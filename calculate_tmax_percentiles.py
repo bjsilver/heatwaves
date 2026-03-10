@@ -5,7 +5,7 @@ Created on Mon Nov 18 09:38:34 2024
 
 @author: ben
 """
-
+#%%
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from tqdm import tqdm
@@ -16,9 +16,9 @@ import regionmask
 import warnings
 
 
-DPATH = '/scratch/earjba/'
+DPATH = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/'
 PAD = 7
-TEMP_DIR = '/scratch/earbsi/heatwaves/'
+TEMP_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentile_chunks/'
 MP_CORES = 30
 
 def check_if_land(chunk):
@@ -111,7 +111,7 @@ def get_quantiles(doy_da):
 def calculate_percentiles_mp(da):
     
     
-    doy_chunks = np.array_split(list(range(1,366)), MP_CORES)
+    doy_chunks = np.array_split(list(range(1,366)), 30)
     doy_das = []
     for doy_chunk in doy_chunks:
         
@@ -129,10 +129,11 @@ def calculate_percentiles_mp(da):
                 pbar.update()
 
     
-    
     percentiles = xr.concat(results, dim='DOY').sortby('DOY')
     
     percentiles.name = 'Ta_TMAX_95pc'
+    percentiles.attrs['units'] = '0.1degC'
+
     return percentiles
 
 def get_percentiles_chunk(chunk):
@@ -185,3 +186,5 @@ if __name__ == '__main__':
         fname = f'percentiles_{chunk[0].start}_{chunk[1].start}.nc'
         percentiles.to_netcdf(TEMP_DIR+fname, encoding=encoding)
     
+
+# %%
