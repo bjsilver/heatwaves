@@ -1,0 +1,2 @@
+LAT_STEP = 2
+LON_STEP = 3

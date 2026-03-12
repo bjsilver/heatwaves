@@ -14,6 +14,7 @@ import numpy as np
 import time
 import regionmask
 import warnings
+from constants import LAT_STEP, LON_STEP
 
 
 DPATH = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/'
@@ -111,7 +112,7 @@ def get_quantiles(doy_da):
 def calculate_percentiles_mp(da):
     
     
-    doy_chunks = np.array_split(list(range(1,366)), 30)
+    doy_chunks = np.array_split(list(range(1,366)), MP_CORES)
     doy_das = []
     for doy_chunk in doy_chunks:
         
@@ -155,13 +156,13 @@ def get_percentiles_chunk(chunk):
     
     return percentiles
 
-def get_amazon_chunks():
+def get_amazon_chunks(LAT_STEP, LON_STEP):
 
     chunks = []
-    for lat in range(-20, 0, 2):
-        for lon in range(-75, -45, 3):
-            lat_slicer = slice(lat+2,lat)
-            lon_slicer = slice(lon, lon+3)
+    for lat in range(-20, 0, LAT_STEP):
+        for lon in range(-75, -45, LON_STEP):
+            lat_slicer = slice(lat+LAT_STEP,lat)
+            lon_slicer = slice(lon, lon+LON_STEP)
             chunks.append((lat_slicer, lon_slicer))
             
     return chunks
