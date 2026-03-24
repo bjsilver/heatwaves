@@ -12,6 +12,7 @@ import time
 
 PERCENTILE_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentile_chunks/'
 DPATH = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/'
+HEATDAYS_CHUNKS_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays_chunks/'
 
 
 
@@ -58,6 +59,7 @@ def process_chunk(percentile_path, YEAR_RANGE, pool):
 
     heatdays_year = xr.concat(heatdays_chunks_year, dim='time')
     spath_fname = percentile_path.split('/')[-1].replace('percentiles', 'heatdays')
+    heatdays_year.name = 'heatdays'
     heatdays_year.to_netcdf(HEATDAYS_CHUNKS_PATH+spath_fname)
 
     end_time = time.time()
@@ -71,7 +73,6 @@ if __name__ == '__main__':
 
     YEAR_RANGE = range(2006,2018)
 
-    HEATDAYS_CHUNKS_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays_chunks/'
     
 
     with mp.Pool(len(YEAR_RANGE)) as pool:
