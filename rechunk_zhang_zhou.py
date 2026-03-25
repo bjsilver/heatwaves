@@ -29,7 +29,7 @@ NC_SOURCE_PATTERN = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropic
 
 # Where to save the output (needs ~1TB of space)
 WORK_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/' 
-TARGET_STORE = os.path.join(WORK_DIR, 'final_timeseries.zarr')
+TARGET_STORE = os.path.join(WORK_DIR, 'tmax_rechunked.zarr')
 TEMP_STORE = os.path.join(WORK_DIR, 'rechunk_temp.zarr')
 
 # Set your coordinate start date

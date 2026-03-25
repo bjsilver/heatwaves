@@ -1,191 +1,162 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Nov 18 09:38:34 2024
-
-@author: ben
-"""
 #%%
-import xarray as xr
-from dask.diagnostics import ProgressBar
-from tqdm import tqdm
-import multiprocessing as mp
+import os
 import numpy as np
-import time
-import regionmask
-import warnings
-from constants import LAT_STEP, LON_STEP
+from numba import njit, prange
+import xarray as xr
+import dask.array as da_lazy
+from pathlib import Path
+import zarr
+from dask.distributed import Client, LocalCluster
 
-
-DPATH = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/'
+# --- CONFIGURATION ---
+DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
+PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
+OUT_ZARR = os.path.join(PERCENTILES_DIR, 'tmax_95pc.zarr')
 PAD = 7
-TEMP_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentile_chunks/'
-MP_CORES = 30
 
-def check_if_land(chunk):
-    
-    lat_slicer, lon_slicer = chunk
+# Ensure output directory exists
+Path(PERCENTILES_DIR).mkdir(parents=True, exist_ok=True)
 
+# --- NUMBA COMPUTATIONAL KERNELS ---
 
-    lon = np.arange(-179.5, 180, .1)
-    lat = np.arange(-89.5, 90, .1)
-    
-    minlat, maxlat = lat_slicer.stop, lat_slicer.start
-    minlon, maxlon = lon_slicer.start, lon_slicer.stop
-    
-    mask = regionmask.defined_regions.natural_earth_v4_1_0.land_110.mask(lon, lat)
-    
-    mask_in = mask.loc[{'lat':slice(minlat, maxlat), 'lon':slice(minlon, maxlon)}]
-    
-    if mask_in.count() > 0:
-        return True
-    else:
-        return False
+@njit
+def _quantile_skipna_1d(vals, q):
+    n = vals.size
+    buf = np.empty(n, dtype=np.float64)
+    m = 0
+    for i in range(n):
+        v = vals[i]
+        if not np.isnan(v):
+            buf[m] = v
+            m += 1
+    if m == 0:
+        return np.nan
+    a = np.sort(buf[:m])
+    if m == 1:
+        return a[0]
+    h = (m - 1) * q
+    lo = int(np.floor(h))
+    hi = int(np.ceil(h))
+    if lo == hi:
+        return a[lo]
+    w = h - lo
+    return a[lo] * (1.0 - w) + a[hi] * w
 
+@njit(parallel=True)
+def quantile95_over_year_window_skipna(arr):
+    # arr shape: (year, doy, lat, lon, window)
+    ny, nd, nlat, nlon, nw = arr.shape
+    out = np.empty((nd, nlat, nlon), dtype=np.float64)
+    for d in prange(nd):
+        for i in range(nlat):
+            for j in range(nlon):
+                vals = np.empty(ny * nw, dtype=np.float64)
+                k = 0
+                for y in range(ny):
+                    for w in range(nw):
+                        vals[k] = arr[y, d, i, j, w]
+                        k += 1
+                out[d, i, j] = _quantile_skipna_1d(vals, 0.95)
+    return out
 
+# --- HELPER FUNCTIONS ---
 
-def pad_start_end_doys(da, pad=7):
-
-    # take start and move to end
-    end_pad = da.loc[{'DOY':slice(1, 1+pad-1)}]
-    end_pad.coords['DOY'] = end_pad.DOY + 365
-    
-    # take end and move to before start
-    start_pad = da.loc[{'DOY':slice(365-pad+1, 365)}]
-    start_pad.coords['DOY'] = start_pad.DOY - 365
-    
-    da = xr.concat([start_pad, da, end_pad], dim='DOY')
+def load_tmax_da():
+    # consolidated=False prevents the KeyError: '.zmetadata'
+    ds = xr.open_zarr(DPATH + 'tmax_rechunked.zarr', chunks={}, consolidated=False)
+    # Rename 'time' to 'year' to match your dimension logic
+    da = ds["Ta_TMAX"].rename({"time": "year", "DOY": "doy"})
+    # Assign year coordinates (must match dimension name exactly)
+    da = da.assign_coords(year=np.arange(2006, 2018))
+    if 'doy' not in da.coords:
+        da = da.assign_coords(doy=np.arange(1, da.sizes['doy'] + 1))
     return da
 
+def iter_chunk_bounds_1d(chunk_lengths):
+    start = 0
+    for n in chunk_lengths:
+        end = start + n
+        yield start, end
+        start = end
 
+def iter_lat_lon_chunks(da, lat_dim="lat", lon_dim="lon"):
+    lat_axis = da.get_axis_num(lat_dim)
+    lon_axis = da.get_axis_num(lon_dim)
+    lat_chunks = da.chunks[lat_axis]
+    lon_chunks = da.chunks[lon_axis]
 
+    for i, (lat0, lat1) in enumerate(iter_chunk_bounds_1d(lat_chunks)):
+        for j, (lon0, lon1) in enumerate(iter_chunk_bounds_1d(lon_chunks)):
+            yield {
+                "lat": slice(lat0, lat1),
+                "lon": slice(lon0, lon1),
+            }
 
-def preprocess(lat_slicer, lon_slicer):
-    def pp(ds):
-        ds = ds.loc[{'lat':lat_slicer, 'lon':lon_slicer}]
-        ds = ds.drop_vars('spatial_ref')
-        ds.coords['DOY'] = range(1, 366)
-        return ds
-    return pp
+def build_wrapped_doy_axis(da, pad):
+    left = da.isel(doy=slice(-pad, None)).assign_coords(doy=np.arange(1 - pad, 1))
+    middle = da
+    right = da.isel(doy=slice(0, pad)).assign_coords(doy=np.arange(366, 366 + pad))
+    return xr.concat([left, middle, right], dim='doy')
 
-def load_area_chunk(lat_slicer, lon_slicer):
-
-
-    ds = xr.open_mfdataset(DPATH+'SouthAmerica_Ta_SVCMsp_*TMAX_daily_tropics30N30S.nc',
-                           preprocess=preprocess(lat_slicer, lon_slicer), 
-             
-                           concat_dim='DOY', combine='nested',
-                           chunks={'DOY':-1},
-                           parallel=True)
-    da = ds['Ta_TMAX']
-    
-    print('loading chunk...')
-    with ProgressBar():
-        da = da.load()
-    
-    da = da.sortby('DOY')
-    
-    da = pad_start_end_doys(da, pad=PAD)
-    
-    return da
-
-def get_quantiles(doy_da):    
-    doys_in = np.unique(doy_da.DOY)[PAD:-PAD]
-
-    res_da = xr.DataArray(coords=doy_da.coords)
-    res_da = res_da.drop_duplicates(dim='DOY')
-
-    for doy in doys_in:
-                
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-            p = doy_da.loc[{'DOY':slice(doy-PAD, doy+PAD)}].quantile(dim='DOY', q=.95)
-        p = p.drop_vars('quantile')
-       
-        p = p.assign_coords({'DOY':doys_in[PAD]})
-        res_da.loc[{'DOY':doy}] = p
-    
-    res_da = res_da.dropna('DOY', how='all')
-    return res_da
-
-
-def calculate_percentiles_mp(da):
-    
-    
-    doy_chunks = np.array_split(list(range(1,366)), MP_CORES)
-    doy_das = []
-    for doy_chunk in doy_chunks:
-        
-        doy_da = da.loc[{'DOY':slice(doy_chunk[0] - PAD,
-                                       doy_chunk[-1] + PAD)}]
-        doy_das.append(doy_da)
-    
-    
-    print('multiprocessing...')
-    with mp.Pool(MP_CORES) as pool:
-        with tqdm(total=len(doy_das)) as pbar:
-            results = []
-            for result in pool.imap_unordered(get_quantiles, doy_das):
-                results.append(result)
-                pbar.update()
-
-    
-    percentiles = xr.concat(results, dim='DOY').sortby('DOY')
-    
-    percentiles.name = 'Ta_TMAX_95pc'
-    percentiles.attrs['units'] = '0.1degC'
-
-    return percentiles
-
-def get_percentiles_chunk(chunk):
-    
-    lat_slicer, lon_slicer = chunk
-    
-    print('calculating percentiles for',
-          f'lat: {lat_slicer.start}—{lat_slicer.stop}',
-          f'lon: {lon_slicer.start}—{lon_slicer.stop}')
-    
-    start_time = time.time()
-    
-    da = load_area_chunk(lat_slicer, lon_slicer)
-    percentiles = calculate_percentiles_mp(da)
-    
-    end_time = time.time()
-    
-    print(f'time taken for chunk {end_time-start_time:.1f} seconds')
-    
-    return percentiles
-
-def get_amazon_chunks(LAT_STEP, LON_STEP):
-
-    chunks = []
-    for lat in range(-20, 0, LAT_STEP):
-        for lon in range(-75, -45, LON_STEP):
-            lat_slicer = slice(lat+LAT_STEP,lat)
-            lon_slicer = slice(lon, lon+LON_STEP)
-            chunks.append((lat_slicer, lon_slicer))
-            
-    return chunks
-
-
+# --- MAIN EXECUTION ---
 #%%
+# 1. Load data and Initialize Skeleton
+da = load_tmax_da()
 
-if __name__ == '__main__':
-            
-    chunks = get_amazon_chunks()
-    
-    encoding = {'Ta_TMAX_95pc':{'zlib':True, 'complevel':5}}
-    
-    for chunk in chunks:
-        
-        if not check_if_land(chunk):
-            print('no land in chunk...')
-            continue
-        
-        percentiles = get_percentiles_chunk(chunk)
-        
-        fname = f'percentiles_{chunk[0].start}_{chunk[1].start}.nc'
-        percentiles.to_netcdf(TEMP_DIR+fname, encoding=encoding)
-    
+shape = (365, len(da.lat), len(da.lon))
+chunks = (365, 100, 100) # Ensure doy is in one chunk for rolling window efficiency
 
-# %%
+# Create a lazy skeleton using dask (zero memory footprint)
+dummy_data = da_lazy.full(shape, fill_value=np.nan, chunks=chunks)
+full_ds = xr.Dataset(
+    data_vars={"Ta_TMAX_p95": (("doy", "lat", "lon"), dummy_data)},
+    coords={"doy": np.arange(1, 366), "lat": da.lat, "lon": da.lon}
+)
+
+# Initialize Zarr on disk (metadata only)
+print(f"Initializing Zarr skeleton at {OUT_ZARR}...")
+full_ds.to_zarr(OUT_ZARR, compute=False, mode="w")
+
+# 2. Iterative Tile Processing
+print("Starting iterative processing...")
+for tile in iter_lat_lon_chunks(da):
+    # Load tile into RAM
+    cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
+
+    # Skip tiles that are all NaN (oceans/empty space)
+    if np.isnan(cda).all():
+        continue
+
+
+    # Prep data for Numba
+    padded = build_wrapped_doy_axis(cda, PAD)
+    windowed = padded.rolling(doy=2 * PAD + 1, center=True).construct('window').sel(doy=slice(1, 365))
+
+    # Calculate Percentiles
+    p95_vals = quantile95_over_year_window_skipna(windowed.values)
+    
+    # Wrap in Dataset with coordinates aligned to the skeleton
+    percentiles_ds = xr.DataArray(
+        p95_vals.astype(np.float32), # Optional: float32 saves 50% disk space
+        dims=('doy', 'lat', 'lon'),
+        coords={'doy': np.arange(1, 366), 'lat': cda.lat, 'lon': cda.lon},
+        name='Ta_TMAX_p95',
+    ).to_dataset()
+
+    # Map the tile slice to the global Zarr indices
+    region_dict = {
+        "doy": slice(0, 365),
+        "lat": tile["lat"],
+        "lon": tile["lon"]
+    }
+
+    # Write the specific region
+    percentiles_ds.to_zarr(OUT_ZARR, region=region_dict)
+    print(f"Finished: lat={tile['lat']} lon={tile['lon']}")
+
+# 3. Final Step: Consolidate metadata for faster future reading
+print("Consolidating metadata...")
+zarr.consolidate_metadata(OUT_ZARR)
+print("Processing Complete.")
