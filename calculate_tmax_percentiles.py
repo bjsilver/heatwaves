@@ -8,16 +8,24 @@ import xarray as xr
 import dask.array as da_lazy
 from pathlib import Path
 import zarr
-from dask.diagnostics import ProgressBar
 from glob import glob
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 # --- CONFIGURATION ---
 DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 OUT_ZARR = os.path.join(PERCENTILES_DIR, 'tmax_95pc.zarr')
 PAD = 7
+MAX_TILES = None  # Set to None to process all tiles.
+READER_WORKERS = 3
+PREFETCH_DEPTH = 9
 
-# Ensure output directory exists
+# Ensure output directory exists.
 Path(PERCENTILES_DIR).mkdir(parents=True, exist_ok=True)
 
 # --- NUMBA COMPUTATIONAL KERNELS ---
@@ -46,9 +54,10 @@ def _quantile_skipna_1d(vals, q):
     return a[lo] * (1.0 - w) + a[hi] * w
 
 @njit(parallel=True)
-def quantile95_over_year_window_skipna(arr):
-    # arr shape: (year, doy, lat, lon, window)
-    ny, nd, nlat, nlon, nw = arr.shape
+def quantile95_over_year_window_skipna(arr, pad):
+    # arr shape: (year, doy, lat, lon)
+    ny, nd, nlat, nlon = arr.shape
+    nw = 2 * pad + 1
     out = np.empty((nd, nlat, nlon), dtype=np.float64)
     for d in prange(nd):
         for i in range(nlat):
@@ -56,8 +65,9 @@ def quantile95_over_year_window_skipna(arr):
                 vals = np.empty(ny * nw, dtype=np.float64)
                 k = 0
                 for y in range(ny):
-                    for w in range(nw):
-                        vals[k] = arr[y, d, i, j, w]
+                    for w in range(-pad, pad + 1):
+                        doy_idx = (d + w) % nd
+                        vals[k] = arr[y, doy_idx, i, j]
                         k += 1
                 out[d, i, j] = _quantile_skipna_1d(vals, 0.95)
     return out
@@ -65,11 +75,12 @@ def quantile95_over_year_window_skipna(arr):
 # --- HELPER FUNCTIONS ---
 
 def load_tmax_da():
-    # consolidated=False prevents the KeyError: '.zmetadata'
+    print(f"Opening input Zarr: {DPATH}tmax_rechunked.zarr")
+    # Use consolidated=False to support stores without .zmetadata.
     ds = xr.open_zarr(DPATH + 'tmax_rechunked.zarr', chunks={}, consolidated=False)
-    # Rename 'time' to 'year' to match your dimension logic
+    # Align dimension names with downstream processing.
     da = ds["Ta_TMAX"].rename({"time": "year", "DOY": "doy"})
-    # Assign year coordinates (must match dimension name exactly)
+    # Attach explicit year coordinates expected downstream.
     da = da.assign_coords(year=np.arange(2006, 2018))
     if 'doy' not in da.coords:
         da = da.assign_coords(doy=np.arange(1, da.sizes['doy'] + 1))
@@ -86,6 +97,7 @@ def get_empty_chunk_map(chunked):
 
     NC_SOURCE_PATTERN = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/*TMAX_daily_tropics30N30S.nc'
     files = sorted(glob(NC_SOURCE_PATTERN))
+    print(f"Building empty-chunk map from: {files[0]}")
 
     orig = xr.open_dataset(files[0])
     orig = orig['Ta_TMAX'][0]
@@ -106,6 +118,8 @@ def get_empty_chunk_map(chunked):
             valid = oc.isnull().all().item()
             empty_chunks[(lat0, lat1, lon0, lon1)] = valid
 
+    empty_count = sum(empty_chunks.values())
+    print(f"Chunk map ready: {len(empty_chunks)} total, {empty_count} empty")
     return empty_chunks
 
 def iter_lat_lon_chunks(da, empty_chunks, lat_dim="lat", lon_dim="lon"):
@@ -124,71 +138,122 @@ def iter_lat_lon_chunks(da, empty_chunks, lat_dim="lat", lon_dim="lon"):
                     "lon": slice(lon0, lon1),
                 }
 
-def build_wrapped_doy_axis(da, pad):
-    left = da.isel(doy=slice(-pad, None)).assign_coords(doy=np.arange(1 - pad, 1))
-    middle = da
-    right = da.isel(doy=slice(0, pad)).assign_coords(doy=np.arange(366, 366 + pad))
-    return xr.concat([left, middle, right], dim='doy')
+def prepare_tile_payload(da, tile):
+    cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
+
+    return {
+        "vals": cda.values,
+        "lat": cda.lat.values,
+        "lon": cda.lon.values,
+        "tile": tile,
+    }
 
 # --- MAIN EXECUTION ---
 #%%
 
+def process_tiles_serial(da, empty_chunks, max_tiles=None, reader_workers=1, prefetch_depth=1):
+    print(f"Starting tile processing (reader_workers={reader_workers}, prefetch_depth={prefetch_depth})...")
+    tile_count = 0
+    non_empty_submitted = 0
+    total_tiles = len(empty_chunks) - sum(empty_chunks.values())
+    if max_tiles is not None:
+        total_tiles = min(total_tiles, max_tiles)
+
+    tiles_iter = iter(iter_lat_lon_chunks(da, empty_chunks))
+
+    def submit_one(executor, pending):
+        nonlocal non_empty_submitted
+        if max_tiles is not None and non_empty_submitted >= max_tiles:
+            return False
+        try:
+            tile = next(tiles_iter)
+        except StopIteration:
+            return False
+        pending.append(executor.submit(prepare_tile_payload, da, tile))
+        non_empty_submitted += 1
+        return True
+
+    progress = tqdm(total=total_tiles, desc="Tiles", unit="tile") if tqdm is not None else None
+    try:
+        with ThreadPoolExecutor(max_workers=reader_workers) as executor:
+            pending = []
+            target_depth = max(1, prefetch_depth)
+
+            while len(pending) < target_depth and submit_one(executor, pending):
+                pass
+
+            while pending:
+                payload = pending.pop(0).result()
+
+                p95_vals = quantile95_over_year_window_skipna(payload["vals"], PAD)
+
+                percentiles_ds = xr.DataArray(
+                    p95_vals.astype(np.float32),
+                    dims=('doy', 'lat', 'lon'),
+                    coords={
+                        'doy': np.arange(1, 366),
+                        'lat': payload["lat"],
+                        'lon': payload["lon"],
+                    },
+                    name='Ta_TMAX_p95',
+                ).to_dataset()
+
+                region_dict = {
+                    "doy": slice(0, 365),
+                    "lat": payload["tile"]["lat"],
+                    "lon": payload["tile"]["lon"],
+                }
+                percentiles_ds.to_zarr(OUT_ZARR, region=region_dict)
+
+                tile_count += 1
+                if progress is not None:
+                    progress.update(1)
+                elif tile_count % 20 == 0:
+                    print(f"Processed {tile_count} tiles")
+
+                while len(pending) < target_depth and submit_one(executor, pending):
+                    pass
+    finally:
+        if progress is not None:
+            progress.close()
+
+    if max_tiles is not None and non_empty_submitted >= max_tiles:
+        print(f"Reached tile limit for tuning run: {max_tiles}")
+    print(f"Finished serial tile processing ({tile_count} tiles)")
+    print(f"Non-empty tiles submitted: {non_empty_submitted}")
+
+
+
 if __name__ == "__main__":
-    # 1. Load data and Initialize Skeleton
+    # Load data and initialize the output skeleton.
     da = load_tmax_da()
 
-    # get chunk validity map to skip empty chunks in the percentile calculation
+    # Skip all-empty chunks to avoid unnecessary compute.
     empty_chunks = get_empty_chunk_map(da)
 
-
     shape = (365, len(da.lat), len(da.lon))
-    chunks = (365, 100, 100) # Ensure doy is in one chunk for rolling window efficiency
+    chunks = (365, 100, 100)  # Keep doy in one chunk for rolling-window efficiency.
 
-    # Create a lazy skeleton using dask (zero memory footprint)
+    # Create a lazy skeleton using dask.
     dummy_data = da_lazy.full(shape, fill_value=np.nan, chunks=chunks)
     full_ds = xr.Dataset(
         data_vars={"Ta_TMAX_p95": (("doy", "lat", "lon"), dummy_data)},
         coords={"doy": np.arange(1, 366), "lat": da.lat, "lon": da.lon}
     )
 
-    # Initialize Zarr on disk (metadata only)
+    # Initialize Zarr on disk (metadata only).
     print(f"Initializing Zarr skeleton at {OUT_ZARR}...")
     full_ds.to_zarr(OUT_ZARR, compute=False, mode="w")
 
-    # 2. Iterative Tile Processing
-    print("Starting iterative processing...")
-    for tile in iter_lat_lon_chunks(da, empty_chunks):
-        # Load tile into RAM
-        cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
+    process_tiles_serial(
+        da,
+        empty_chunks,
+        max_tiles=MAX_TILES,
+        reader_workers=READER_WORKERS,
+        prefetch_depth=PREFETCH_DEPTH,
+    )
 
-
-        # Prep data for Numba
-        padded = build_wrapped_doy_axis(cda, PAD)
-        windowed = padded.rolling(doy=2 * PAD + 1, center=True).construct('window').sel(doy=slice(1, 365))
-
-        # Calculate Percentiles
-        p95_vals = quantile95_over_year_window_skipna(windowed.values)
-        
-        # Wrap in Dataset with coordinates aligned to the skeleton
-        percentiles_ds = xr.DataArray(
-            p95_vals.astype(np.float32), # Optional: float32 saves 50% disk space
-            dims=('doy', 'lat', 'lon'),
-            coords={'doy': np.arange(1, 366), 'lat': cda.lat, 'lon': cda.lon},
-            name='Ta_TMAX_p95',
-        ).to_dataset()
-
-        # Map the tile slice to the global Zarr indices
-        region_dict = {
-            "doy": slice(0, 365),
-            "lat": tile["lat"],
-            "lon": tile["lon"]
-        }
-
-        # Write the specific region
-        percentiles_ds.to_zarr(OUT_ZARR, region=region_dict)
-        print(f"Finished: lat={tile['lat']} lon={tile['lon']}")
-
-    # 3. Final Step: Consolidate metadata for faster future reading
     print("Consolidating metadata...")
     zarr.consolidate_metadata(OUT_ZARR)
     print("Processing Complete.")
+
