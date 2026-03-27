@@ -8,6 +8,8 @@ import xarray as xr
 import dask.array as da_lazy
 from pathlib import Path
 import zarr
+from dask.diagnostics import ProgressBar
+from glob import glob
 
 # --- CONFIGURATION ---
 DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
@@ -80,7 +82,35 @@ def iter_chunk_bounds_1d(chunk_lengths):
         yield start, end
         start = end
 
-def iter_lat_lon_chunks(da, lat_dim="lat", lon_dim="lon"):
+def get_empty_chunk_map(chunked):
+
+    NC_SOURCE_PATTERN = '/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/*TMAX_daily_tropics30N30S.nc'
+    files = sorted(glob(NC_SOURCE_PATTERN))
+
+    orig = xr.open_dataset(files[0])
+    orig = orig['Ta_TMAX'][0]
+
+
+    empty_chunks = {}
+    lat_axis = chunked.get_axis_num('lat')
+    lon_axis = chunked.get_axis_num('lon')
+    lat_chunks = chunked.chunks[lat_axis]
+    lon_chunks = chunked.chunks[lon_axis]
+
+
+    for (lat0, lat1) in iter_chunk_bounds_1d(lat_chunks):
+        for (lon0, lon1) in iter_chunk_bounds_1d(lon_chunks):
+
+            oc = orig.isel(lat=slice(lat0, lat1), lon=slice(lon0, lon1))
+            
+            valid = oc.isnull().all().item()
+            empty_chunks[(lat0, lat1, lon0, lon1)] = valid
+
+    return empty_chunks
+
+def iter_lat_lon_chunks(da, empty_chunks, lat_dim="lat", lon_dim="lon"):
+
+    
     lat_axis = da.get_axis_num(lat_dim)
     lon_axis = da.get_axis_num(lon_dim)
     lat_chunks = da.chunks[lat_axis]
@@ -88,10 +118,11 @@ def iter_lat_lon_chunks(da, lat_dim="lat", lon_dim="lon"):
 
     for i, (lat0, lat1) in enumerate(iter_chunk_bounds_1d(lat_chunks)):
         for j, (lon0, lon1) in enumerate(iter_chunk_bounds_1d(lon_chunks)):
-            yield {
-                "lat": slice(lat0, lat1),
-                "lon": slice(lon0, lon1),
-            }
+            if not empty_chunks[(lat0, lat1, lon0, lon1)]:
+                yield {
+                    "lat": slice(lat0, lat1),
+                    "lon": slice(lon0, lon1),
+                }
 
 def build_wrapped_doy_axis(da, pad):
     left = da.isel(doy=slice(-pad, None)).assign_coords(doy=np.arange(1 - pad, 1))
@@ -105,6 +136,10 @@ def build_wrapped_doy_axis(da, pad):
 if __name__ == "__main__":
     # 1. Load data and Initialize Skeleton
     da = load_tmax_da()
+
+    # get chunk validity map to skip empty chunks in the percentile calculation
+    empty_chunks = get_empty_chunk_map(da)
+
 
     shape = (365, len(da.lat), len(da.lon))
     chunks = (365, 100, 100) # Ensure doy is in one chunk for rolling window efficiency
@@ -122,13 +157,9 @@ if __name__ == "__main__":
 
     # 2. Iterative Tile Processing
     print("Starting iterative processing...")
-    for tile in iter_lat_lon_chunks(da):
+    for tile in iter_lat_lon_chunks(da, empty_chunks):
         # Load tile into RAM
         cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
-
-        # Skip tiles that are all NaN (oceans/empty space)
-        if np.isnan(cda).all():
-            continue
 
 
         # Prep data for Numba
