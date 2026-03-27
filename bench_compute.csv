@@ -1,3 +1,0 @@
-workers,threads_per_worker,memory_limit,mode,seconds,status,message
-4,1,12GB,compute,70.501,ok,
-6,1,12GB,compute,63.084,ok,

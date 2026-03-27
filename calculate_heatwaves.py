@@ -1,36 +1,64 @@
 #%%
 import xarray as xr
-from glob import glob
-from dask.diagnostics import ProgressBar
-import multiprocessing as mp
-from constants import LAT_STEP, LON_STEP
-import time
-import dask
+from dask.distributed import Client, LocalCluster
 
-HEATDAYS_CHUNKS_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays_chunks/'
+
+HEATDAYS_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays/'
 HEATWAVE_DAY_THRESH = 3
 
-#%%
-
-heatdays_chunks_paths = glob(HEATDAYS_CHUNKS_PATH+'heatdays_*.nc')
-
-chunkpath = heatdays_chunks_paths[0]
-
-def load_heatdays_chunk(chunkpath):
-    ds = xr.open_dataset(chunkpath)
-    if '__xarray_dataarray_variable__' in ds.data_vars:
-        ds = ds.rename({'__xarray_dataarray_variable__':'heatdays'})
-    da = ds['heatdays']
-    return da
 
 #%%
-da = load_heatdays_chunk(chunkpath)
-da = da.chunk({'time':-1, 'lat':50, 'lon':50})
 
-is_run_end = da.rolling(time=HEATWAVE_DAY_THRESH).all()
-mask = is_run_end.rolling(time=HEATWAVE_DAY_THRESH, center=False).any()
-mask = mask.shift(time=-(HEATWAVE_DAY_THRESH - 1))
-da = da.where(mask.fillna(False), False)
+def stack_time(heatdays):
 
-with dask.config.set(scheduler='processes', num_workers=16):
-    da.to_netcdf("filtered_output.nc")
+    start_year = heatdays['year'].min().item()
+    end_year = heatdays['year'].max().item()
+
+    tindex = xr.date_range(start=f'{start_year}-01-01',
+                end=f'{end_year}-12-31',
+                freq='D', calendar='noleap',
+                use_cftime=True)
+
+    heatdays = heatdays.stack(time=("year", "doy"),
+                              create_index=False)
+    heatdays = heatdays.reset_coords(drop=True)
+    heatdays.coords['time'] = tindex
+    return heatdays
+
+
+#%%
+
+def remove_short_runs(heatdays, thresh=HEATWAVE_DAY_THRESH):
+    # 1) True only at run-ends of length >= thresh
+    is_run_end = heatdays
+    for k in range(1, thresh):
+        is_run_end = is_run_end & heatdays.shift(time=k, fill_value=False)
+
+    # 2) Expand each run-end back over the previous thresh-1 days
+    mask = is_run_end
+    for k in range(1, thresh):
+        mask = mask | is_run_end.shift(time=-k, fill_value=False)
+
+    # 3) Keep only days belonging to long-enough runs
+    heatwaves = heatdays & mask
+    return heatwaves
+
+
+def calculate_heatwaves(thresh=HEATWAVE_DAY_THRESH):
+    heatdays = xr.open_zarr(HEATDAYS_PATH+'heatdays.zarr',
+                            consolidated=True)['heatdays']
+    heatdays = stack_time(heatdays)
+    heatwaves = remove_short_runs(heatdays, thresh)
+    return heatwaves
+
+if __name__ == '__main__':
+    with LocalCluster(n_workers=16,       
+            threads_per_worker=2,  
+            memory_limit='8GB',  
+            dashboard_address=':8787') as cluster:
+        with Client(cluster) as client:
+            print('client started')
+            heatwaves = calculate_heatwaves()
+            heatwaves.name = 'heatwaves'
+            heatwaves.to_zarr(HEATDAYS_PATH+'heatwaves.zarr',
+                            consolidated=True)

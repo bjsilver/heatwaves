@@ -8,7 +8,6 @@ import xarray as xr
 import dask.array as da_lazy
 from pathlib import Path
 import zarr
-from dask.distributed import Client, LocalCluster
 
 # --- CONFIGURATION ---
 DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
@@ -102,61 +101,63 @@ def build_wrapped_doy_axis(da, pad):
 
 # --- MAIN EXECUTION ---
 #%%
-# 1. Load data and Initialize Skeleton
-da = load_tmax_da()
 
-shape = (365, len(da.lat), len(da.lon))
-chunks = (365, 100, 100) # Ensure doy is in one chunk for rolling window efficiency
+if __name__ == "__main__":
+    # 1. Load data and Initialize Skeleton
+    da = load_tmax_da()
 
-# Create a lazy skeleton using dask (zero memory footprint)
-dummy_data = da_lazy.full(shape, fill_value=np.nan, chunks=chunks)
-full_ds = xr.Dataset(
-    data_vars={"Ta_TMAX_p95": (("doy", "lat", "lon"), dummy_data)},
-    coords={"doy": np.arange(1, 366), "lat": da.lat, "lon": da.lon}
-)
+    shape = (365, len(da.lat), len(da.lon))
+    chunks = (365, 100, 100) # Ensure doy is in one chunk for rolling window efficiency
 
-# Initialize Zarr on disk (metadata only)
-print(f"Initializing Zarr skeleton at {OUT_ZARR}...")
-full_ds.to_zarr(OUT_ZARR, compute=False, mode="w")
+    # Create a lazy skeleton using dask (zero memory footprint)
+    dummy_data = da_lazy.full(shape, fill_value=np.nan, chunks=chunks)
+    full_ds = xr.Dataset(
+        data_vars={"Ta_TMAX_p95": (("doy", "lat", "lon"), dummy_data)},
+        coords={"doy": np.arange(1, 366), "lat": da.lat, "lon": da.lon}
+    )
 
-# 2. Iterative Tile Processing
-print("Starting iterative processing...")
-for tile in iter_lat_lon_chunks(da):
-    # Load tile into RAM
-    cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
+    # Initialize Zarr on disk (metadata only)
+    print(f"Initializing Zarr skeleton at {OUT_ZARR}...")
+    full_ds.to_zarr(OUT_ZARR, compute=False, mode="w")
 
-    # Skip tiles that are all NaN (oceans/empty space)
-    if np.isnan(cda).all():
-        continue
+    # 2. Iterative Tile Processing
+    print("Starting iterative processing...")
+    for tile in iter_lat_lon_chunks(da):
+        # Load tile into RAM
+        cda = da.isel(lat=tile["lat"], lon=tile["lon"]).load()
+
+        # Skip tiles that are all NaN (oceans/empty space)
+        if np.isnan(cda).all():
+            continue
 
 
-    # Prep data for Numba
-    padded = build_wrapped_doy_axis(cda, PAD)
-    windowed = padded.rolling(doy=2 * PAD + 1, center=True).construct('window').sel(doy=slice(1, 365))
+        # Prep data for Numba
+        padded = build_wrapped_doy_axis(cda, PAD)
+        windowed = padded.rolling(doy=2 * PAD + 1, center=True).construct('window').sel(doy=slice(1, 365))
 
-    # Calculate Percentiles
-    p95_vals = quantile95_over_year_window_skipna(windowed.values)
-    
-    # Wrap in Dataset with coordinates aligned to the skeleton
-    percentiles_ds = xr.DataArray(
-        p95_vals.astype(np.float32), # Optional: float32 saves 50% disk space
-        dims=('doy', 'lat', 'lon'),
-        coords={'doy': np.arange(1, 366), 'lat': cda.lat, 'lon': cda.lon},
-        name='Ta_TMAX_p95',
-    ).to_dataset()
+        # Calculate Percentiles
+        p95_vals = quantile95_over_year_window_skipna(windowed.values)
+        
+        # Wrap in Dataset with coordinates aligned to the skeleton
+        percentiles_ds = xr.DataArray(
+            p95_vals.astype(np.float32), # Optional: float32 saves 50% disk space
+            dims=('doy', 'lat', 'lon'),
+            coords={'doy': np.arange(1, 366), 'lat': cda.lat, 'lon': cda.lon},
+            name='Ta_TMAX_p95',
+        ).to_dataset()
 
-    # Map the tile slice to the global Zarr indices
-    region_dict = {
-        "doy": slice(0, 365),
-        "lat": tile["lat"],
-        "lon": tile["lon"]
-    }
+        # Map the tile slice to the global Zarr indices
+        region_dict = {
+            "doy": slice(0, 365),
+            "lat": tile["lat"],
+            "lon": tile["lon"]
+        }
 
-    # Write the specific region
-    percentiles_ds.to_zarr(OUT_ZARR, region=region_dict)
-    print(f"Finished: lat={tile['lat']} lon={tile['lon']}")
+        # Write the specific region
+        percentiles_ds.to_zarr(OUT_ZARR, region=region_dict)
+        print(f"Finished: lat={tile['lat']} lon={tile['lon']}")
 
-# 3. Final Step: Consolidate metadata for faster future reading
-print("Consolidating metadata...")
-zarr.consolidate_metadata(OUT_ZARR)
-print("Processing Complete.")
+    # 3. Final Step: Consolidate metadata for faster future reading
+    print("Consolidating metadata...")
+    zarr.consolidate_metadata(OUT_ZARR)
+    print("Processing Complete.")
