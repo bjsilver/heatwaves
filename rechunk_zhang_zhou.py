@@ -174,6 +174,8 @@ if __name__ == "__main__":
             mask_and_scale=False
         )
 
+        ds = ds.astype('float32')  # Downcast to reduce memory usage during rechunking
+
         # --- Step C: Define Rechunk Plan ---
         # We want ALL time (5840) for every 100x100 pixel block
         target_chunks = {'time': -1, 'lat': 100, 'lon': 100}

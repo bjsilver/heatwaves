@@ -1,0 +1,1 @@
+ERA_HW_DATA = '/uolstore/Research/b/b0256/Users/earjba/jackson_tropical_heatwaves/'
