@@ -10,37 +10,35 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 import multiprocessing as mp
 import matplotlib.pyplot as plt
-import os
+import numpy as np
 import subprocess
+from calculate_tmax_percentiles import load_tmax_da
+from constants import FIGDIR
+STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 
-
-#DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentile_chunks/'
-DPATH = '/local/data/earbsi/scratch/percentile_chunks/'
-FIGDIR = '/uolstore/home/users/earbsi/onedrive/craft/figs/heatwaves/'
-
-CPU_COUNT = 30
-
-# def preprocess(doy):
-#     def pp(ds):
-#         ds = ds.loc[{'DOY':doy}]
-#         return ds
-#     return pp
-
-ds = xr.open_mfdataset(DPATH+'percentiles_*.nc', combine='by_coords')
-da = ds['Ta_TMAX_95pc']
+CPU_COUNT = 16
 
 with ProgressBar():
-    da = da.load()
+    tmax = load_tmax_da().load()
+
+pctl = xr.open_zarr(STORAGE_DIR+'/percentiles/tmax_95pc.zarr',
+                    consolidated=True)
+pctl = pctl['Ta_TMAX_p95']
+pctl.coords['lat'] = np.where(np.isnan(pctl.lat.values), 0, pctl.lat.values)
+
 #%%
 
+
 # chunk da into CPU_COUNT chunks along the DOY dimension
-das = [da.loc[{'DOY':doy}].load() for doy in range(1, 366)]
+
+
+das = [pctl.loc[{'doy':doy}].load() for doy in range(1, 366)]
 
 # make iterable of chunks of DOY
 #%%
 
 def plot_doy(doy_chunk):
-    doy = int(doy_chunk.DOY)
+    doy = int(doy_chunk.doy)
     
 
     fig, ax = plt.subplots(figsize=[10,8]) 
@@ -48,7 +46,7 @@ def plot_doy(doy_chunk):
     doyda.plot.imshow(ax=ax, vmin=26, vmax=42, cmap='magma',
                       cbar_kwargs={'extend':'both',
                                     'label':'95th percentile of daily maximum temperature (°C)'})
-    fig.savefig(FIGDIR+f'doy_{str(doy).zfill(3)}_Ta_TMAX_95pc.png',
+    fig.savefig(FIGDIR+f'doy_pctls/doy_{str(doy).zfill(3)}_Ta_TMAX_95pc.png',
                 dpi=400, bbox_inches='tight')
     plt.close()
     print(f'Plotted DOY {doy}')
@@ -59,7 +57,7 @@ if __name__ == '__main__':
 # %% make the DOY plots into a video using ffmpeg
 
 
-input_pattern = FIGDIR + "doy_%03d_Ta_TMAX_95pc.png"
+input_pattern = FIGDIR + "doy_pctls/doy_%03d_Ta_TMAX_95pc.png"
 output_mp4 = FIGDIR + "doy_Ta_TMAX_95pc.mp4"
 
 cmd = [

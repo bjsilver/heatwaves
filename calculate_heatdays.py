@@ -2,6 +2,8 @@
 import xarray as xr
 from dask.distributed import Client, LocalCluster
 from calculate_tmax_percentiles import load_tmax_da
+import os
+import shutil
 
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 
@@ -13,6 +15,10 @@ tmax = load_tmax_da()
 # %%
 
 if __name__ == '__main__':
+
+    if os.path.exists(STORAGE_DIR+'/heatdays/heatdays.zarr'):
+        print('deleting existing heatdays zarr')
+        shutil.rmtree(STORAGE_DIR+'/heatdays/heatdays.zarr')
 
     with LocalCluster(n_workers=8,       
         threads_per_worker=1,  

@@ -1,6 +1,8 @@
 #%%
 import xarray as xr
 from dask.distributed import Client, LocalCluster
+import shutil
+import os
 
 
 HEATDAYS_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays/'
@@ -52,6 +54,11 @@ def calculate_heatwaves(thresh=HEATWAVE_DAY_THRESH):
     return heatwaves
 
 if __name__ == '__main__':
+
+    if os.path.exists(HEATDAYS_PATH+'heatwaves.zarr'):
+        print('deleting existing heatwaves zarr')
+        shutil.rmtree(HEATDAYS_PATH+'heatwaves.zarr')
+
     with LocalCluster(n_workers=16,       
             threads_per_worker=2,  
             memory_limit='8GB',  
