@@ -45,7 +45,16 @@ SPATIAL_CHUNK = 256
 CAST_TO_FLOAT32 = False
 
 # Resume behavior.
-RESET_OUTPUT = True
+RESET_OUTPUT = False
+
+# Optional targeted rewrite.
+# Set to an integer year (for example, 2010) to process only that year.
+# Leave as None for normal full-run behavior.
+ONLY_YEAR = 2014
+
+# When ONLY_YEAR is set, force rewriting that year's region even if progress
+# already marks the file as completed.
+FORCE_RERUN_ONLY_YEAR = True
 
 # Validate the assumption that each source file is one 365-day year.
 STRICT_365_DAYS = True
@@ -299,6 +308,14 @@ def main():
     records = inspect_files(files)
     validate_records(records)
 
+    if ONLY_YEAR is not None:
+        available_years = {r["year"] for r in records}
+        if ONLY_YEAR not in available_years:
+            raise ValueError(
+                f"ONLY_YEAR={ONLY_YEAR} not found in input files. "
+                f"Available years: {sorted(y for y in available_years if y is not None)}"
+            )
+
     print(f"Found {len(records)} files")
     print(f"First file: {records[0]['name']}")
     print(f"Last file:  {records[-1]['name']}")
@@ -341,9 +358,24 @@ def main():
         print(f"Dask dashboard: {client.dashboard_link}")
 
         for record, (start, end) in zip(records, offsets):
-            if record["name"] in completed:
-                print(f"Skipping completed file: {record['name']}")
+            if ONLY_YEAR is not None and record["year"] != ONLY_YEAR:
                 continue
+
+            is_forced_only_year = (
+                ONLY_YEAR is not None
+                and FORCE_RERUN_ONLY_YEAR
+                and record["year"] == ONLY_YEAR
+            )
+
+            if record["name"] in completed:
+                if is_forced_only_year:
+                    print(f"Rewriting selected year despite progress: {record['name']}")
+                else:
+                    print(f"Skipping completed file: {record['name']}")
+                    continue
+
+            if ONLY_YEAR is not None:
+                print(f"Processing selected year {ONLY_YEAR}: {record['name']}")
 
             t0 = time.time()
             print(
@@ -377,6 +409,10 @@ def main():
 
             completed.add(record["name"])
             save_progress({"completed": sorted(completed)})
+
+            if ONLY_YEAR is not None:
+                print(f"Selected year {ONLY_YEAR} rewrite complete.")
+                break
 
     finalize_metadata()
     ds_final = xr.open_zarr(ANNUAL_STORE, consolidated=True)

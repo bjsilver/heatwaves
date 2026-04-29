@@ -39,10 +39,10 @@ TIME_ZONE = "utc+00:00"
 FREQUENCY = "1_hourly"
 
 # Adjust these if you want a different period.
-START_YEAR = 2000
-END_YEAR = 2020
+START_YEAR = 1970
+END_YEAR = 2000
 
-OUTPUT_DIR = Path('/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/')
+OUTPUT_DIR = ERA5_PATH
 OUTPUT_TEMPLATE = "era5_land_skinT_on_single_level_daily_{year}.nc"
 
 MONTHS = [f"{month:02d}" for month in range(1, 13)]

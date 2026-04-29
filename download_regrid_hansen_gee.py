@@ -13,9 +13,9 @@ geemap.ee_initialize()
 
 # 2. Setup Data and ROI (South America / Amazon BBox)
 dataset = ee.Image('UMD/hansen/global_forest_change_2024_v1_12')
-#roi = ee.Geometry.BBox(-82, -20, -24, 13) 
+roi = ee.Geometry.BBox(-82, -20, -24, 13) 
 # test small roi
-roi = ee.Geometry.BBox(-63, -6, -62, -5)
+#roi = ee.Geometry.BBox(-63, -6, -62, -5)
 
 # Extract core bands
 tc00 = dataset.select('treecover2000').clip(roi)
@@ -90,5 +90,5 @@ task_tc.start()
 task_gain.start()
 
 
-
+#%% export regridded loss
 

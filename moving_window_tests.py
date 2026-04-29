@@ -11,8 +11,6 @@ import matplotlib.pyplot as plt
 from ufuncs import lon_to_180
 
 
-
-
 def safe_compute_dataset(ds, memory_budget_gb=70, safety_factor=2.0, num_workers=4):
     estimated_bytes = ds.nbytes
     estimated_peak_bytes = int(estimated_bytes * safety_factor)
@@ -107,7 +105,8 @@ def moving_window_analysis(ds, window_radius, d_cc_var_name='d_cc',
 
     # only keep pixels where:
     valid = [
-        ds[d_cc_var_name] > 0, #  CC loss data present and >0
+        #ds[d_cc_var_name] > 0,
+        ds[d_cc_var_name] >= 0, #  CC loss data present and >0
         ds[d_cc_var_name] < nds[d_cc_var_name].max('neighbour'), # at least one neighbour with higher CC loss
         ds[dep_var_name].notnull(), # temperature change data present
         # how about edge pixels?
@@ -223,11 +222,14 @@ plot_binned_results(results,
 def load_era_heatwaves_count_data(heatwave_year_range=None):
     OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5_heatwaves.zarr'
     da = xr.open_zarr(OUTPUT_PATH, consolidated=True)['heatwaves']
-    if heatwave_year_range:
-        da = da.sel(time=slice(f'{heatwave_year_range[0]}-01-01', f'{heatwave_year_range[1]}-12-31'))
-    count = da.sum('time').compute()
+    start_years = [2003, 2004, 2005]
+    end_years = [2018, 2019, 2020]
+    # if heatwave_year_range:
+    #     da = da.sel(time=slice(f'{heatwave_year_range[0]}-01-01', f'{heatwave_year_range[1]}-12-31'))
+    count = da.sel(time=da.time.dt.year.isin(end_years)).sum('time') - da.sel(time=da.time.dt.year.isin(start_years)).sum('time')
+    # count = da.sum('time').compute()
     start_year, end_year = da.time.dt.year.min().item(), da.time.dt.year.max().item()
-    count.attrs['units'] = f'n days during {start_year}-{end_year}'
+    # count.attrs['units'] = f'n days during {start_year}-{end_year}'
     count.attrs['long_name'] = 'heatwave days'
     count.name = 'heatwave_day_count'
     count = count.rename({'lat': 'latitude', 'lon': 'longitude'})
@@ -248,14 +250,46 @@ results = moving_window_analysis(ds, window_radius=1, d_cc_var_name='d_cc', dep_
 plot_binned_results(results,
                     xlabel='paired pixel difference in canopy cover bin (%)',
                     bin_lims=(0,55), bin_width=5,
-                    ylabel='difference in deforestation (%)',
+                    ylabel='difference in number of heatwave days',
                     spath=FIGDIR+'moving_window_tests/era5_heatwave_count.png',)
 
+#%% Lawrence heatwaves
+def get_lawrence_era5_heatwaves():
+    LAWPATH = '/uolstore/Research/b/b0256/Users/earjba/jackson_tropical_heatwaves/'
+    law = xr.open_mfdataset(LAWPATH+'hw_dataset*.nc')['hw']
+    law = law.rename({'lat': 'latitude', 'lon': 'longitude'})
+    law = lon_to_180(law)
+    law = law.sortby('latitude')
+    law = law.sel(AMAZON_BBOX)
+    law = law > 0
+    tindex = xr.date_range('1993-01-01', '2022-12-31', freq='D', calendar='noleap')
+    law.coords['time'] = tindex
+    start_years = np.arange(1995, 2001)
+    end_years = np.arange(2015, 2021)
+    hw_diff = law.sel(time=law.time.dt.year.isin(end_years)).sum('time') - law.sel(time=law.time.dt.year.isin(start_years)).sum('time')
+    hw_diff.attrs['long_name'] = 'heatwave days'
+    return hw_diff
+def prepare_lawrence_era5_heatwaves_hansen():
+    hw = get_lawrence_era5_heatwaves()
+    hansen = get_hansen_deforestation(res=0.25, type='loss')
+    hw, hansen = ensure_match_coords(hw, hansen)
+    ds = xr.Dataset({
+        'heatwave_count': hw,
+        'd_cc': hansen
+    })
+    return ds.compute()
+
+ds = prepare_lawrence_era5_heatwaves_hansen()
+results = moving_window_analysis(ds, window_radius=1, d_cc_var_name='d_cc', dep_var_name='heatwave_count')
+plot_binned_results(results,
+                    xlabel='paired pixel difference in canopy cover bin (%)',
+                    bin_lims=(0,55), bin_width=5,
+                    ylabel='difference in number of heatwave days',
+                    spath=FIGDIR+'moving_window_tests/lawrence_era5_heatwave_count.png',)
+
+
+
 #%% test with zz heatwaves data
-
-
-
-
 def prepare_zz_heatwaves_hansen_data(heatwave_year_range=None):
     ZZ_HEATWAVES_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/heatdays/heatwaves.zarr'
     da = xr.open_zarr(ZZ_HEATWAVES_PATH, consolidated=True)['heatwaves']

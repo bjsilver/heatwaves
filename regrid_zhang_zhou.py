@@ -10,6 +10,8 @@ import numpy as np
 import xarray as xr
 import xesmf as xe
 import zarr
+from dask.distributed import Client, LocalCluster
+from tqdm import tqdm
 
 
 RECHUNKED_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
@@ -22,11 +24,12 @@ VARNAME = 'Ta_TMAX'
 SOURCE_NODATA_THRESHOLD = -30000
 SPATIAL_CHUNK = 256
 TIME_CHUNK = 365
-THREAD_WORKERS = 28
+NUM_PROCESSES = 4
+THREAD_WORKERS = 16
 WRITE_TILE = 256
-RESET_OUTPUT = True
+RESET_OUTPUT = False
 
-TARGET_RES = .05
+TARGET_RES = .01
 
 
 def mask_source_nodata(da):
@@ -107,109 +110,116 @@ def create_skeleton(time_vals, target_lat, target_lon):
 
 def main():
     print('Opening source Zarr (lazy)...')
-    ds = xr.open_zarr(SOURCE_STORE, consolidated=True)
+    # Setup the hybrid pool: 4 processes, 16 threads each = 64 cores total
+    with LocalCluster(n_workers=NUM_PROCESSES, threads_per_worker=THREAD_WORKERS, memory_limit='40GB') as cluster:
 
-    time_vals_all = ds.time.values
-    years_arr = np.array([t.year for t in time_vals_all], dtype=np.int32)
-    years = sorted(set(int(y) for y in years_arr))
+        with Client(cluster) as client:
 
-    print('Building target grid...')
-    target_lat, target_lon, target_grid = build_target_grid(ds)
-    print(f'  Output shape: ({len(time_vals_all)}, {target_lat.size}, {target_lon.size})')
+            ds = xr.open_zarr(SOURCE_STORE, consolidated=True)
 
-    print(f'Weights path: {WEIGHTS_PATH}')
-    if os.path.exists(WEIGHTS_PATH):
-        print('  Reusing existing weights...')
-        regridder = xe.Regridder(
-            ds[VARNAME],
-            target_grid,
-            'bilinear',
-            reuse_weights=True,
-            weights=WEIGHTS_PATH,
-        )
-    else:
-        print('  Building new weights...')
-        regridder = xe.Regridder(ds[VARNAME], target_grid, 'bilinear')
-        regridder.to_netcdf(WEIGHTS_PATH)
-        print(f'  Saved weights to {WEIGHTS_PATH}')
+            time_vals_all = ds.time.values
+            years_arr = np.array([t.year for t in time_vals_all], dtype=np.int32)
+            years = sorted(set(int(y) for y in years_arr))
 
-    create_skeleton(time_vals_all, target_lat, target_lon)
+            print('Building target grid...')
+            target_lat, target_lon, target_grid = build_target_grid(ds)
+            print(f'  Output shape: ({len(time_vals_all)}, {target_lat.size}, {target_lon.size})')
 
-    year_slices = {}
-    for year in years:
-        idx = np.where(years_arr == year)[0]
-        year_slices[year] = (int(idx[0]), int(idx[-1]) + 1)
+            print(f'Weights path: {WEIGHTS_PATH}')
+            if os.path.exists(WEIGHTS_PATH):
+                print('  Reusing existing weights...')
+                regridder = xe.Regridder(
+                    ds[VARNAME],
+                    target_grid,
+                    'bilinear',
+                    reuse_weights=True,
+                    weights=WEIGHTS_PATH,
+                )
+            else:
+                print('  Building new weights...')
+                regridder = xe.Regridder(ds[VARNAME], target_grid, 'bilinear')
+                regridder.to_netcdf(WEIGHTS_PATH)
+                print(f'  Saved weights to {WEIGHTS_PATH}')
 
-    progress = load_or_create_progress(years)
-    completed_years = set(progress['completed_years'])
+            create_skeleton(time_vals_all, target_lat, target_lon)
 
-    root = zarr.open_group(OUTPUT_STORE, mode='r+')
-    z_data = root[VARNAME]
+            year_slices = {}
+            for year in years:
+                idx = np.where(years_arr == year)[0]
+                year_slices[year] = (int(idx[0]), int(idx[-1]) + 1)
 
-    total_start = time.time()
-    for i, year in enumerate(years, start=1):
-        start_idx, end_idx = year_slices[year]
-        n_days = end_idx - start_idx
+            progress = load_or_create_progress(years)
+            completed_years = set(progress['completed_years'])
 
-        if year in completed_years:
-            print(f'  [{i}/{len(years)}] {year}: already completed, skipping')
-            continue
+            root = zarr.open_group(OUTPUT_STORE, mode='r+')
+            z_data = root[VARNAME]
 
-        year_start = time.time()
-        year_da = ds[VARNAME].isel(time=slice(start_idx, end_idx)).chunk(
-            {'time': -1, 'lat': SPATIAL_CHUNK, 'lon': SPATIAL_CHUNK}
-        )
-        year_da = mask_source_nodata(year_da)
-        regridded = regridder(
-            year_da,
-            skipna=True,
-            na_thres=1.0,
-            output_chunks={'lat': SPATIAL_CHUNK, 'lon': SPATIAL_CHUNK},
-        ).astype('float32')
+            total_start = time.time()
+            for i, year in enumerate(years, start=1):
+                start_idx, end_idx = year_slices[year]
+                n_days = end_idx - start_idx
 
-        task_count = len(regridded.data.dask)
-        print(
-            f'  [{i}/{len(years)}] {year}: {task_count} tasks, '
-            f'time[{start_idx}:{end_idx}]...',
-            flush=True,
-        )
+                if year in completed_years:
+                    print(f'  [{i}/{len(years)}] {year}: already completed, skipping')
+                    continue
 
-        # Compute and write spatial tiles to keep memory bounded.
-        n_lat = target_lat.size
-        n_lon = target_lon.size
-        tile_total = ((n_lat + WRITE_TILE - 1) // WRITE_TILE) * ((n_lon + WRITE_TILE - 1) // WRITE_TILE)
-        tile_done = 0
+                year_start = time.time()
+                year_da = ds[VARNAME].isel(time=slice(start_idx, end_idx)).chunk(
+                    {'time': -1, 'lat': SPATIAL_CHUNK, 'lon': SPATIAL_CHUNK}
+                )
+                year_da = mask_source_nodata(year_da)
+                regridded = regridder(
+                    year_da,
+                    skipna=True,
+                    na_thres=1.0,
+                    output_chunks={'lat': SPATIAL_CHUNK, 'lon': SPATIAL_CHUNK},
+                ).astype('float32')
 
-        for lat0 in range(0, n_lat, WRITE_TILE):
-            lat1 = min(lat0 + WRITE_TILE, n_lat)
-            for lon0 in range(0, n_lon, WRITE_TILE):
-                lon1 = min(lon0 + WRITE_TILE, n_lon)
+                task_count = len(regridded.data.dask)
+                print(
+                    f'  [{i}/{len(years)}] {year}: {task_count} tasks, '
+                    f'time[{start_idx}:{end_idx}]...',
+                    flush=True,
+                )
 
-                tile_da = regridded.isel(lat=slice(lat0, lat1), lon=slice(lon0, lon1))
-                with dask.config.set(scheduler='threads', num_workers=THREAD_WORKERS):
-                    with dask.diagnostics.ProgressBar():
-                        tile_np = tile_da.data.compute()
+                # Compute and write spatial tiles to keep memory bounded.
+                n_lat = target_lat.size
+                n_lon = target_lon.size
+                tile_total = ((n_lat + WRITE_TILE - 1) // WRITE_TILE) * ((n_lon + WRITE_TILE - 1) // WRITE_TILE)
+                tile_done = 0
 
-                z_data[start_idx:end_idx, lat0:lat1, lon0:lon1] = tile_np
+                for lat0 in tqdm(range(0, n_lat, WRITE_TILE)):
+                    lat1 = min(lat0 + WRITE_TILE, n_lat)
+                    for lon0 in range(0, n_lon, WRITE_TILE):
+                        lon1 = min(lon0 + WRITE_TILE, n_lon)
 
-                tile_done += 1
-                if tile_done % 20 == 0 or tile_done == tile_total:
-                    print(
-                        f'    tiles {tile_done}/{tile_total} '
-                        f'({100.0 * tile_done / tile_total:.1f}%)',
-                        flush=True,
-                    )
+                        tile_da = regridded.isel(lat=slice(lat0, lat1), lon=slice(lon0, lon1))
+                        # with dask.config.set(scheduler='threads', num_workers=THREAD_WORKERS):
+                        #     with dask.diagnostics.ProgressBar():
+                        #         tile_np = tile_da.data.compute()
 
-        completed_years.add(year)
-        progress['completed_years'] = sorted(completed_years)
-        save_progress(progress)
+                        tile_np = tile_da.data.compute(scheduler='distributed')
 
-        print(f'    done in {time.time() - year_start:.1f}s', flush=True)
+                        z_data[start_idx:end_idx, lat0:lat1, lon0:lon1] = tile_np
 
-    print(f'All years written in {time.time() - total_start:.1f}s')
-    print('Consolidating metadata...')
-    zarr.consolidate_metadata(OUTPUT_STORE)
-    print(f'Done. Output: {OUTPUT_STORE}')
+                        tile_done += 1
+                        if tile_done % 20 == 0 or tile_done == tile_total:
+                            print(
+                                f'    tiles {tile_done}/{tile_total} '
+                                f'({100.0 * tile_done / tile_total:.1f}%)',
+                                flush=True,
+                            )
+
+                completed_years.add(year)
+                progress['completed_years'] = sorted(completed_years)
+                save_progress(progress)
+
+                print(f'    done in {time.time() - year_start:.1f}s', flush=True)
+
+            print(f'All years written in {time.time() - total_start:.1f}s')
+            print('Consolidating metadata...')
+            zarr.consolidate_metadata(OUTPUT_STORE)
+            print(f'Done. Output: {OUTPUT_STORE}')
 
 
 #%%
