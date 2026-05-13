@@ -38,3 +38,12 @@ heatwaves_timesum_amazon.plot.contourf(ax=ax, levels=levels, cmap='magma',
                                         cbar_kwargs={'label':'Number of heatwave days',
                                                      'shrink':0.8})
 fig.savefig(FIGDIR+'heatwave_days_amazon.png', dpi=400, bbox_inches='tight')
+
+#%% compare heatwave days with ERA5- and ZZ-derived percentile threshold
+zz = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatdays.zarr')['heatdays']
+era = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatdays_era5pctl.zarr')['heatdays']
+
+ds = xr.Dataset({'zz':zz, 'era':era})
+
+with ProgressBar():
+    timesum = ds.sum(['year', 'doy']).compute(num_workers=16, num_threads=4)

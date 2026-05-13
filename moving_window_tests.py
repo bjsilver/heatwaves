@@ -5,7 +5,7 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 from dask.diagnostics import ProgressBar
-from calculate_tmax_percentiles import load_tmax_da
+from calculate_zz_percentiles import load_tmax_da
 from constants import MODIS_PATH, HANSEN_PATH, ERA5_PATH, AMAZON_BBOX, FIGDIR
 import matplotlib.pyplot as plt
 from ufuncs import lon_to_180

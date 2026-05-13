@@ -23,7 +23,7 @@ WEIGHTS_FILE = "/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/weig
 PROGRESS_JSON = "/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/progress.json"
 YEAR_RANGE = range(2003, 2021)
 
-RESET_OUTPUT = True
+RESET_OUTPUT = False
 
 #%%
 # WEIGHTS
@@ -53,6 +53,13 @@ def get_regridder(source_ds, target_ds):
                     )
     return regridder
 
+def fix_time_coord(ds, year):
+    ds = ds.rename({'DOY': 'time'})
+    tindex = xr.date_range(start=f"{year}-01-01", end=f"{year}-12-31",
+                            freq='D', calendar='noleap')
+    ds.coords['time'] = tindex
+    return ds
+
 def get_regridder_and_data(year):
     # create target grid
     lats = np.arange(-30, 20, .01)
@@ -67,10 +74,13 @@ def get_regridder_and_data(year):
         np.ones((len(target_ds.lat), len(target_ds.lon)), dtype=bool),
         dims=["lat", "lon"]
     )
+
+
     
     source_ds = xr.open_dataset(f"{SOURCE_DIR}SouthAmerica_Ta_SVCMsp_{year}TMAX_daily_tropics30N30S.nc",
                                 chunks={'DOY':1, 'lat':1024, 'lon':1024}).drop_vars('spatial_ref', errors='ignore')
-
+    
+    source_ds = fix_time_coord(source_ds, year)
     regridder = get_regridder(source_ds, target_ds)
 
 
@@ -130,7 +140,7 @@ if __name__ == "__main__":
                     regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='w', consolidated=False)
                 else:
                     print("Appending to existing Zarr store...")
-                    regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='DOY', consolidated=False)
+                    regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='time', consolidated=False)
 
                 completed_years.add(year)
                 progress['completed_years'] = sorted(completed_years)

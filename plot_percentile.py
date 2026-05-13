@@ -12,7 +12,7 @@ import multiprocessing as mp
 import matplotlib.pyplot as plt
 import numpy as np
 import subprocess
-from calculate_tmax_percentiles import load_tmax_da
+from calculate_zz_percentiles import load_tmax_da
 from constants import FIGDIR
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 

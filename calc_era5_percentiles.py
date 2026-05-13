@@ -1,4 +1,5 @@
 #%%
+import xarray as xr
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -7,15 +8,13 @@ import pandas as pd
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from numba import njit, prange
-
+import os
 from constants import AMAZON_BBOX, ERA5_PATH
 from ufuncs import lon_to_180
+from dask.distributed import Client, LocalCluster
 
-try:
-    from dask.distributed import Client, LocalCluster
-except ImportError:  # pragma: no cover
-    Client = None
-    LocalCluster = None
+ERA_YEAR_RANGE = range(1970, 2000)
+
 
 PAD = 7
 PERCENTILE = 0.95
@@ -23,14 +22,14 @@ ABSOLUTE_THRESHOLD_C = 28.5
 HEATWAVE_DAY_THRESH = 3
 
 USE_LOCAL_CLUSTER = True
-N_WORKERS = 8
-THREADS_PER_WORKER = 1
-MEMORY_LIMIT = '10GB'
+N_WORKERS = 4
+THREADS_PER_WORKER = 4
+MEMORY_LIMIT = '80GB'
 
 ERA5_OPEN_CHUNKS = {'time': 365}
 ERA5_ANALYSIS_CHUNKS = {'time': 365, 'lat': 120, 'lon': 120}
 ERA5_YEAR_DOY_CHUNKS = {'year': 1, 'doy': 365, 'lat': 120, 'lon': 120}
-OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5_heatwaves.zarr'
+OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/era5_percentile_1970-1999.zarr'
 
 @njit
 def _quantile_skipna_1d(vals, q):
@@ -93,7 +92,7 @@ def maybe_local_cluster():
         n_workers=N_WORKERS,
         threads_per_worker=THREADS_PER_WORKER,
         memory_limit=MEMORY_LIMIT,
-        dashboard_address=':8787',
+        dashboard_address=':7878',
     ) as cluster:
         with Client(cluster) as client:
             print(f'LocalCluster started: {client.dashboard_link}')
@@ -101,11 +100,12 @@ def maybe_local_cluster():
 
 def load_era5_skt_celsius():
     da = xr.open_mfdataset(
-        ERA5_PATH + 'era5_land_skinT_on_single_level_daily_*.nc',
+        ERA5_PATH + 'era5_land_skinT_dailymax*.nc',
         chunks=ERA5_OPEN_CHUNKS,
         parallel=False,
     )['skt'].astype(np.float32)
     da = da.rename({'valid_time': 'time'})
+    da = da.sel(time=slice(f'{ERA_YEAR_RANGE.start}-01-01', f'{ERA_YEAR_RANGE.stop - 1}-12-31'))
     da = lon_to_180(da)
     da = da.sortby('latitude')
     da = da.sel(AMAZON_BBOX)
@@ -208,9 +208,7 @@ def run_pipeline():
     era_year_doy = reshape_to_year_doy(era)
 
     p95 = calculate_percentile95(era_year_doy)
-    heatdays = calculate_heatdays(era_year_doy, p95)
-    heatwaves = calculate_heatwaves(heatdays)
-    return heatwaves
+    return p95
 
 def save_heatwaves(heatwaves, output_path=OUTPUT_PATH):
     print(f'Saving final heatwaves to {output_path}...')
@@ -221,8 +219,9 @@ def save_heatwaves(heatwaves, output_path=OUTPUT_PATH):
             mode='w',
             consolidated=True,
         )
+
 #%%
 if __name__ == '__main__':
     with maybe_local_cluster():
-        heatwaves = run_pipeline()
-        save_heatwaves(heatwaves)
+        p95 = run_pipeline()
+        save_heatwaves(p95, output_path=OUTPUT_PATH)
