@@ -15,15 +15,15 @@ HEATWAVE_DAY_THRESH = 3
 
 def load_data():
     zz = xr.open_zarr(STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
-                    consolidated=True)['Ta_TMAX']
-
+                    consolidated=True)['Ta_TMAX'] / 10
+    
     # check if zz time has duplicates
     if len(zz.time) != len(np.unique(zz.time)):
         print("Warning: Duplicate time entries found in zz dataset. Removing duplicates.")
         zz = zz.drop_duplicates('time')
 
     zz_pct = xr.open_zarr(STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
-                        consolidated=True)['Ta_TMAX_p95']
+                        consolidated=True)['Ta_TMAX_p95'] / 10
     zz_pct = zz_pct[:, :-1, :-1]
 
     era_pct_1970_1999 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_1970-1999_rechunked.zarr',
@@ -35,7 +35,7 @@ def load_data():
     pct = xr.Dataset({'era_1970-1999': era_pct_1970_1999, 'era_2003-2020': era_pct_2003_2020})
     
     zz, pct = ensure_match_coords(zz, pct)
-    pct['zz_2003-2020'] = zz_pct / 10
+    pct['zz_2003-2020'] = zz_pct
     pct.coords['time'] = list(range(1, 366))
     return zz, pct
 
@@ -56,7 +56,7 @@ def calculate_heatdays(zz, pctda, write_path):
         zz_time_coords = zz_year.coords['time']
         zz_year_doy = zz_year.assign_coords(time=np.arange(1, zz_year.sizes['time'] + 1))
 
-        heatdays_year = ((zz_year_doy > 28.5) & (zz_year_doy > pctda_doy)).assign_coords(time=zz_time_coords)
+        heatdays_year = ((zz_year_doy > 28.5) & (zz_year_doy > pctda)).assign_coords(time=zz_time_coords)
         heatdays_year.name = 'heatdays'
 
         if i == 0:
