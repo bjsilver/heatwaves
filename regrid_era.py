@@ -4,6 +4,7 @@ import os
 import numpy as np
 import xarray as xr
 import xesmf as xe
+import regionmask
 
 from constants import ERA5_PATH, STORAGE_DIR
 from calc_era5_percentiles import maybe_local_cluster, save_heatwaves
@@ -73,3 +74,4 @@ if __name__ == '__main__':
         p95 = load_percentile_data()
         regridded_p95 = regrid_to_zz(p95)
         save_heatwaves(regridded_p95, output_path=OUTPUT_PATH)
+ 

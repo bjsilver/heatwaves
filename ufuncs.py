@@ -4,6 +4,7 @@ import json
 import shutil
 import xarray as xr
 import numpy as np
+from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR
 
 def lon_to_180(ds):
     ds = ds.copy()
@@ -79,3 +80,16 @@ def ensure_match_coords(ds1, ds2, round_decimals=2):
     ds1 = ds1.sel(lat=lat_coords, lon=lon_coords)
     ds2 = ds2.sel(lat=lat_coords, lon=lon_coords)
     return ds1, ds2
+
+def load_heat(category='heatdays'):
+    dss = {}
+    for key in PERCENTILE_KEYS:
+        da = xr.open_zarr(STORAGE_DIR + f'heatdays/{category}_{key}.zarr', consolidated=False)[category]
+        dss[key] = da
+    ds = xr.Dataset(dss)
+    ds = ds.assign_coords(lat=np.round(ds.lat, 2), lon=np.round(ds.lon, 2))
+    return ds
+
+def open_hansen():
+    ds = xr.open_zarr(HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr', consolidated=False)['tree_cover']
+    return ds

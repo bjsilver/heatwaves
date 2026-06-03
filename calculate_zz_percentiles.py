@@ -3,18 +3,17 @@
 #%%
 import os
 from contextlib import contextmanager
-
 import numpy as np
 from numba import njit, prange
 import xarray as xr
+import dask
 import dask.array as da_lazy
 from pathlib import Path
 from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
 
-
 # --- CONFIGURATION ---
-DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
+DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 OUT_ZARR = os.path.join(PERCENTILES_DIR, 'zz_tmax_95pc.zarr')
 PAD = 7
@@ -23,7 +22,8 @@ PERCENTILE = 0.95
 USE_LOCAL_CLUSTER = True
 N_WORKERS = 32
 THREADS_PER_WORKER = 4
-MEMORY_LIMIT = '8GB'
+MEMORY_LIMIT = '16GB'
+TILE_SIZE = 120  # spatial tile size for lat/lon
 
 # Ensure output directory exists.
 Path(PERCENTILES_DIR).mkdir(parents=True, exist_ok=True)
@@ -73,67 +73,68 @@ def quantile_over_window_view_skipna(win_view, q):
 # --- HELPER FUNCTIONS ---
 
 def load_tmax_da():
-    print(f"Opening input Zarr: {DPATH}tmax_regridded.zarr")
+    print(f"Opening input Zarr: {DPATH}zhang_zhou_regridded.zarr")
     # Use consolidated=False to support stores without .zmetadata.
-    ds = xr.open_zarr(DPATH + 'tmax_regridded.zarr', chunks={}, consolidated=False)
+    ds = xr.open_zarr(DPATH + 'zhang_zhou_regridded.zarr', chunks={}, consolidated=False)
     da = ds['Ta_TMAX']
     # check if zz time has duplicates
     if len(da.time) != len(np.unique(da.time)):
         print("Warning: Duplicate time entries found in zz dataset. Removing duplicates.")
         da = da.drop_duplicates('time')
 
-    da.coords['lat'] = np.where(np.isnan(da.lat.values), 0, da.lat.values)
-
-    if 'time' in da.dims:
-        year_vals = da['time'].dt.year.data
-        doy_vals = da['time'].dt.dayofyear.data
-        da = da.assign_coords(year=('time', year_vals), doy=('time', doy_vals))
-        da = da.set_index(time=['year', 'doy']).unstack('time').transpose('year', 'doy', 'lat', 'lon')
-
-    if 'doy' not in da.coords:
-        da = da.assign_coords(doy=np.arange(1, da.sizes['doy'] + 1))
-
-    da = da.transpose('year', 'doy', 'lat', 'lon')
-
-    print('Using native chunks from source/transform pipeline:')
-    print(dict(zip(da.dims, da.chunks)))
-
-    min_doy_chunk = min(da.chunks[da.get_axis_num('doy')])
-    if min_doy_chunk <= 2 * PAD:
-        raise ValueError(
-            f'doy chunk size must be > {2 * PAD} for map_overlap with PAD={PAD}. '
-            f'Current minimum doy chunk is {min_doy_chunk}.'
-        )
-
     return da
 
-def _percentile_block_with_stride_view(block, pad, q):
-    # block shape: (year, doy_with_halo, lat, lon)
+def _percentile_block_flat_time(block, n_years, pad, q):
+    # block shape: (n_years * 365, lat, lon) — no leap days guaranteed
+    n_days = 365
+    _, nlat, nlon = block.shape
+
+    # Zero-copy view as (n_years, 365, lat, lon) for C-contiguous arrays
+    reshaped = block.reshape(n_years, n_days, nlat, nlon)
+
+    # Periodic padding on the doy axis (within each year)
+    padded = np.concatenate(
+        [reshaped[:, -pad:, :, :], reshaped, reshaped[:, :pad, :, :]],
+        axis=1,
+    )
+    # padded shape: (n_years, 365 + 2*pad, lat, lon)
+
     window = 2 * pad + 1
-    win_view = np.lib.stride_tricks.sliding_window_view(block, window_shape=window, axis=1)
+    win_view = np.lib.stride_tricks.sliding_window_view(
+        padded, window_shape=window, axis=1
+    )
+    # win_view shape: (n_years, 365, lat, lon, window)
+
     return quantile_over_window_view_skipna(win_view, q)
 
 
 def compute_percentiles_dask(tmax_da):
-    arr = tmax_da.data
-    out = da_lazy.map_overlap(
-        _percentile_block_with_stride_view,
+    n_years = tmax_da.sizes['time'] // 365
+
+    # Rechunk with method='tasks' to avoid the P2P shuffle algorithm which
+    # spills to /tmp.  The tasks-based rechunk is pure in-memory graph fusion.
+    arr = tmax_da.data.rechunk(
+        {0: n_years * 365, 1: TILE_SIZE, 2: TILE_SIZE},
+        method='tasks',
+    )
+
+    out = da_lazy.map_blocks(
+        _percentile_block_flat_time,
         arr,
-        depth={0: 0, 1: PAD, 2: 0, 3: 0},
-        boundary={0: 'none', 1: 'periodic', 2: 'none', 3: 'none'},
-        trim=False,
         dtype=np.float32,
+        n_years=n_years,
         pad=PAD,
         q=PERCENTILE,
         drop_axis=0,
-        chunks=(arr.chunks[1], arr.chunks[2], arr.chunks[3]),
+        new_axis=0,
+        chunks=((365,), arr.chunks[1], arr.chunks[2]),
     )
 
     return xr.DataArray(
         out,
         dims=('doy', 'lat', 'lon'),
         coords={
-            'doy': tmax_da['doy'],
+            'doy': np.arange(1, 366, dtype=np.int16),
             'lat': tmax_da['lat'],
             'lon': tmax_da['lon'],
         },
@@ -165,7 +166,7 @@ def save_percentiles(p95_da, out_path=OUT_ZARR):
         ds_out.to_zarr(out_path, mode='w', consolidated=True)
 
 
-
+#%%
 if __name__ == "__main__":
     with maybe_local_cluster():
         tmax = load_tmax_da()

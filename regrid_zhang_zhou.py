@@ -23,10 +23,9 @@ WEIGHTS_FILE = "/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/weig
 PROGRESS_JSON = "/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/progress.json"
 YEAR_RANGE = range(2003, 2021)
 
-RESET_OUTPUT = False
+RESET_OUTPUT = True
 
-#%%
-# WEIGHTS
+
 
 def get_regridder(source_ds, target_ds):
     if not os.path.exists(WEIGHTS_FILE):
@@ -122,7 +121,7 @@ if __name__ == "__main__":
                       threads_per_worker=16,
                       dashboard_address=':8787') as cluster:
         with Client(cluster) as client:
-
+            print(f"Dask Dashboard available at: {client.dashboard_link}")
             for year in YEAR_RANGE:
 
                 if year in completed_years:
@@ -132,7 +131,7 @@ if __name__ == "__main__":
 
                 regridded_ds, regridder = get_regridder_and_data(year)
 
-                print(f"Dask Dashboard available at: {client.dashboard_link}")
+                
 
                 print('saving to zarr...')
                 if not os.path.exists(ZARR_DESTINATION):

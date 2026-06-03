@@ -12,8 +12,8 @@ geemap.ee_initialize()
 #%%
 
 # 2. Setup Data and ROI (South America / Amazon BBox)
-dataset = ee.Image('UMD/hansen/global_forest_change_2024_v1_12')
-roi = ee.Geometry.BBox(-82, -20, -24, 13) 
+dataset = ee.Image('UMD/hansen/global_forest_change_2025_v1_13')
+roi = ee.Geometry.BBox(-82, -30, -34.5, 20) 
 # test small roi
 #roi = ee.Geometry.BBox(-63, -6, -62, -5)
 
@@ -21,10 +21,6 @@ roi = ee.Geometry.BBox(-82, -20, -24, 13)
 tc00 = dataset.select('treecover2000').clip(roi)
 loss_year = dataset.select('lossyear').clip(roi)
 gain = dataset.select('gain').clip(roi)
-
-#%%
-
-
 
 
 #%%
@@ -44,7 +40,7 @@ annual_stack = ee.Image.cat(annual_list)
 # 4. Regridding (0.01 degree)
 target_crs = 'EPSG:4326'
 grid_size = 0.01 
-target_transform = [grid_size, 0, -180, 0, -grid_size, 90]
+target_transform = [grid_size, 0, -180.005, 0, -grid_size, 90.005]
 
 regridded_tc = annual_stack.reduceResolution(
     reducer=ee.Reducer.mean(), 

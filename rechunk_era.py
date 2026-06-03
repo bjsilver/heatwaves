@@ -31,7 +31,7 @@ if __name__ == '__main__':
     with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
         rechunked = da.rechunk(target_chunks)
 
-    with LocalCluster(n_workers=16, threads_per_worker=1, memory_limit='8GB') as cluster:
+    with LocalCluster(n_workers=16, threads_per_worker=1, memory_limit='16GB') as cluster:
         with Client(cluster) as client:
             print(f"Dask Dashboard available at: {client.dashboard_link}")
             rechunked.to_zarr(target_store, mode='w', consolidated=False, align_chunks=True)
@@ -48,3 +48,5 @@ if __name__ == '__main__':
 
     ds = xr.open_zarr(target_store, consolidated=False)
     print(ds)
+
+#%%

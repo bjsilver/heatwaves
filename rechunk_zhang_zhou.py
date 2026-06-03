@@ -14,12 +14,14 @@ RECHUNK_JOBS = [
         'input_path': STORAGE_DIR + 'regridded/zhang_zhou_regridded.zarr',
         'output_path': STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
         'var_name': 'Ta_TMAX',
+        'dims': ('time', 'lat', 'lon'),
         'consolidated': False,
     },
     {
         'input_path': STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
         'output_path': STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
         'var_name': 'Ta_TMAX_p95',
+        'dims': ('doy', 'lat', 'lon'),
         'consolidated': True,
     },
 ]
@@ -31,7 +33,7 @@ def cleanup_store(store_path):
         shutil.rmtree(store_path)
 
 
-def rechunk_and_save(input_path, output_path, var_name, consolidated=False):
+def rechunk_and_save(input_path, output_path, var_name, dims, consolidated=False):
     cleanup_store(output_path)
     
     print(f"Loading {var_name} from {input_path}")
@@ -53,7 +55,7 @@ def rechunk_and_save(input_path, output_path, var_name, consolidated=False):
     add_metadata_to_zarr(
         output_path,
         var_name=var_name,
-        dims=("time", "lat", "lon"),
+        dims=dims,
         consolidate=True,
         orig_ds=orig,
     )
@@ -62,7 +64,7 @@ def rechunk_and_save(input_path, output_path, var_name, consolidated=False):
     print(f"Output dataset:\n{ds}\n")
     return ds
 
-
+#%%
 if __name__ == '__main__':
     for job in RECHUNK_JOBS:
         rechunk_and_save(**job)

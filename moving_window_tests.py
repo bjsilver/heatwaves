@@ -168,7 +168,7 @@ def plot_binned_results(results, spath=None,
 
 def get_era5_temperature_change(year_window):
     ds = xr.open_mfdataset(
-        ERA5_PATH+'era5_land_skinT_on_single_level_daily_*.nc',
+        ERA5_PATH+'era5_land_skinT_dailymax_*.nc',
         chunks={},
         parallel=False,
     )['skt'].astype(np.float32)
@@ -179,6 +179,7 @@ def get_era5_temperature_change(year_window):
     # round coords and ensure float32
     ds['latitude'] = np.round(ds['latitude'], 2).astype(np.float32)
     ds['longitude'] = np.round(ds['longitude'], 2).astype(np.float32)
+    ds = ds.sel(time=slice('2001-01-01', '2021-12-31'))
     years = np.unique(ds.time.dt.year)
     start_years = years[:year_window]
     end_years = years[-year_window:]
@@ -221,7 +222,7 @@ plot_binned_results(results,
 
 def load_era_heatwaves_count_data(heatwave_year_range=None):
     OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5_heatwaves.zarr'
-    da = xr.open_zarr(OUTPUT_PATH, consolidated=True)['heatwaves']
+    da = xr.open_zarr(OUTPUT_PATH, consolidated=False)['heatwaves']
     start_years = [2003, 2004, 2005]
     end_years = [2018, 2019, 2020]
     # if heatwave_year_range:
