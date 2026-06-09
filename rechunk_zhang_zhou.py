@@ -10,17 +10,24 @@ from ufuncs import add_metadata_to_zarr
 TARGET_CHUNKS = (365, 250, 250)
 
 RECHUNK_JOBS = [
+    # {
+    #     'input_path': STORAGE_DIR + 'regridded/zhang_zhou_regridded.zarr',
+    #     'output_path': STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
+    #     'var_name': 'Ta_TMAX',
+    #     'dims': ('time', 'lat', 'lon'),
+    #     'consolidated': False,
+    # },
+    # {
+    #     'input_path': STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
+    #     'output_path': STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
+    #     'var_name': 'Ta_TMAX_p95',
+    #     'dims': ('doy', 'lat', 'lon'),
+    #     'consolidated': True,
+    # },
     {
-        'input_path': STORAGE_DIR + 'regridded/zhang_zhou_regridded.zarr',
-        'output_path': STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
-        'var_name': 'Ta_TMAX',
-        'dims': ('time', 'lat', 'lon'),
-        'consolidated': False,
-    },
-    {
-        'input_path': STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
-        'output_path': STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
-        'var_name': 'Ta_TMAX_p95',
+        'input_path': STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr',
+        'output_path': STORAGE_DIR + 'rechunked/zz_pct_smooth_rechunked.zarr',
+        'var_name': 'Ta_TMAX_p95_smooth',
         'dims': ('doy', 'lat', 'lon'),
         'consolidated': True,
     },

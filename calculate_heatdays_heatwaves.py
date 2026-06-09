@@ -24,19 +24,24 @@ def load_data():
 
     zz_pct = xr.open_zarr(STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
                         consolidated=True)['Ta_TMAX_p95'] / 10
-    zz_pct = zz_pct[:, :-1, :-1]
+    zz_pct = zz_pct[:, :-1, :-1]  # remove last row and column to match zz dimensions
+    zz_pct_smooth = xr.open_zarr(STORAGE_DIR + 'rechunked/zz_pct_smooth_rechunked.zarr',
+                        consolidated=True)['Ta_TMAX_p95_smooth']
+    zz_pct_smooth = zz_pct_smooth[:, :-1, :-1]  # remove last row and column to match zz dimensions
+    zz_pct_smooth = zz_pct_smooth.rename({'doy':'time'})
 
-    era_pct_1970_1999 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_1970-1999_rechunked.zarr',
-                        consolidated=True)['Ta_TMAX']
+    # era_pct_1970_1999 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_1970-1999_rechunked.zarr',
+    #                     consolidated=True)['Ta_TMAX']
 
-    era_pct_2003_2020 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_2003-2020_rechunked.zarr',
-                        consolidated=True)['Ta_TMAX']
+    # era_pct_2003_2020 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_2003-2020_rechunked.zarr',
+    #                     consolidated=True)['Ta_TMAX']
 
-    pct = xr.Dataset({'era_1970-1999': era_pct_1970_1999, 'era_2003-2020': era_pct_2003_2020})
+    # pct = xr.Dataset({'era_1970-1999': era_pct_1970_1999, 'era_2003-2020': era_pct_2003_2020})
     
-    zz, pct = ensure_match_coords(zz, pct)
-    pct['zz_2003-2020'] = zz_pct
+    
+    pct = xr.Dataset({'zz_2003-2020': zz_pct, 'zz_2003-2020_smooth': zz_pct_smooth})
     pct.coords['time'] = list(range(1, 366))
+    zz, pct = ensure_match_coords(zz, pct)
     return zz, pct
 
 
@@ -84,20 +89,20 @@ def remove_short_runs(heatdays, thresh=HEATWAVE_DAY_THRESH):
 if __name__ == '__main__':
 
     with LocalCluster(n_workers=32, memory_limit='20GB',
-                      threads_per_worker=2, dashboard_address=':8787') as cluster:
+                      threads_per_worker=1, dashboard_address=':8787') as cluster:
         with Client(cluster) as client:
             print(f"Dask Dashboard available at: {client.dashboard_link}")
 
             zz, pct = load_data()
+            # pct = pct.chunk({'lat':250, 'lon':250, 'doy':-1})
 
-            for pctlkey in pct.data_vars:
+            for pctlkey in  ['zz_2003-2020', 'zz_2003-2020_smooth']:
                 print(f"Calculating heatdays and heatwaves for {pctlkey}...")
                 pctda = pct[pctlkey]
                 write_path = STORAGE_DIR + f'heatdays/heatdays_{pctlkey}.zarr'
                 remove_previous_zarr(write_path)
                 print(f"Writing heatdays to {write_path} as yearly appends...")
                 calculate_heatdays(zz, pctda, write_path)
-
                 heatdays = xr.open_zarr(write_path, consolidated=True)['heatdays']
                 heatwaves = remove_short_runs(heatdays)
                 write_path = STORAGE_DIR + f'heatdays/heatwaves_{pctlkey}.zarr'
@@ -105,3 +110,6 @@ if __name__ == '__main__':
                 print(f"Writing heatwaves to {write_path}...")
                 heatwaves.to_zarr(write_path, consolidated=True, mode='w')
            
+#%%
+
+# heatwaves = xr.open_zarr(STORAGE_DIR + 'heatdays/heatwaves_era_2003-2020.zarr', consolidated=True)['heatwaves']

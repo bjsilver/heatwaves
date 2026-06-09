@@ -26,8 +26,7 @@ zz, pctl = load_zz_era_pct()
 
 pretty_percentile = {
     "zz_2003-2020": "Zhang and Zhou 2003-2020",
-    "era_2003-2020": "ERA5 2003-2020",
-    "era_1970-1999": "ERA5 1970-1999"}
+    "zz_2003-2020_smooth": "Zhang and Zhou 2003-2020 (percentile smoothed)"}
 
 #%%
 with ProgressBar():
@@ -37,8 +36,7 @@ with ProgressBar():
 
 cmap_lims = {
     "zz_2003-2020": (28, 40),
-    "era_2003-2020": (28, 40),
-    "era_1970-1999": (22, 32),
+    "zz_2003-2020_smooth": (28, 40)
 }
 
 

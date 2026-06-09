@@ -7,30 +7,42 @@ import os
 import dask.array as da
 from functools import partial
 from ufuncs import load_heat
-from constants import HANSEN_DIR, STORAGE_DIR
+from constants import HANSEN_DIR, PERCENTILES_DIR, STORAGE_DIR
 from dask.distributed import Client, LocalCluster
 from dask.diagnostics import ProgressBar
 import matplotlib.pyplot as plt
 
-def open_hansen_loss(start_year, end_year):
-    HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
+MWA_DIR = STORAGE_DIR + 'moving_window_analysis/'
 
+def open_hansen_loss(start_year, end_year):
     ds = xr.open_zarr(HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr')
     tc = ds['tree_cover']
     tc = tc.sel(time=slice(str(start_year), str(end_year)))
     loss = tc.diff('time').sum('time')
     loss = -loss
     loss = loss.assign_coords(lat=np.round(loss.lat, 2), lon=np.round(loss.lon, 2))
+    loss = loss.drop_vars('spatial_ref')
     return loss
 
-def calculate_heatwaves_trend(heatwaves):
-    heatwaves_yearly = heatwaves.groupby('time.year').sum('time')
-    heatwaves_trend = heatwaves_yearly.polyfit(dim='year', deg=1)
-    trends = heatwaves_trend['polyfit_coefficients'].sel(degree=1)
+def load_tmax_trends(mask_insignificant=True):
+    dpath = os.path.join(PERCENTILES_DIR, 'zz_tmax_ts_trend.zarr')
+    ds = xr.open_zarr(dpath)
+    trends = ds['Ta_TMAX_trend']
+    if mask_insignificant:
+        pvals = ds['Ta_TMAX_trend_pvalue']
+        trends = trends.where(pvals < 0.05)
     return trends
 
-
-
+def combine_dataarrays_match_coords(da1, da2, da1_name='d_cc', da2_name='d_temp'):
+    # round all coords to 2 decimals to ensure alignment
+    da1 = da1.assign_coords(lat=np.round(da1.lat, 2), lon=np.round(da1.lon, 2))
+    da2 = da2.assign_coords(lat=np.round(da2.lat, 2), lon=np.round(da2.lon, 2))
+    # check if coords match
+    if not da1.lat.equals(da2.lat) or not da1.lon.equals(da2.lon):
+        raise ValueError("Latitude and longitude coordinates do not match between the two DataArrays.")
+    # combine into a Dataset
+    ds = xr.Dataset({da1_name: da1, da2_name: da2})
+    return ds
 
 def _mwa_kernel(block, window_radius):
     """Numpy kernel for moving_window_analysis, called by dask.array.map_overlap.
@@ -147,7 +159,7 @@ def calculate_binned_stats(results, csv_path=None,
         'count': bin_counts.values
     })
     if csv_path is not None:
-        bin_stats.to_csv('./data/'+csv_path, index=False)
+        bin_stats.to_csv(MWA_DIR+csv_path, index=False)
         print(f"Saved bin statistics to {csv_path}")
     else:
         return bin_stats
@@ -163,15 +175,16 @@ def slice_elev_mask(da):
 
 #%%
 
-def calc_moving_window(coarsen_factor=None):
+def calc_moving_window(ind_var, dep_var, ind_var_name, dep_var_name, coarsen_factor=None):
+
+    # generate file save name based on variable names and coarsen factor
+    sname = f'{dep_var_name}_vs_{ind_var_name}'
+    if coarsen_factor:
+        sname += f'_coarsened{coarsen_factor}'
 
     elev = xr.open_dataset(STORAGE_DIR + '../elevation/elevation_regridded.nc')['elevation']
 
-
-    loss = open_hansen_loss(2003, 2020)
-    heatwaves = load_heat('heatwaves')['zz_2003-2020']
-    heatwaves_trend = calculate_heatwaves_trend(heatwaves)
-    ds = xr.Dataset({'d_cc': loss, 'heatwaves_trend': heatwaves_trend})
+    ds = combine_dataarrays_match_coords(ind_var, dep_var, da1_name=ind_var_name, da2_name=dep_var_name)
 
     ds = ds.where(elev < 1000)  # mask out high elevation areas
 
@@ -179,79 +192,93 @@ def calc_moving_window(coarsen_factor=None):
         ds = ds.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
 
     results = moving_window_analysis(ds, window_radius=1, 
-                                    d_cc_var_name='d_cc',
-                                    dep_var_name='heatwaves_trend')
+                                    d_cc_var_name=ind_var_name,
+                                    dep_var_name=dep_var_name)
 
-    results = results.compute()
-    # heatwaves_trend.to_zarr(STORAGE_DIR + 'heatwaves/heatwaves_trend_2003_2020.zarr', mode='w')
-    # results = results.to_zarr(STORAGE_DIR + f'heatwaves/moving_window_results_coarsened{coarsen_factor}.zarr', mode='w')
+    results.chunk({'lat': -1, 'lon': -1}).to_zarr(os.path.join(MWA_DIR, f'{sname}_mwa_results.zarr'),
+                    mode='w', consolidated=True)
+    
+    results = xr.open_zarr(os.path.join(MWA_DIR, f'{sname}_mwa_results.zarr'), consolidated=True)
+    
+    csv_path = f'{sname}_stats.csv'
+    calculate_binned_stats(results, csv_path=csv_path, dep_var_name=dep_var_name, bin_width=10)
 
-    # results = xr.open_zarr(STORAGE_DIR + f'heatwaves/moving_window_results_coarsened{coarsen_factor}.zarr')
-    if coarsen_factor:
-        csv_path = f'heatwave_trend_vs_cc_loss_bins_coarsened{coarsen_factor}_stats.csv'
-    else:
-        csv_path = f'heatwave_trend_vs_cc_loss_bins_coarsened_stats.csv'
-    calculate_binned_stats(results, csv_path=csv_path, dep_var_name='heatwaves_trend',
-                           bin_width=10)
- 
 
-#%%
+
+#%% DO FOR TRENDS
 if __name__ == "__main__":
     
-
-    with LocalCluster(n_workers=32, threads_per_worker=1,
+    with LocalCluster(n_workers=16, threads_per_worker=1,
                             memory_limit='20GB') as cluster:
         with Client(cluster) as client:
             print(f"Dask Dashboard available at: {client.dashboard_link}")
-            #calc_moving_window()
-            # for coarsen_factor in [2, 5, 10, 15, 20, 25]:
-            for coarsen_factor in [2, 3, 4]:
-                calc_moving_window(coarsen_factor=coarsen_factor)
 
-#%% moving window analysis for Tmax trends
+            loss = open_hansen_loss(2003, 2020)
+            tmax_trend = load_tmax_trends(mask_insignificant=False)
+            for coarsen_factor in [None, 2, 4, 8, 16]:
+                print(f"Running moving window analysis with coarsen_factor={coarsen_factor}...")
+                calc_moving_window(ind_var=loss, dep_var=tmax_trend, 
+                                   ind_var_name='d_cc', dep_var_name='tmax_trend',
+                                   coarsen_factor=coarsen_factor)
+                
+#%% DO FOR SMOOTH TRENDS TOO
 
-def calc_moving_window_tmax_trends(trend_path, var_name='Ta_TMAX_trend',
-                                   coarsen_factor=None):
-    elev = xr.open_dataset(STORAGE_DIR + '../elevation/elevation_regridded.nc')['elevation']
-
-
-    loss = open_hansen_loss(2003, 2020)
-    trend = xr.open_zarr(trend_path)[var_name]
-    ds = xr.Dataset({'d_cc': loss, 'trend': trend})
-
-    ds = ds.where(elev < 1000)  # mask out high elevation areas
-
-    if coarsen_factor:
-        ds = ds.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-
-    results = moving_window_analysis(ds, window_radius=1, 
-                                    d_cc_var_name='d_cc',
-                                    dep_var_name='trend')
-
-    return results
-
+#%% do for heatwaves
 if __name__ == "__main__":
-    with LocalCluster(n_workers=32, threads_per_worker=1,
+    
+
+    with LocalCluster(n_workers=16, threads_per_worker=1,
                                 memory_limit='20GB') as cluster:
             with Client(cluster) as client:
                 print(f"Dask Dashboard available at: {client.dashboard_link}")
 
-                # results = calc_moving_window_tmax_trends(STORAGE_DIR + 'zz_tmax_ts_trend.zarr')
-                # results = results.compute()
-                # calculate_binned_stats(results, csv_path='tmax_trend_vs_cc_loss_bins_stats.csv', 
-                #                        dep_var_name='trend', bin_width=10)
-                
-                # results = calc_moving_window_tmax_trends(STORAGE_DIR + 'percentiles/zz_tmax_ts_trend_JJA.zarr', var_name='Ta_TMAX_trend_JJA')
-                # results = results.compute()
-                # calculate_binned_stats(results, csv_path='tmax_trend_jja_vs_cc_loss_bins_stats.csv', 
-                #                        dep_var_name='trend', bin_width=10)
-                
-                results = calc_moving_window_tmax_trends(STORAGE_DIR + 'percentiles/zz_tmax_ts_trend_JJA.zarr', var_name='Ta_TMAX_trend_JJA',
-                                                         coarsen_factor=10)
-                results = results.compute()
-                calculate_binned_stats(results, csv_path='tmax_trend_jja_vs_cc_loss_bins_coarsened10_stats.csv', 
-                                       dep_var_name='trend', bin_width=10)
+                heatwaves = xr.open_zarr(STORAGE_DIR + 'heatdays/heatwaves_zz_2003-2020.zarr', consolidated=True)['heatwaves']
+                heatwaves_annual = heatwaves.resample(time='YE').sum()
+                heatwaves_diff = heatwaves_annual[-3:].sum('time') - heatwaves_annual[:3].sum('time')
+                heatwaves_diff.name = 'd_heatwaves'
 
-#%%
-stats = calculate_binned_stats(results, dep_var_name='trend',
-                           bin_width=10, csv_path='tmax_trend_vs_cc_loss_bins_stats.csv')
+                loss = open_hansen_loss(2003, 2020)
+                for coarsen_factor in [None, 2, 4, 8, 16]:
+                    print(f"Running moving window analysis with coarsen_factor={coarsen_factor}...")
+                    calc_moving_window(ind_var=loss, dep_var=heatwaves_diff, 
+                                    ind_var_name='d_cc', dep_var_name='d_heatwaves',
+                                    coarsen_factor=coarsen_factor)
+                    
+#%% do for mean temp diff
+if __name__ == "__main__":
+    
+
+    with LocalCluster(n_workers=16, threads_per_worker=1,
+                                memory_limit='20GB') as cluster:
+            with Client(cluster) as client:
+                print(f"Dask Dashboard available at: {client.dashboard_link}")
+                tmax = xr.open_zarr(STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr')['Ta_TMAX']
+                tmax_annual = tmax.resample(time='YE').mean()
+                tmax_diff = tmax_annual[-5:].mean('time') - tmax_annual[:5].mean('time')
+
+
+                loss = open_hansen_loss(2003, 2020)
+                for coarsen_factor in [None, 2, 4, 8, 16]:
+                    print(f"Running moving window analysis with coarsen_factor={coarsen_factor}...")
+                    calc_moving_window(ind_var=loss, dep_var=tmax_diff, 
+                                    ind_var_name='d_cc', dep_var_name='d_temp',
+                                    coarsen_factor=coarsen_factor)
+                    
+#%% do for heatwave trends (raw and smoothed)
+if __name__ == "__main__":
+    
+    with LocalCluster(n_workers=16, threads_per_worker=1,
+                                memory_limit='20GB') as cluster:
+            with Client(cluster) as client:
+                print(f"Dask Dashboard available at: {client.dashboard_link}")
+                heatwave_trends = xr.open_zarr(STORAGE_DIR + 'heatwaves/heatwaves_trend.zarr')['heatwaves_trend']
+                heatwave_trends_smooth = xr.open_zarr(STORAGE_DIR + 'heatwaves/heatwaves_zz_2003-2020_smooth_trend.zarr')['heatwaves_trend']
+
+                loss = open_hansen_loss(2003, 2020)
+                for dep_var, dep_var_name in zip([heatwave_trends, heatwave_trends_smooth],
+                                                 ['heatwave_trends', 'heatwave_trends_smooth']):
+                    for coarsen_factor in [None, 2, 4, 8, 16]:
+                        print(f"Running moving window analysis for {dep_var_name} with coarsen_factor={coarsen_factor}...")
+                        calc_moving_window(ind_var=loss, dep_var=dep_var, 
+                                        ind_var_name='d_cc', dep_var_name=dep_var_name,
+                                        coarsen_factor=coarsen_factor)

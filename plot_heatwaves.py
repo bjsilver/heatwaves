@@ -4,46 +4,87 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 import numpy as np
 import cartopy.crs as ccrs
-from constants import AMAZON_BBOX, FIGDIR
+from constants import AMAZON_BBOX, FIGDIR, STORAGE_DIR
 
 
 HEATWAVES_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
+heatwaves = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatwaves_zz_2003-2020.zarr')['heatwaves']
+hw_smooth = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatwaves_zz_2003-2020_smooth.zarr')['heatwaves']
 
-heatwaves = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatwaves.zarr')['heatwaves']
+ds = xr.Dataset({
+    'heatwaves': heatwaves,
+    'heatwaves_smooth': hw_smooth,
+})
 
 #%%
 with ProgressBar():
-    heatwaves_timesum = heatwaves.sum('time').compute(num_workers=16, num_threads=2)
+    ds = ds.sum('time').compute(num_workers=64, num_threads=1)
 
 #%% plot heatwaves days
 
-levels = np.arange(0, 220, 20)
+levels = np.arange(0, 600, 50)
 
 fig = plt.figure(figsize=[10,8])
 ax = fig.add_subplot(projection=ccrs.PlateCarree())
-heatwaves_timesum.plot.contourf(ax=ax, levels=levels, cmap='magma',
+ds['heatwaves'].plot.contourf(ax=ax, levels=levels, cmap='magma',
                                 cbar_kwargs={'label':'Number of heatwave days',
                                              'shrink':0.8})
-fig.savefig(FIGDIR+'heatwave_days.png', dpi=400, bbox_inches='tight')
+fig.savefig(FIGDIR+'heatwaves/heatwave_days_new.png', dpi=400, bbox_inches='tight')
+#%%
+fig = plt.figure(figsize=[10,8])
+ax = fig.add_subplot(projection=ccrs.PlateCarree())
+ds['heatwaves_smooth'].plot.contourf(ax=ax, levels=levels, cmap='magma',
+                                cbar_kwargs={'label':'Number of heatwave days',
+                                             'shrink':0.8})
+fig.savefig(FIGDIR+'heatwaves/heatwave_days_new_smoothed.png', dpi=400, bbox_inches='tight')
 
-#%% plot heatwave days in amazon area
-amazon_bbox = [-75, -30, -25, 10]
-heatwaves_timesum = heatwaves_timesum.rename({'lat':'latitude', 'lon':'longitude'})
-heatwaves_timesum_amazon = heatwaves_timesum.sel(longitude=slice(amazon_bbox[0], amazon_bbox[1]),
-                                                latitude=slice(amazon_bbox[2], amazon_bbox[3]))
+#%% compare raw vs smoothed
+extent = [-4, -3, -54, -53]
+
+fig = plt.figure(figsize=[12,6])
+ax = fig.add_subplot(1,2,1, projection=ccrs.PlateCarree())
+ds['heatwaves'].sel(lat=slice(extent[0], extent[1]), lon=slice(extent[2], extent[3])).plot.imshow(ax=ax,
+                                                                                                  cmap='magma', vmin=0, vmax=300,
+                                cbar_kwargs={'label':'Number of heatwave days',
+                                             'shrink':0.6})
+ax.set_title('Raw')
+ax = fig.add_subplot(1,2,2, projection=ccrs.PlateCarree())
+ds['heatwaves_smooth'].sel(lat=slice(extent[0], extent[1]), lon=slice(extent[2], extent[3])).plot.imshow(ax=ax,
+                                                                                                  cmap='magma', vmin=0, vmax=500,
+                                cbar_kwargs={'label':'Number of heatwave days',
+                                             'shrink':0.6})
+ax.set_title('Smoothed')
+fig.savefig(FIGDIR+'/heatwaves/heatwave_days_comparison.png', dpi=400, bbox_inches='tight')
+
+#%% plot heatwave trends
+heatwave_trends = xr.open_zarr(STORAGE_DIR+'heatwaves/heatwaves_trend.zarr')['heatwaves_trend']
+heatwave_trends_smooth = xr.open_zarr(STORAGE_DIR+'heatwaves/heatwaves_zz_2003-2020_smooth_trend.zarr')['heatwaves_trend']
+
+ds_trends = xr.Dataset({
+    'heatwave_trends': heatwave_trends,
+    'heatwave_trends_smooth': heatwave_trends_smooth,
+})
+fig = plt.figure(figsize=[10,8])
+ax = fig.add_subplot(projection=ccrs.PlateCarree())
+ds_trends['heatwave_trends'].plot.imshow(ax=ax, vmin=-4, vmax=4, cmap='bwr',
+                                cbar_kwargs={'label':'Trend in heatwave days per year',
+                                             'shrink':0.8})
+
+
+fig.savefig(FIGDIR+'heatwaves/heatwave_trends.png', dpi=400, bbox_inches='tight')   
 
 fig = plt.figure(figsize=[10,8])
 ax = fig.add_subplot(projection=ccrs.PlateCarree())
-heatwaves_timesum_amazon.plot.contourf(ax=ax, levels=levels, cmap='magma',
-                                        cbar_kwargs={'label':'Number of heatwave days',
-                                                     'shrink':0.8})
-fig.savefig(FIGDIR+'heatwave_days_amazon.png', dpi=400, bbox_inches='tight')
+ds_trends['heatwave_trends_smooth'].plot.imshow(ax=ax, vmin=-4, vmax=4, cmap='bwr',
+                                cbar_kwargs={'label':'Trend in heatwave days per year',
+                                             'shrink':0.8})
+fig.savefig(FIGDIR+'heatwaves/heatwave_trends_smoothed.png', dpi=400, bbox_inches='tight')
 
-#%% compare heatwave days with ERA5- and ZZ-derived percentile threshold
-zz = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatdays.zarr')['heatdays']
-era = xr.open_zarr(HEATWAVES_PATH+'heatdays/heatdays_era5pctl.zarr')['heatdays']
-
-ds = xr.Dataset({'zz':zz, 'era':era})
-
-with ProgressBar():
-    timesum = ds.sum(['year', 'doy']).compute(num_workers=16, num_threads=4)
+#%% plot diff in heatwaves trend
+heatwave_trends_diff = ds_trends['heatwave_trends_smooth'] - ds_trends['heatwave_trends']
+fig = plt.figure(figsize=[10,8])
+ax = fig.add_subplot(projection=ccrs.PlateCarree())
+heatwave_trends_diff.plot.imshow(ax=ax, vmin=-2, vmax=2, cmap='bwr',
+                                cbar_kwargs={'label':'Difference in trend (smoothed - raw)',
+                                             'shrink':0.8})
+fig.savefig(FIGDIR+'heatwaves/heatwave_trends_diff.png', dpi=400, bbox_inches='tight')

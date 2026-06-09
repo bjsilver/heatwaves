@@ -11,6 +11,7 @@ import dask.array as da_lazy
 from pathlib import Path
 from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
+import metpy
 
 # --- CONFIGURATION ---
 DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/'
@@ -173,4 +174,5 @@ if __name__ == "__main__":
         p95 = compute_percentiles_dask(tmax)
         save_percentiles(p95, OUT_ZARR)
         print('Processing Complete.')
+
 

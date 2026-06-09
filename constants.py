@@ -15,7 +15,7 @@ ZZ_ORIG_DIR = "/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_reg
 ERA_RECHUNKED_PATH = STORAGE_DIR + 'rechunked/era5_skt_p95_1970-1999_rechunked.zarr'
 ZZ_RECHUNKED_PATH = STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr'
 
-PERCENTILE_KEYS = ['era_1970-1999', 'era_2003-2020', 'zz_2003-2020']
+PERCENTILE_KEYS = ['zz_2003-2020', 'zz_2003-2020_smooth']#, 'era_2003-2020', 'era_1970-1999'] --- IGNORE ---
 
 
 # areas
