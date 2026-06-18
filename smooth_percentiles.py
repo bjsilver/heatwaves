@@ -128,7 +128,7 @@ pctls_smooth = smooth_latlon_chunked(pctls, sigma=40.0)
 pctls_smooth = pctls_smooth.interp(lat=pctls.lat, lon=pctls.lon, method='nearest')
 
 OUT_ZARR_SMOOTH = STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr'
-
+#%%
 with ProgressBar():
     pctls_smooth = pctls_smooth.compute(num_workers=128, memory_limit='4GB')
     ds_out = pctls_smooth.to_dataset(name='Ta_TMAX_p95_smooth')

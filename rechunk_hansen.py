@@ -33,6 +33,14 @@ def open_hansen():
 if __name__ == '__main__':
     hansen = open_hansen()
 
+    # change lat lon coords to float32 and round to 2dp
+    hansen = hansen.assign_coords(lat=hansen.lat.astype('float32').round(2), lon=hansen.lon.astype('float32').round(2))
+    hansen = hansen.drop_vars('spatial_ref')
+    
+    # round to 0dp and convert to int16 to save space
+    hansen = hansen.round(0)
+    hansen = hansen.astype('uint8')
+
     hansen.encoding = {}
 
     da = hansen.chunk().data
