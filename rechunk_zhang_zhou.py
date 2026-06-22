@@ -15,7 +15,7 @@ RECHUNK_JOBS = [
         'input_path': STORAGE_DIR + 'regridded/zhang_zhou_regridded.zarr',
         'output_path': STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
         'var_name': 'Ta_TMAX',
-        'dtype': 'uint16',
+        'dtype': 'int16',
         'dims': ('time', 'lat', 'lon'),
         'consolidated': False,
         'units':'tenths of degC'
@@ -47,22 +47,24 @@ def rechunk_and_save(input_path, output_path, var_name, dtype, dims, units, cons
     cleanup_store(output_path)
     
     print(f"Loading {var_name} from {input_path}")
-    orig = xr.open_zarr(input_path, consolidated=consolidated)
+    ds = xr.open_zarr(input_path, consolidated=consolidated)
+    da = ds[var_name]
+    da.encoding = {}
+
     # if dtype is int replace NaN with FillValue
-    if dtype in ['int16', 'int32', 'int64', 'uint16', 'uint32', 'uint64']:
-        orig = orig.fillna(FILLVALUE)
-        orig.attrs['_FillValue'] = FILLVALUE
-    orig = orig.astype({var_name: dtype})
+    if 'int' in dtype or 'uint' in dtype:
+        da = da.fillna(FILLVALUE)
+        da.attrs['_FillValue'] = FILLVALUE
+    da = da.astype(dtype)
 
-    orig.attrs['units'] = units
+    da.attrs['units'] = units
 
-
-    orig.encoding = {}
-    da = orig[var_name].data
-
+    da = da.astype(dtype)
+    dask_array = da.data
+  
     print(f"Rechunking to {TARGET_CHUNKS}...")
     with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
-        rechunked = da.rechunk(TARGET_CHUNKS)
+        rechunked = dask_array.rechunk(TARGET_CHUNKS)
 
     print(f"Writing rechunked data to {output_path}...")
     rechunked.to_zarr(output_path, mode='w', consolidated=False, align_chunks=True)
@@ -73,7 +75,7 @@ def rechunk_and_save(input_path, output_path, var_name, dtype, dims, units, cons
         var_name=var_name,
         dims=dims,
         consolidate=True,
-        orig_ds=orig,
+        orig_ds=ds,
     )
 
     ds = xr.open_zarr(output_path, consolidated=False)

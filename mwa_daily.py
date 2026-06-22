@@ -1,25 +1,36 @@
 #%%
-import rioxarray as rxr
 import xarray as xr
-import pandas as pd
 import numpy as np
 import os
 import dask.array as da
 from functools import partial
-from ufuncs import load_heat
 from constants import HANSEN_DIR, PERCENTILES_DIR, STORAGE_DIR
 from dask.distributed import Client, LocalCluster
 from dask.diagnostics import ProgressBar
 import matplotlib.pyplot as plt
 from contextlib import contextmanager
 from numba import njit
+import gc
+import warnings
+import pickle
 
 USE_DASK_DASHBOARD = True
-MWA_DAILY_DIR = STORAGE_DIR + 'moving_window_analysis_daily/'
+INDEPEDENT_VARIABLE = 'heatwaves_smoothed'  # or 'heatwaves_smoothed'
+DEPENDENT_VARIABLE = 'cc_loss'  # or 'cc_loss'
+MWA_DAILY_DIR = os.path.join(STORAGE_DIR, 'moving_window_analysis_daily')
 
 
 @contextmanager
-def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB'):
+def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
+                  suppress_dask_warnings=False):
+
+    if suppress_dask_warnings:
+        warnings.filterwarnings(
+            "ignore", 
+            message="Sending large graph of size.*", 
+            category=UserWarning, 
+            module="distributed.client"
+        )
 
     if USE_DASK_DASHBOARD:
         with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
@@ -30,104 +41,18 @@ def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB'):
     else:
         yield None
 
-def open_hansen_loss(start_year, end_year):
-    ds = xr.open_zarr(HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr')
-    tc = ds['tree_cover']
-    tc = tc.sel(time=slice(str(start_year), str(end_year)))
-    loss = tc.diff('time').sum('time')
-    loss = -loss
-    loss = loss.assign_coords(lat=np.round(loss.lat, 2), lon=np.round(loss.lon, 2))
-    loss = loss.drop_vars('spatial_ref')
-    return loss
 
-def load_tmax_trends(mask_insignificant=True):
-    dpath = os.path.join(PERCENTILES_DIR, 'zz_tmax_ts_trend.zarr')
-    ds = xr.open_zarr(dpath)
-    trends = ds['Ta_TMAX_trend']
-    if mask_insignificant:
-        pvals = ds['Ta_TMAX_trend_pvalue']
-        trends = trends.where(pvals < 0.05)
-    return trends
-
-
-def calculate_binned_stats(results, 
-                           dep_var_name='heatwaves_trend',
-                           bin_width=10):
-    """Calculate binned statistics and save to CSV.
-    
-    Parameters
-    ----------
-    results : xr.Dataset
-        Moving window analysis results with 'cc_loss' and '{dep_var_name}_diff'.
-    csv_path : str
-        Path to save the CSV file with bin statistics.
-    dep_var_name : str
-        Name of the dependent variable (e.g., 'heatwaves_trend').
-    bin_width : int
-        Width of each bin in percent.
-    """
-
-    # flatted and combine zarrs in results list
-    combined = xr.concat(results, dim='zarr_index')
-    combined = combined.stack(points=('lat', 'lon', 'zarr_index'))
-    combined = combined.dropna(dim='points')
-
-
-    # Auto-detect max bin limit: find last bin with n > 3 observations
-    preliminary_bins = np.arange(0, 110, bin_width)
-    preliminary_counts = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], preliminary_bins).count().compute()
-    
-    # Find the last bin with count > 3
-    valid_bins = preliminary_counts[preliminary_counts > 3]
-    valid_bins_pd = valid_bins.to_pandas()
-    if len(valid_bins_pd) > 0:
-        last_bin_upper = valid_bins_pd.index[-1].right
-        max_bin_limit = last_bin_upper + bin_width  # Include one more bin
-    else:
-        max_bin_limit = bin_width  # Fallback if no bins have n > 3
-    
-    # Create final bins and compute statistics
-    bins = np.arange(0, max_bin_limit, bin_width)
-    binned = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).mean() 
-    bin_counts = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).count()
-    bin_stds = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).std()
-    bin_sems = bin_stds / np.sqrt(bin_counts)
-    bin_means = binned.values
-    ci_lower = bin_means - 1.96 * bin_sems
-    ci_upper = bin_means + 1.96 * bin_sems
-    
-    # Save the bin means, counts and CIs to a CSV for later use
-    bin_dim = next(dim for dim in binned.dims if dim.endswith('_bins'))
-    bin_stats = pd.DataFrame({
-        'bin': [f'{int(interval.left)}-{int(interval.right)}' for interval in binned[bin_dim].values],
-        'mean_diff': bin_means,
-        'ci_lower': ci_lower,
-        'ci_upper': ci_upper,
-        'count': bin_counts.values
-    })
-    return bin_stats
-
-def slice_elev_mask(da):
-    westlimit=-81.8; southlimit=-17.7; eastlimit=-41.6; northlimit=12.9
-    da = da.sel(lat=slice(southlimit, northlimit), lon=slice(westlimit, eastlimit))
-    elev = xr.open_dataset(STORAGE_DIR + '../elevation/elevation_regridded.nc')['elevation']
-    elev = elev.reindex_like(da, method='nearest')
-    da_elevmask = da.where(elev<1000)
-    return da_elevmask
-
-
-#@njit(parallel=False)
 def _mwa_kernel_time(block, window_radius):
     """
     block: (2, T, H+2wr, W+2wr) — channel 0 = independent var, channel 1 = dependent var.
     Returns same shape, with results embedded in centre for each timestep.
     """
 
-    ind_block = block[0]  # (T, H+2wr, W+2wr)
-    dep_block = block[1]  # (T, H+2wr, W+2wr)
-    
-    ind = np.where(ind_block == -9999.0, np.nan, ind_block.astype(np.float32))
-    dep = np.where(dep_block == -9999.0, np.nan, dep_block.astype(np.float32))
+    ind_block = block[0].astype(np.float32)  # (T, H+2wr, W+2wr)
+    dep_block = block[1].astype(np.float32)  # (T, H+2wr, W+2wr)
+
+    ind = np.where(ind_block == -9999.0, np.nan, ind_block)
+    dep = np.where(dep_block == -9999.0, np.nan, dep_block)
     # dep = dep[0]  # (H+2wr, W+2wr)
 
     wr = window_radius
@@ -141,8 +66,8 @@ def _mwa_kernel_time(block, window_radius):
     center_ind = ind[:, wr:wr+h_size, wr:wr+w_size]
     center_dep = dep[:, wr:wr+h_size, wr:wr+w_size]
 
-    max_ind_diff = np.full((t_size, h_size, w_size), -np.inf, dtype=ind.dtype)
-    max_dep_diff = np.zeros((1, h_size, w_size), dtype=dep.dtype)
+    max_ind_diff = np.full((t_size, h_size, w_size), -np.inf, dtype=np.float32)
+    max_dep_diff = np.zeros((1, h_size, w_size), dtype=np.float32)
     has_higher = np.zeros((1, h_size, w_size), dtype=np.bool_)
 
     for di in range(-wr, wr + 1):
@@ -167,7 +92,10 @@ def _mwa_kernel_time(block, window_radius):
 
     out[0] = np.where(valid, max_ind_diff, np.nan)
     out[1] = np.where(valid, max_dep_diff, np.nan)
-    return out
+
+    out[0] = np.nan_to_num(out[0], nan=-9999, posinf=-9999, neginf=-9999)
+    out[1] = np.nan_to_num(out[1], nan=-9999, posinf=-9999, neginf=-9999)
+    return out.astype(np.int16)
 
 def moving_window_analysis_daily(ds, window_radius, ind_var_name, dep_var_name):
     """Daily moving-window analysis on (time, lat, lon) inputs."""
@@ -188,26 +116,35 @@ def moving_window_analysis_daily(ds, window_radius, ind_var_name, dep_var_name):
         depth={0: 0, 1: 0, 2: window_radius, 3: window_radius},
         boundary=np.nan,
         trim=False,
-        dtype=np.float32,
+        dtype=np.int16,
     )
 
-    results = xr.Dataset(
+    ind_ds = xr.Dataset(
     data_vars={
-        "ind_var": (("time", "lat", "lon"), result[0]),
-        "dep_var": (("year", "lat", "lon"), result[1, 0][None, :, :])
+        f'{ind_var_name}_cdiff': (("time", "lat", "lon"), result[0]),
     },
     coords={
         "time": ds.coords["time"],
+        "lat": ds.coords["lat"],
+        "lon": ds.coords["lon"]
+    }
+    )
+
+    dep_ds = xr.Dataset(
+    data_vars={
+        f'{dep_var_name}_cdiff': (("year", "lat", "lon"), result[1, 0][None]),
+    },
+    coords={
         "year": [year],
         "lat": ds.coords["lat"],
         "lon": ds.coords["lon"]
     }
     )
 
-    return results
+    return ind_ds, dep_ds
 
 
-def calc_moving_window_daily(ind_var, dep_var,
+def calc_moving_window_daily(ind_var, dep_var, client=None,
                              coarsen_factor=None, window_radius=1):
     
     ind_var_name = ind_var.name
@@ -219,7 +156,7 @@ def calc_moving_window_daily(ind_var, dep_var,
         sname += f'_coarsened{coarsen_factor}'
 
 
-    elev = xr.open_dataset(STORAGE_DIR + '../elevation/elevation_regridded.nc')['elevation']
+    elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
     elev = elev.assign_coords(lat=ind_var.lat, lon=ind_var.lon)
     ind_var = ind_var.where(elev < 1000)
     dep_var = dep_var.where(elev < 1000)
@@ -232,7 +169,8 @@ def calc_moving_window_daily(ind_var, dep_var,
 
 
     os.makedirs(MWA_DAILY_DIR, exist_ok=True)
-    out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results.zarr')
+    out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
+    out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
 
     write_mode = 'w'
     for year in years_daily:
@@ -245,7 +183,7 @@ def calc_moving_window_daily(ind_var, dep_var,
         ds_year = xr.Dataset({ind_var_name: ind_year, dep_var_name: dep_year})
 
 
-        results_year = moving_window_analysis_daily(
+        ind_ds, dep_ds = moving_window_analysis_daily(
             ds_year,
             window_radius=window_radius,
             ind_var_name=ind_var_name,
@@ -253,88 +191,126 @@ def calc_moving_window_daily(ind_var, dep_var,
         )
 
         if write_mode == 'w':
-            results_year.to_zarr(out_path, mode='w', consolidated=True)
+            ind_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
+            dep_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
             write_mode = 'a'
         else:
-            results_year.to_zarr(out_path, mode='a', append_dim='time', consolidated=True)
-        print(f"Results for year {year} written to {out_path}.")
-    #return xr.open_zarr(out_path, consolidated=True)
+            ind_ds.to_zarr(out_path_ind, mode='a', append_dim='time', consolidated=False)
+            dep_ds.to_zarr(out_path_dep, mode='a', append_dim='year', consolidated=False)
 
-# def run_mwa_coarsen_loop(ind_var, dep_var, ind_var_name,dep_var_name):
-#         dep_var = load_tmax_trends(mask_insignificant=False)
-#         for coarsen_factor in [None, 2, 4, 8, 16]:
-#             print(f"Running moving window analysis with coarsen_factor={coarsen_factor}...")
-#             calc_moving_window(ind_var=ind_var, dep_var=dep_var, ind_var_name=ind_var_name, dep_var_name=dep_var_name,
-#                                 coarsen_factor=coarsen_factor, coarsen_offset_resample=True)
-            
-def load_heatwave_diffs():
-    heatwaves = xr.open_zarr(STORAGE_DIR + 'heatdays/heatwaves_zz_2003-2020.zarr', consolidated=True)['heatwaves']
-    heatwaves_smoothed = xr.open_zarr(STORAGE_DIR + 'heatdays/heatwaves_zz_2003-2020_smooth.zarr', consolidated=True)['heatwaves']
-    ds = xr.Dataset({'d_heatwaves': heatwaves, 'd_heatwaves_smooth': heatwaves_smoothed})
-    annual = ds.resample(time='YE').sum()
-    heatwaves_diff = annual.isel(time=slice(-3, None)).sum('time') - annual.isel(time=slice(0, 3)).sum('time')
-    return heatwaves_diff['d_heatwaves'], heatwaves_diff['d_heatwaves_smooth']
+        if client is not None:
+            client.cancel(ind_ds)
+            client.cancel(dep_ds)
+        gc.collect()
+        print(f"Year {year} results written to {out_path_ind} and {out_path_dep}")
+  
+def calculate_binned_stats(dep_var_name, ind_var_name, coarsen_factor=None, sname=None):
 
-#%%
-if __name__ == "__main__":
-    
-    with local_cluster(n_workers=4, threads_per_worker=4, memory_limit='100GB') as client:
+    ind = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr'), consolidated=False)[ind_var_name+'_cdiff']
+    # cast to float32 and replace -9999 with NaN
+    ind = ind.astype(np.float32).where(ind != -9999.0)
+    dep = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr'), consolidated=False)[dep_var_name+'_cdiff']
+    dep = dep.astype(np.float32).where(dep != -9999.0)
 
 
-        ds = xr.open_zarr(HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr')
+    bins = np.arange(10, 110, 10)
+    stats_dss = []
+    for year in dep.year.values:
+        
+        ind_year = ind.sel(time=ind.time.dt.year == year)
+        dep_year = dep.sel(year=year)
+
+        binned = ind_year.groupby_bins(dep_year, bins=bins)
+
+        stats = xr.Dataset({
+            'sum': binned.sum(),
+            'count': binned.count(),
+            'sumsq': (ind_year**2).groupby_bins(dep_year, bins=bins).sum()
+        })
+        stats = stats.drop_vars('year')
+        stats_dss.append(stats)
+
+    stats_ds = xr.concat(stats_dss, dim='time', join='outer', coords='minimal')
+    stats_summed = stats_ds.sum('time')
+    stats_summed['mean'] = stats_summed['sum'] / stats_summed['count']
+    stats_summed['std'] = np.sqrt(stats_summed['sumsq'] / stats_summed['count'] - stats_summed['mean']**2)
+
+    stats_computed = stats_summed.compute()
+
+
+    pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
+    print(f"Saving binned statistics to as pickle {pickle_path}...")
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(stats_computed, f)
+
+def load_ind_dep_data(ind_var_name, dep_var_name):
+
+    if dep_var_name == 'cc_loss':
+        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
         tc = ds['tree_cover'].loc[dict(time=slice('2003', '2020'))]
         tc = tc.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
                                                 freq='YS', calendar='noleap', use_cftime=True))
         dep_var = -(tc - tc[0]).round()
-        dep_var.name = 'cc_loss'
+        dep_var.name = dep_var_name
+    else:
+        raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
+
+    if ind_var_name == 'tmax':
+        ind_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
+        ind_var.name = ind_var_name
+    elif ind_var_name == 'heatwaves_smoothed':
+        ind_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020_smooth.zarr'))['heatwaves']
+        ind_var.name = ind_var_name
+    else:
+        raise ValueError(f"Unsupported independent variable name: {ind_var_name}")
+
+    dep_var = dep_var.assign_coords(lat=ind_var.lat, lon=ind_var.lon)
+    return ind_var, dep_var
 
 
+def run_mwa_daily(coarsen_factor=None, window_radius=1, client=None):
 
-        ind_var = xr.open_zarr(STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr')['Ta_TMAX']
-        ind_var.name = 'tmax'
+    ind_var, dep_var = load_ind_dep_data(ind_var_name=INDEPEDENT_VARIABLE, dep_var_name=DEPENDENT_VARIABLE)
 
-        dep_var = dep_var.assign_coords(lat=ind_var.lat, lon=ind_var.lon)
+    # check if output zarr already exists
+    sname = f'{dep_var.name}_vs_{ind_var.name}_daily'
+    if coarsen_factor:
+        sname += f'_coarsened{coarsen_factor}'
+    out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
+    out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
+    if not os.path.exists(out_path_ind) or not os.path.exists(out_path_dep):
+        print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
+        calc_moving_window_daily(ind_var=ind_var, dep_var=dep_var, client=client, window_radius=window_radius,
+                                coarsen_factor=coarsen_factor)
+        print(f"Moving window analysis completed for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
+    else:
+        print(f"Output zarrs already exist for {sname}. Skipping moving window analysis.")
 
-        calc_moving_window_daily(ind_var=ind_var, dep_var=dep_var, window_radius=1)
+
+    if not os.path.exists(os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')):
+        
+        print(f"Calculating binned statistics for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
+
+        calculate_binned_stats(dep_var_name=dep_var.name, ind_var_name=ind_var.name,
+                            coarsen_factor=coarsen_factor, sname=sname)
+        print(f"Binned statistics calculation completed for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
+    else:
+        print(f"Binned statistics already exist for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}. Skipping calculation.")
+
+def run_mwa_coarsen_loop(client=None):
+        for coarsen_factor in [None, 2, 5, 10, 25]:#[None, 2, 4, 8, 16]:
+            run_mwa_daily(coarsen_factor=coarsen_factor, window_radius=1, client=client)
+            
+#%%
+if __name__ == "__main__":
+    
+    with local_cluster(n_workers=6, threads_per_worker=6, memory_limit='100GB',
+                       suppress_dask_warnings=True) as client:
+        run_mwa_coarsen_loop(client=client)
+
 
 #%%
 
-# results = xr.open_zarr(os.path.join(MWA_DAILY_DIR, 'cc_loss_vs_tmax_daily_mwa_results.zarr'), consolidated=True)
-
-# combined = xr.concat(results, dim='zarr_index')
-# combined = combined.stack(points=('lat', 'lon', 'zarr_index'))
-# combined = combined.dropna(dim='points')
-
-
-# # Auto-detect max bin limit: find last bin with n > 3 observations
-# preliminary_bins = np.arange(0, 110, bin_width)
-# preliminary_counts = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], preliminary_bins).count().compute()
-
-# # Find the last bin with count > 3
-# valid_bins = preliminary_counts[preliminary_counts > 3]
-# valid_bins_pd = valid_bins.to_pandas()
-# if len(valid_bins_pd) > 0:
-#     last_bin_upper = valid_bins_pd.index[-1].right
-#     max_bin_limit = last_bin_upper + bin_width  # Include one more bin
-# else:
-#     max_bin_limit = bin_width  # Fallback if no bins have n > 3
-
-# # Create final bins and compute statistics
-# bins = np.arange(0, max_bin_limit, bin_width)
-# binned = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).mean() 
-# bin_counts = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).count()
-# bin_stds = combined[f'{dep_var_name}_diff'].groupby_bins(combined['cc_loss'], bins).std()
-# bin_sems = bin_stds / np.sqrt(bin_counts)
-# bin_means = binned.values
-# ci_lower = bin_means - 1.96 * bin_sems
-# ci_upper = bin_means + 1.96 * bin_sems
-
-# # Save the bin means, counts and CIs to a CSV for later use
-# bin_dim = next(dim for dim in binned.dims if dim.endswith('_bins'))
-# bin_stats = pd.DataFrame({
-#     'bin': [f'{int(interval.left)}-{int(interval.right)}' for interval in binned[bin_dim].values],
-#     'mean_diff': bin_means,
-#     'ci_lower': ci_lower,
-#     'ci_upper': ci_upper,
-#     'count': bin_counts.values
-# })
+# # open pickle to check
+# with open(os.path.join(MWA_DAILY_DIR, f'{dep_var.name}_vs_{ind_var.name}_daily_binned_stats.P'), 'rb') as f:
+#     stats_summed = pickle.load(f)
