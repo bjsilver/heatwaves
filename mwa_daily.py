@@ -14,10 +14,18 @@ import gc
 import warnings
 import pickle
 
+COARSEN_FACTORS = [10, 25]#[None, 2, 5, 10, 25]
+
+
+def _extract_years_from_time(time_coord):
+    values = np.asarray(time_coord.values)
+    if np.issubdtype(values.dtype, np.integer):
+        return values.astype(np.int32)
+    return np.asarray(time_coord.dt.year.values, dtype=np.int32)
+
 USE_DASK_DASHBOARD = True
-INDEPEDENT_VARIABLE = 'heatwaves_smoothed'  # or 'heatwaves_smoothed'
-DEPENDENT_VARIABLE = 'cc_loss'  # or 'cc_loss'
-MWA_DAILY_DIR = os.path.join(STORAGE_DIR, 'moving_window_analysis_daily')
+
+MWA_DAILY_DIR = os.path.join(STORAGE_DIR, 'mwa_results')
 
 
 @contextmanager
@@ -42,19 +50,44 @@ def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
         yield None
 
 
+def load_ind_dep_data(ind_var_name, dep_var_name):
+
+    if ind_var_name == 'cc_loss':
+        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
+        tc = ds['tree_cover'].loc[dict(time=slice('2003', '2020'))]
+        tc = tc.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
+                                                freq='YS', calendar='noleap', use_cftime=True))
+        ind_var = -(tc - tc[0]).round()
+        ind_var.name = ind_var_name
+    else:
+        raise ValueError(f"Unsupported independent variable name: {ind_var_name}")
+
+    if dep_var_name == 'tmax':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
+        dep_var = dep_var.astype(np.float32).where(dep_var != -9999.0) / 10.0  # convert to °C
+        dep_var.name = dep_var_name
+    elif dep_var_name == 'heatwaves':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020.zarr'))['heatwaves']
+        dep_var.name = dep_var_name
+    elif dep_var_name == 'heatwaves_smoothed':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020_smooth.zarr'))['heatwaves']
+        dep_var.name = dep_var_name
+    else:
+        raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
+
+    ind_var = ind_var.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
+    return ind_var, dep_var
+
+
+
 def _mwa_kernel_time(block, window_radius):
     """
     block: (2, T, H+2wr, W+2wr) — channel 0 = independent var, channel 1 = dependent var.
     Returns same shape, with results embedded in centre for each timestep.
     """
 
-    ind_block = block[0].astype(np.float32)  # (T, H+2wr, W+2wr)
-    dep_block = block[1].astype(np.float32)  # (T, H+2wr, W+2wr)
-
-    ind = np.where(ind_block == -9999.0, np.nan, ind_block)
-    dep = np.where(dep_block == -9999.0, np.nan, dep_block)
-    # dep = dep[0]  # (H+2wr, W+2wr)
-
+    ind = block[0]
+    dep = block[1]
     wr = window_radius
 
     t_size = ind.shape[0]
@@ -67,8 +100,8 @@ def _mwa_kernel_time(block, window_radius):
     center_dep = dep[:, wr:wr+h_size, wr:wr+w_size]
 
     max_ind_diff = np.full((t_size, h_size, w_size), -np.inf, dtype=np.float32)
-    max_dep_diff = np.zeros((1, h_size, w_size), dtype=np.float32)
-    has_higher = np.zeros((1, h_size, w_size), dtype=np.bool_)
+    max_dep_diff = np.zeros((t_size, h_size, w_size), dtype=np.float32)
+    has_higher = np.zeros((t_size, h_size, w_size), dtype=np.bool_)
 
     for di in range(-wr, wr + 1):
         for dj in range(-wr, wr + 1):
@@ -81,11 +114,11 @@ def _mwa_kernel_time(block, window_radius):
             dep_diff = n_dep - center_dep
             ind_diff = n_ind - center_ind
             
-            better = dep_diff > max_dep_diff
-            max_dep_diff = np.where(better, dep_diff, max_dep_diff)
+            better = ind_diff > max_ind_diff
             max_ind_diff = np.where(better, ind_diff, max_ind_diff)
+            max_dep_diff = np.where(better, dep_diff, max_dep_diff)
 
-            has_higher = has_higher | (n_dep > center_dep)
+            has_higher = has_higher | (n_ind > center_ind)
 
     valid = (center_ind >= 0)  & ~np.isnan(center_dep) & has_higher
 
@@ -93,30 +126,26 @@ def _mwa_kernel_time(block, window_radius):
     out[0] = np.where(valid, max_ind_diff, np.nan)
     out[1] = np.where(valid, max_dep_diff, np.nan)
 
-    out[0] = np.nan_to_num(out[0], nan=-9999, posinf=-9999, neginf=-9999)
-    out[1] = np.nan_to_num(out[1], nan=-9999, posinf=-9999, neginf=-9999)
-    return out.astype(np.int16)
+    return out
 
-def moving_window_analysis_daily(ds, window_radius, ind_var_name, dep_var_name):
-    """Daily moving-window analysis on (time, lat, lon) inputs."""
+def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name,
+                                 time_res='daily'):
+    """Moving-window analysis on (time, lat, lon) inputs."""
     ind_arr = ds[ind_var_name].data
     dep_arr = ds[dep_var_name].data
 
-    dep_arr = da.broadcast_to(dep_arr, ind_arr.shape)
-
-    year = ds.time.dt.year.values[0]
+    years = np.unique(_extract_years_from_time(ds.time))
 
     stacked = da.stack([ind_arr, dep_arr]).rechunk({0: -1})
     stacked = stacked.persist()
     
-    # block = stacked.blocks[:,:,9,9]
     result = da.map_overlap(
         partial(_mwa_kernel_time, window_radius=window_radius),
         stacked,
         depth={0: 0, 1: 0, 2: window_radius, 3: window_radius},
         boundary=np.nan,
         trim=False,
-        dtype=np.int16,
+        dtype=np.float32,
     )
 
     ind_ds = xr.Dataset(
@@ -132,10 +161,10 @@ def moving_window_analysis_daily(ds, window_radius, ind_var_name, dep_var_name):
 
     dep_ds = xr.Dataset(
     data_vars={
-        f'{dep_var_name}_cdiff': (("year", "lat", "lon"), result[1, 0][None]),
+        f'{dep_var_name}_cdiff': (("year", "lat", "lon"), result[1].mean(axis=0, keepdims=True) if time_res == 'daily' else result[1]),
     },
     coords={
-        "year": [year],
+        "year": [int(years[0])] if time_res == 'daily' else years,
         "lat": ds.coords["lat"],
         "lon": ds.coords["lon"]
     }
@@ -144,50 +173,136 @@ def moving_window_analysis_daily(ds, window_radius, ind_var_name, dep_var_name):
     return ind_ds, dep_ds
 
 
-def calc_moving_window_daily(ind_var, dep_var, client=None,
-                             coarsen_factor=None, window_radius=1):
+def _generate_coarsened_versions(ind_var, dep_var, coarsen_factor):
+    """Generate coarsened variable pairs, with offset versions if coarsen_factor >= 10.
+    
+    Returns a list of (ind_var_coarse, dep_var_coarse) tuples.
+    For coarsen_factor >= 10, creates offset versions with 5-pixel intervals.
+    """
+    dss = []
+    
+    # First version: standard coarsening
+    ind_coarse = ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    dep_coarse = dep_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    dss.append((ind_coarse, dep_coarse))
+    
+    # # Add offset versions if coarsen_factor >= 10
+    # if coarsen_factor >= 10:
+    #     num_offsets = (coarsen_factor - 10) // 5 + 1
+    #     for offset_idx in range(num_offsets):
+    #         offset = (offset_idx + 1) * 5
+            
+    #         # Create shifted versions with offset slicing
+    #         ind_shifted = ind_var.loc[{'lat': slice(ind_var.lat.values[offset], ind_var.lat.values[-offset]),
+    #                                    'lon': slice(ind_var.lon.values[offset], ind_var.lon.values[-offset])}]
+    #         dep_shifted = dep_var.loc[{'lat': slice(dep_var.lat.values[offset], dep_var.lat.values[-offset]),
+    #                                    'lon': slice(dep_var.lon.values[offset], dep_var.lon.values[-offset])}]
+            
+    #         # Coarsen the shifted versions
+    #         ind_shifted_coarse = ind_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    #         dep_shifted_coarse = dep_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+            
+    #         dss.append((ind_shifted_coarse, dep_shifted_coarse))
+    
+    return dss
+
+
+def calc_moving_window(ind_var, dep_var, client=None, time_res='daily',
+                             coarsen_factor=None, window_radius=1, sname=None):
     
     ind_var_name = ind_var.name
     dep_var_name = dep_var.name
-
-
-    sname = f'{dep_var_name}_vs_{ind_var_name}_daily'
-    if coarsen_factor:
-        sname += f'_coarsened{coarsen_factor}'
-
 
     elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
     elev = elev.assign_coords(lat=ind_var.lat, lon=ind_var.lon)
     ind_var = ind_var.where(elev < 1000)
     dep_var = dep_var.where(elev < 1000)
 
+    # Generate list of variable pairs (with offsets if applicable)
     if coarsen_factor:
-        ind_var = ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-        dep_var = dep_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-
-    years_daily = np.unique(ind_var.time.dt.year.values.astype(np.int32))
-
-
+        dss = _generate_coarsened_versions(ind_var, dep_var, coarsen_factor)
+    else:
+        dss = [(ind_var, dep_var)]
+    
     os.makedirs(MWA_DAILY_DIR, exist_ok=True)
-    out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
-    out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
+    
+    # Process each version
+    for version_idx, (ind_var_version, dep_var_version) in enumerate(dss):
+        # Add version suffix to output paths if there are multiple versions
+        if len(dss) > 1:
+            out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind_{version_idx}.zarr')
+            out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep_{version_idx}.zarr')
+        else:
+            out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
+            out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
+
+        # Aggregate if needed
+        if time_res in ('annual_mean', 'annual_sum'):
+            dep_var_version = aggregate_independent_variable(dep_var_version, time_res)
+
+        if time_res == 'daily':
+            _calc_moving_window_daily(
+                ind_var=ind_var_version,
+                dep_var=dep_var_version,
+                ind_var_name=ind_var_name,
+                dep_var_name=dep_var_name,
+                out_path_ind=out_path_ind,
+                out_path_dep=out_path_dep,
+                client=client,
+                window_radius=window_radius,
+            )
+        elif time_res in ('annual_mean', 'annual_sum'):
+            _calc_moving_window_annual(
+                ind_var=ind_var_version,
+                dep_var=dep_var_version,
+                ind_var_name=ind_var_name,
+                dep_var_name=dep_var_name,
+                out_path_ind=out_path_ind,
+                out_path_dep=out_path_dep,
+                client=client,
+                window_radius=window_radius,
+                time_res=time_res,
+            )
+        else:
+            raise ValueError(f"Unsupported time_res: {time_res}")
+
+
+def _calc_moving_window_daily(ind_var, dep_var, ind_var_name, dep_var_name,
+                              out_path_ind, out_path_dep, client,
+                              window_radius):
+    year_list = np.unique(_extract_years_from_time(dep_var.time))
 
     write_mode = 'w'
-    for year in years_daily:
+    for year in year_list:
         print(f"Running moving window analysis for year {year}...")
         ind_year = ind_var.sel(time=ind_var.time.dt.year == year)
         dep_year = dep_var.sel(time=dep_var.time.dt.year == year)
 
-        dep_year = dep_year.rename({'time': 'year'})
-        dep_year = dep_year.assign_coords(year=[year])
-        ds_year = xr.Dataset({ind_var_name: ind_year, dep_var_name: dep_year})
+        if ind_year.sizes['time'] == dep_year.sizes['time']:
+            ind_year_for_kernel = ind_year
+            dep_year_for_kernel = dep_year
+        elif ind_year.sizes['time'] == 1 and dep_year.sizes['time'] > 1:
+            ind_year_for_kernel = ind_year.squeeze('time', drop=True).expand_dims(time=dep_year.time)
+            ind_year_for_kernel = ind_year_for_kernel.assign_coords(time=dep_year.time)
+            dep_year_for_kernel = dep_year
+        elif dep_year.sizes['time'] == 1 and ind_year.sizes['time'] > 1:
+            dep_year_for_kernel = dep_year.squeeze('time', drop=True).expand_dims(time=ind_year.time)
+            dep_year_for_kernel = dep_year_for_kernel.assign_coords(time=ind_year.time)
+            ind_year_for_kernel = ind_year
+        else:
+            raise ValueError(
+                f"Cannot align yearly time dimensions for year {year}: "
+                f"ind={ind_year.sizes['time']}, dep={dep_year.sizes['time']}"
+            )
 
+        ds_year = xr.Dataset({ind_var_name: ind_year_for_kernel, dep_var_name: dep_year_for_kernel})
 
-        ind_ds, dep_ds = moving_window_analysis_daily(
+        ind_ds, dep_ds = moving_window_analysis(
             ds_year,
             window_radius=window_radius,
             ind_var_name=ind_var_name,
             dep_var_name=dep_var_name,
+            time_res='daily',
         )
 
         if write_mode == 'w':
@@ -203,85 +318,170 @@ def calc_moving_window_daily(ind_var, dep_var, client=None,
             client.cancel(dep_ds)
         gc.collect()
         print(f"Year {year} results written to {out_path_ind} and {out_path_dep}")
+
+
+def _calc_moving_window_annual(ind_var, dep_var, ind_var_name, dep_var_name,
+                               out_path_ind, out_path_dep, client,
+                               window_radius, time_res):
+    years = np.unique(_extract_years_from_time(ind_var.time))
+    dep_years = _extract_years_from_time(dep_var.time)
+    dep_var = dep_var.isel(time=np.isin(dep_years, years))
+    dep_var = dep_var.assign_coords(time=ind_var.time)
+
+    ds_all = xr.Dataset({ind_var_name: ind_var, dep_var_name: dep_var})
+    ind_ds, dep_ds = moving_window_analysis(
+        ds_all,
+        window_radius=window_radius,
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        time_res=time_res,
+    )
+
+    ind_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
+    dep_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
+
+    if client is not None:
+        client.cancel(ind_ds)
+        client.cancel(dep_ds)
+    gc.collect()
+    print(f"All-year results written to {out_path_ind} and {out_path_dep}")
   
 def calculate_binned_stats(dep_var_name, ind_var_name, coarsen_factor=None, sname=None):
-
-    ind = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr'), consolidated=False)[ind_var_name+'_cdiff']
-    # cast to float32 and replace -9999 with NaN
-    ind = ind.astype(np.float32).where(ind != -9999.0)
-    dep = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr'), consolidated=False)[dep_var_name+'_cdiff']
-    dep = dep.astype(np.float32).where(dep != -9999.0)
-
+    """Calculate binned statistics from moving window analysis results.
+    
+    Handles both single zarr files and multiple versions (from offset resampling).
+    """
+    
+    # Check if multiple versions exist (indexed zarr files)
+    zarr_files = []
+    version_idx = 0
+    while True:
+        ind_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind_{version_idx}.zarr')
+        dep_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep_{version_idx}.zarr')
+        if os.path.exists(ind_path) and os.path.exists(dep_path):
+            zarr_files.append((ind_path, dep_path))
+            version_idx += 1
+        else:
+            break
+    
+    # If no indexed files, try non-indexed versions
+    if not zarr_files:
+        ind_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
+        dep_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
+        if os.path.exists(ind_path) and os.path.exists(dep_path):
+            zarr_files = [(ind_path, dep_path)]
+    
+    if not zarr_files:
+        raise FileNotFoundError(f"No zarr files found for {sname}")
+    
+    # Load and concatenate all versions
+    all_inds = []
+    all_deps = []
+    for ind_path, dep_path in zarr_files:
+        ind = xr.open_zarr(ind_path, consolidated=False)[ind_var_name+'_cdiff']
+        dep = xr.open_zarr(dep_path, consolidated=False)[dep_var_name+'_cdiff']
+        all_inds.append(ind)
+        all_deps.append(dep)
+    
+    # Concatenate across versions (if multiple)
+    if len(all_inds) > 1:
+        ind = xr.concat(all_inds, dim='version')
+        dep = xr.concat(all_deps, dim='version')
+    else:
+        ind = all_inds[0]
+        dep = all_deps[0]
 
     bins = np.arange(10, 110, 10)
-    stats_dss = []
-    for year in dep.year.values:
-        
-        ind_year = ind.sel(time=ind.time.dt.year == year)
-        dep_year = dep.sel(year=year)
-
-        binned = ind_year.groupby_bins(dep_year, bins=bins)
-
-        stats = xr.Dataset({
+    if ind.sizes.get('time', -1) == dep.sizes.get('year', -2):
+        dep_time = dep.rename({'year': 'time'}).assign_coords(time=ind.time if 'time' in ind.dims else ind.time)
+        binned = dep_time.groupby_bins(ind, bins=bins)
+        stats_summed = xr.Dataset({
             'sum': binned.sum(),
             'count': binned.count(),
-            'sumsq': (ind_year**2).groupby_bins(dep_year, bins=bins).sum()
+            'sumsq': (dep_time**2).groupby_bins(ind, bins=bins).sum(),
         })
-        stats = stats.drop_vars('year')
-        stats_dss.append(stats)
+    else:
+        stats_dss = []
+        for year in dep.year.values:
+            if 'time' in ind.dims:
+                ind_year = ind.sel(time=ind.time.dt.year == year)
+            else:
+                ind_year = ind
+            dep_year = dep.sel(year=year)
 
-    stats_ds = xr.concat(stats_dss, dim='time', join='outer', coords='minimal')
-    stats_summed = stats_ds.sum('time')
+            ind_bins = ind_year.mean('time') if 'time' in ind_year.dims else ind_year
+            binned = dep_year.groupby_bins(ind_bins, bins=bins)
+
+            stats = xr.Dataset({
+                'sum': binned.sum(),
+                'count': binned.count(),
+                'sumsq': (dep_year**2).groupby_bins(ind_bins, bins=bins).sum()
+            })
+            stats = stats.expand_dims(year=[year])
+            stats_dss.append(stats)
+
+        stats_ds = xr.concat(stats_dss, dim='year', join='outer', coords='minimal')
+        stats_summed = stats_ds.sum('year')
+
     stats_summed['mean'] = stats_summed['sum'] / stats_summed['count']
     stats_summed['std'] = np.sqrt(stats_summed['sumsq'] / stats_summed['count'] - stats_summed['mean']**2)
 
     stats_computed = stats_summed.compute()
-
 
     pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
     print(f"Saving binned statistics to as pickle {pickle_path}...")
     with open(pickle_path, 'wb') as f:
         pickle.dump(stats_computed, f)
 
-def load_ind_dep_data(ind_var_name, dep_var_name):
-
-    if dep_var_name == 'cc_loss':
-        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
-        tc = ds['tree_cover'].loc[dict(time=slice('2003', '2020'))]
-        tc = tc.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
-                                                freq='YS', calendar='noleap', use_cftime=True))
-        dep_var = -(tc - tc[0]).round()
-        dep_var.name = dep_var_name
-    else:
-        raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
-
-    if ind_var_name == 'tmax':
-        ind_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
-        ind_var.name = ind_var_name
-    elif ind_var_name == 'heatwaves_smoothed':
-        ind_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020_smooth.zarr'))['heatwaves']
-        ind_var.name = ind_var_name
-    else:
-        raise ValueError(f"Unsupported independent variable name: {ind_var_name}")
-
-    dep_var = dep_var.assign_coords(lat=ind_var.lat, lon=ind_var.lon)
-    return ind_var, dep_var
+def aggregate_independent_variable(ind_var, time_res):
 
 
-def run_mwa_daily(coarsen_factor=None, window_radius=1, client=None):
+    if time_res == "daily":
+        return ind_var
 
-    ind_var, dep_var = load_ind_dep_data(ind_var_name=INDEPEDENT_VARIABLE, dep_var_name=DEPENDENT_VARIABLE)
+    elif time_res == "annual_mean":
+        annual = ind_var.groupby("time.year").mean()
+        annual = annual.rename({"year": "time"})
+        annual = annual.assign_coords(time=annual.time.astype(np.int32))
+        return annual
 
-    # check if output zarr already exists
-    sname = f'{dep_var.name}_vs_{ind_var.name}_daily'
-    if coarsen_factor:
-        sname += f'_coarsened{coarsen_factor}'
+    elif time_res == "annual_sum":
+        annual = ind_var.groupby("time.year").sum()
+        annual = annual.rename({"year": "time"})
+        annual = annual.assign_coords(time=annual.time.astype(np.int32))
+        return annual
+
+    raise ValueError(f"Unsupported time_res: {time_res}")
+
+
+def _check_zarrs_exist(sname):
+    """Check if output zarrs exist (either indexed or non-indexed versions)."""
+    # Check for indexed versions (from offset resampling)
+    indexed_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind_0.zarr')
+    indexed_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep_0.zarr')
+    if os.path.exists(indexed_ind) and os.path.exists(indexed_dep):
+        return True
+    
+    # Check for non-indexed versions
     out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
     out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
-    if not os.path.exists(out_path_ind) or not os.path.exists(out_path_dep):
+    return os.path.exists(out_path_ind) and os.path.exists(out_path_dep)
+
+
+def run_mwa(coarsen_factor=None, window_radius=1, time_res='daily', client=None,
+            ind_var_name='cc_loss', dep_var_name='heatwaves'):
+
+    ind_var, dep_var = load_ind_dep_data(ind_var_name=ind_var_name, dep_var_name=dep_var_name)
+
+    # check if output zarr already exists
+    sname = f'{dep_var.name}_vs_{ind_var.name}_{time_res}'
+    if coarsen_factor:
+        sname += f'_coarsened{coarsen_factor}'
+    
+    if not _check_zarrs_exist(sname):
         print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
-        calc_moving_window_daily(ind_var=ind_var, dep_var=dep_var, client=client, window_radius=window_radius,
-                                coarsen_factor=coarsen_factor)
+        calc_moving_window(ind_var=ind_var, dep_var=dep_var, client=client, window_radius=window_radius,
+                           coarsen_factor=coarsen_factor, sname=sname, time_res=time_res)
         print(f"Moving window analysis completed for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
     else:
         print(f"Output zarrs already exist for {sname}. Skipping moving window analysis.")
@@ -297,20 +497,29 @@ def run_mwa_daily(coarsen_factor=None, window_radius=1, client=None):
     else:
         print(f"Binned statistics already exist for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}. Skipping calculation.")
 
-def run_mwa_coarsen_loop(client=None):
-        for coarsen_factor in [None, 2, 5, 10, 25]:#[None, 2, 4, 8, 16]:
-            run_mwa_daily(coarsen_factor=coarsen_factor, window_radius=1, client=client)
+def run_mwa_coarsen_loop(client=None, time_res='daily', ind_var_name='cc_loss', dep_var_name='heatwaves'):
+    for coarsen_factor in COARSEN_FACTORS:
+        run_mwa(coarsen_factor=coarsen_factor, window_radius=1, time_res=time_res, client=client,
+                ind_var_name=ind_var_name, dep_var_name=dep_var_name)
             
 #%%
 if __name__ == "__main__":
     
     with local_cluster(n_workers=6, threads_per_worker=6, memory_limit='100GB',
                        suppress_dask_warnings=True) as client:
-        run_mwa_coarsen_loop(client=client)
+        run_mwa_coarsen_loop(client=client, time_res='annual_mean', ind_var_name='cc_loss', dep_var_name='tmax')
+        run_mwa_coarsen_loop(client=client, time_res='annual_sum', ind_var_name='cc_loss', dep_var_name='heatwaves')
+        run_mwa_coarsen_loop(client=client, time_res='annual_sum', ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed')
+        run_mwa_coarsen_loop(client=client, time_res='daily', ind_var_name='cc_loss', dep_var_name='tmax')
 
 
-#%%
 
-# # open pickle to check
-# with open(os.path.join(MWA_DAILY_DIR, f'{dep_var.name}_vs_{ind_var.name}_daily_binned_stats.P'), 'rb') as f:
-#     stats_summed = pickle.load(f)
+
+#%% test
+
+# get results for
+# time_res = 'daily'
+# ind_var_name = 'cc_loss'
+# dep_var_name = 'tmax'
+# ind_ds = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{dep_var_name}_vs_{ind_var_name}_{time_res}_mwa_results_ind.zarr'), consolidated=False)
+# dep_ds = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{dep_var_name}_vs_{ind_var_name}_{time_res}_mwa_results_dep.zarr'), consolidated=False)
