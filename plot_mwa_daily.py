@@ -32,7 +32,10 @@ def pickle_to_df(pickle_path):
         # read pickle
         with open(pickle_path, 'rb') as f:
             ds = pickle.load(f)
-        df = ds.to_pandas()
+            ds.coords['time'] = ds.time.dt.year
+            ds = ds.rename({'time': 'year', 'cc_loss_cdiff_bins':'bins'})
+
+        df = ds.to_dataframe()
 
         df['se'] = df['std'] / np.sqrt(df['count'])
         df['ci_lower'] = df['mean'] - 1.96 * df['se']
@@ -42,7 +45,20 @@ def pickle_to_df(pickle_path):
         df['yerr_lower'] = df['mean'] - df['ci_lower']
         df['yerr_upper'] = df['ci_upper'] - df['mean']
 
-        return df
+        meandf = pd.DataFrame(index=df.index.get_level_values('bins').unique().sort_values())
+        meandf['sum'] = df.groupby('bins')['sum'].sum() 
+        meandf['count'] = df.groupby('bins')['count'].sum()
+        meandf['mean'] = meandf['sum'] / meandf['count']
+        meandf['sumsq'] = df.groupby('bins')['sumsq'].sum()
+        meandf['std'] = np.sqrt(meandf['sumsq'] / meandf['count'] - meandf['mean']**2)
+        meandf['se'] = meandf['std'] / np.sqrt(meandf['count'])
+        meandf['ci_lower'] = meandf['mean'] - 1.96 * meandf['se']
+        meandf['ci_upper'] = meandf['mean'] + 1.96 * meandf['se']
+        meandf['yerr_lower'] = meandf['mean'] - meandf['ci_lower']
+        meandf['yerr_upper'] = meandf['ci_upper'] - meandf['mean']
+        meandf = meandf.sort_index()
+
+        return df, meandf
 
 def plot_binned_results(ind_var_name, dep_var_name, time_res, coarsen_factor=None,
                         ylabel='neighbour mean temperature change (°C)',
@@ -52,9 +68,9 @@ def plot_binned_results(ind_var_name, dep_var_name, time_res, coarsen_factor=Non
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
     pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
-    df = pickle_to_df(pickle_path)
-    
-    
+    df, meandf = pickle_to_df(pickle_path)
+    df = meandf
+
     # make readable xtick labels from pandas interval index
     xticklabels = [f"{int(interval.left)}-{int(interval.right)}" for interval in df.index]
 
@@ -93,7 +109,7 @@ def plot_binned_results(ind_var_name, dep_var_name, time_res, coarsen_factor=Non
 
 def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
                         ylabel=None,
-                        xlabel=None):
+                        xlabel='canopy cover loss bin (%)'):
     
     sname = f'{dep_var_name}_vs_{ind_var_name}_{time_res}'
 
@@ -103,13 +119,13 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
 
     dfs = {}
     for pickle_path in pickle_paths:
-        df = pickle_to_df(pickle_path)
+        df, meandf = pickle_to_df(pickle_path)
+        df = meandf
         # Extract coarsen factor from filename
         coarsen_factor = None
         if 'coarsened' in pickle_path:
             coarsen_factor = int(pickle_path.split('coarsened')[-1].split('_')[0])
         dfs[coarsen_factor] = df
-
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
     n_cfs = len(cfs)
@@ -117,14 +133,12 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
         raise ValueError(f"No valid CSVs to plot for {sname}")
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    colors = plt.cm.Greys(np.linspace(.4, .8, n_cfs))
+    colors = plt.cm.Greys(np.linspace(.25, .75, n_cfs))
 
     # Build a shared x-axis from the union of all df indexes
     bin_labels = set()
     for df in dfs.values():
-        # make readable xtick labels from pandas interval index
-        xticklabels = [f"{int(interval.left)}-{int(interval.right)}" for interval in df.index]
-        bin_labels.update(xticklabels)
+        bin_labels.update(df.index)
 
     n_bins = len(bin_labels)
 
@@ -153,11 +167,10 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
     if ylabel is None:
         ylabel = f'mean difference in {dep_var_name}'
 
-
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xticks(x)
-    ax.set_xticklabels(sort_bin_labels(bin_labels), rotation=0)
+    ax.set_xticklabels(bin_labels, rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.legend(title='downsampled\nresolution', bbox_to_anchor=(1.01, 1), loc='upper left')
     ax.set_title(f'{dep_var_name} vs {ind_var_name} by downsampled resolution')
@@ -181,14 +194,15 @@ def plot_mwa_results(ind_var_name, dep_var_name, time_res,
                                      xlabel=xlabel)
     plot_mwa_results_all(ind_var_name=ind_var_name, dep_var_name=dep_var_name,
                          time_res=time_res,
-                            ylabel=ylabel,
-                            xlabel=xlabel)
+                            xlabel=xlabel,
+                            ylabel=ylabel)
 
 
 plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', time_res='annual_mean',
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual mean tmax (°C)')
 
+#%%
 plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves', time_res='annual_sum',
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual heatwave count')
@@ -197,6 +211,9 @@ plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed', time
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual heatwave count')
 
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', time_res='daily',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in daily tmax (°C)')
+
+# #%% 
+coarsen_factor=25
+
+ind_var_name='cc_loss'
+dep_var_name='tmax'

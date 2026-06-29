@@ -5,6 +5,9 @@ import shutil
 import xarray as xr
 import numpy as np
 from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR
+from dask.distributed import Client, LocalCluster
+import warnings
+from contextlib import contextmanager
 
 def lon_to_180(ds):
     ds = ds.copy()
@@ -93,3 +96,24 @@ def load_heat(category='heatdays'):
 def open_hansen():
     ds = xr.open_zarr(HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr', consolidated=False)['tree_cover']
     return ds
+
+@contextmanager
+def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
+                  suppress_dask_warnings=False, use_dask_dashboard=True):
+
+    if suppress_dask_warnings:
+        warnings.filterwarnings(
+            "ignore", 
+            message="Sending large graph of size.*", 
+            category=UserWarning, 
+            module="distributed.client"
+        )
+
+    if use_dask_dashboard:
+        with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
+                        memory_limit=memory_limit, dashboard_address=':7878') as cluster:
+            with Client(cluster) as client:
+                print(f'LocalCluster started: {client.dashboard_link}')
+                yield client
+    else:
+        yield None

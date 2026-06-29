@@ -4,17 +4,15 @@ import numpy as np
 import os
 import dask.array as da
 from functools import partial
-from constants import HANSEN_DIR, PERCENTILES_DIR, STORAGE_DIR
-from dask.distributed import Client, LocalCluster
-from dask.diagnostics import ProgressBar
+from constants import HANSEN_DIR, MWA_DAILY_DIR, STORAGE_DIR, LAT_CHUNK_SIZE, LON_CHUNK_SIZE
 import matplotlib.pyplot as plt
-from contextlib import contextmanager
-from numba import njit
 import gc
-import warnings
-import pickle
+from ufuncs import local_cluster
 
-COARSEN_FACTORS = [10, 25]#[None, 2, 5, 10, 25]
+
+COARSEN_FACTORS = [None, 2, 5, 10, 25]
+
+SPATH_SUFFIX = None
 
 
 def _extract_years_from_time(time_coord):
@@ -25,40 +23,20 @@ def _extract_years_from_time(time_coord):
 
 USE_DASK_DASHBOARD = True
 
-MWA_DAILY_DIR = os.path.join(STORAGE_DIR, 'mwa_results')
-
-
-@contextmanager
-def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
-                  suppress_dask_warnings=False):
-
-    if suppress_dask_warnings:
-        warnings.filterwarnings(
-            "ignore", 
-            message="Sending large graph of size.*", 
-            category=UserWarning, 
-            module="distributed.client"
-        )
-
-    if USE_DASK_DASHBOARD:
-        with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
-                        memory_limit=memory_limit, dashboard_address=':7878') as cluster:
-            with Client(cluster) as client:
-                print(f'LocalCluster started: {client.dashboard_link}')
-                yield client
-    else:
-        yield None
-
 
 def load_ind_dep_data(ind_var_name, dep_var_name):
 
     if ind_var_name == 'cc_loss':
         ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
-        tc = ds['tree_cover'].loc[dict(time=slice('2003', '2020'))]
-        tc = tc.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
+        tc = ds['tree_cover']
+        ind_var = -(tc - tc[0])
+        ind_var = ind_var.loc[{'time': slice('2003', '2020')}]
+        
+        ind_var = ind_var.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
                                                 freq='YS', calendar='noleap', use_cftime=True))
-        ind_var = -(tc - tc[0]).round()
+        
         ind_var.name = ind_var_name
+        
     else:
         raise ValueError(f"Unsupported independent variable name: {ind_var_name}")
 
@@ -111,8 +89,10 @@ def _mwa_kernel_time(block, window_radius):
             
             n_ind = ind[:, ri:ri+h_size, rj:rj+w_size]
             n_dep = dep[:, ri:ri+h_size, rj:rj+w_size]
-            dep_diff = n_dep - center_dep
-            ind_diff = n_ind - center_ind
+            # dep_diff = n_dep - center_dep
+            # ind_diff = n_ind - center_ind
+            dep_diff = center_dep - n_dep
+            ind_diff = center_ind - n_ind
             
             better = ind_diff > max_ind_diff
             max_ind_diff = np.where(better, ind_diff, max_ind_diff)
@@ -184,25 +164,32 @@ def _generate_coarsened_versions(ind_var, dep_var, coarsen_factor):
     # First version: standard coarsening
     ind_coarse = ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
     dep_coarse = dep_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    # rechunk for the coarsened versions
+    ind_coarse = ind_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+    dep_coarse = dep_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
     dss.append((ind_coarse, dep_coarse))
     
-    # # Add offset versions if coarsen_factor >= 10
-    # if coarsen_factor >= 10:
-    #     num_offsets = (coarsen_factor - 10) // 5 + 1
-    #     for offset_idx in range(num_offsets):
-    #         offset = (offset_idx + 1) * 5
+    # Add offset versions if coarsen_factor >= 10
+    if coarsen_factor >= 10:
+        num_offsets = (coarsen_factor - 10) // 5 + 1
+        for offset_idx in range(num_offsets):
+            offset = (offset_idx + 1) * 5
             
-    #         # Create shifted versions with offset slicing
-    #         ind_shifted = ind_var.loc[{'lat': slice(ind_var.lat.values[offset], ind_var.lat.values[-offset]),
-    #                                    'lon': slice(ind_var.lon.values[offset], ind_var.lon.values[-offset])}]
-    #         dep_shifted = dep_var.loc[{'lat': slice(dep_var.lat.values[offset], dep_var.lat.values[-offset]),
-    #                                    'lon': slice(dep_var.lon.values[offset], dep_var.lon.values[-offset])}]
+            # Create shifted versions with offset slicing
+            ind_shifted = ind_var.loc[{'lat': slice(ind_var.lat.values[offset], ind_var.lat.values[-offset]),
+                                       'lon': slice(ind_var.lon.values[offset], ind_var.lon.values[-offset])}]
+            dep_shifted = dep_var.loc[{'lat': slice(dep_var.lat.values[offset], dep_var.lat.values[-offset]),
+                                       'lon': slice(dep_var.lon.values[offset], dep_var.lon.values[-offset])}]
             
-    #         # Coarsen the shifted versions
-    #         ind_shifted_coarse = ind_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-    #         dep_shifted_coarse = dep_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-            
-    #         dss.append((ind_shifted_coarse, dep_shifted_coarse))
+            # Coarsen the shifted versions
+            ind_shifted_coarse = ind_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+            dep_shifted_coarse = dep_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+
+            # rechunk for the coarsened versions
+            ind_shifted_coarse = ind_shifted_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+            dep_shifted_coarse = dep_shifted_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+
+            dss.append((ind_shifted_coarse, dep_shifted_coarse))
     
     return dss
 
@@ -345,93 +332,7 @@ def _calc_moving_window_annual(ind_var, dep_var, ind_var_name, dep_var_name,
         client.cancel(dep_ds)
     gc.collect()
     print(f"All-year results written to {out_path_ind} and {out_path_dep}")
-  
-def calculate_binned_stats(dep_var_name, ind_var_name, coarsen_factor=None, sname=None):
-    """Calculate binned statistics from moving window analysis results.
-    
-    Handles both single zarr files and multiple versions (from offset resampling).
-    """
-    
-    # Check if multiple versions exist (indexed zarr files)
-    zarr_files = []
-    version_idx = 0
-    while True:
-        ind_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind_{version_idx}.zarr')
-        dep_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep_{version_idx}.zarr')
-        if os.path.exists(ind_path) and os.path.exists(dep_path):
-            zarr_files.append((ind_path, dep_path))
-            version_idx += 1
-        else:
-            break
-    
-    # If no indexed files, try non-indexed versions
-    if not zarr_files:
-        ind_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
-        dep_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
-        if os.path.exists(ind_path) and os.path.exists(dep_path):
-            zarr_files = [(ind_path, dep_path)]
-    
-    if not zarr_files:
-        raise FileNotFoundError(f"No zarr files found for {sname}")
-    
-    # Load and concatenate all versions
-    all_inds = []
-    all_deps = []
-    for ind_path, dep_path in zarr_files:
-        ind = xr.open_zarr(ind_path, consolidated=False)[ind_var_name+'_cdiff']
-        dep = xr.open_zarr(dep_path, consolidated=False)[dep_var_name+'_cdiff']
-        all_inds.append(ind)
-        all_deps.append(dep)
-    
-    # Concatenate across versions (if multiple)
-    if len(all_inds) > 1:
-        ind = xr.concat(all_inds, dim='version')
-        dep = xr.concat(all_deps, dim='version')
-    else:
-        ind = all_inds[0]
-        dep = all_deps[0]
 
-    bins = np.arange(10, 110, 10)
-    if ind.sizes.get('time', -1) == dep.sizes.get('year', -2):
-        dep_time = dep.rename({'year': 'time'}).assign_coords(time=ind.time if 'time' in ind.dims else ind.time)
-        binned = dep_time.groupby_bins(ind, bins=bins)
-        stats_summed = xr.Dataset({
-            'sum': binned.sum(),
-            'count': binned.count(),
-            'sumsq': (dep_time**2).groupby_bins(ind, bins=bins).sum(),
-        })
-    else:
-        stats_dss = []
-        for year in dep.year.values:
-            if 'time' in ind.dims:
-                ind_year = ind.sel(time=ind.time.dt.year == year)
-            else:
-                ind_year = ind
-            dep_year = dep.sel(year=year)
-
-            ind_bins = ind_year.mean('time') if 'time' in ind_year.dims else ind_year
-            binned = dep_year.groupby_bins(ind_bins, bins=bins)
-
-            stats = xr.Dataset({
-                'sum': binned.sum(),
-                'count': binned.count(),
-                'sumsq': (dep_year**2).groupby_bins(ind_bins, bins=bins).sum()
-            })
-            stats = stats.expand_dims(year=[year])
-            stats_dss.append(stats)
-
-        stats_ds = xr.concat(stats_dss, dim='year', join='outer', coords='minimal')
-        stats_summed = stats_ds.sum('year')
-
-    stats_summed['mean'] = stats_summed['sum'] / stats_summed['count']
-    stats_summed['std'] = np.sqrt(stats_summed['sumsq'] / stats_summed['count'] - stats_summed['mean']**2)
-
-    stats_computed = stats_summed.compute()
-
-    pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
-    print(f"Saving binned statistics to as pickle {pickle_path}...")
-    with open(pickle_path, 'wb') as f:
-        pickle.dump(stats_computed, f)
 
 def aggregate_independent_variable(ind_var, time_res):
 
@@ -477,6 +378,8 @@ def run_mwa(coarsen_factor=None, window_radius=1, time_res='daily', client=None,
     sname = f'{dep_var.name}_vs_{ind_var.name}_{time_res}'
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
+    if SPATH_SUFFIX:
+        sname += f'_{SPATH_SUFFIX}'
     
     if not _check_zarrs_exist(sname):
         print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
@@ -487,15 +390,6 @@ def run_mwa(coarsen_factor=None, window_radius=1, time_res='daily', client=None,
         print(f"Output zarrs already exist for {sname}. Skipping moving window analysis.")
 
 
-    if not os.path.exists(os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')):
-        
-        print(f"Calculating binned statistics for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
-
-        calculate_binned_stats(dep_var_name=dep_var.name, ind_var_name=ind_var.name,
-                            coarsen_factor=coarsen_factor, sname=sname)
-        print(f"Binned statistics calculation completed for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}.")
-    else:
-        print(f"Binned statistics already exist for {dep_var.name} vs {ind_var.name} with coarsen factor {coarsen_factor}. Skipping calculation.")
 
 def run_mwa_coarsen_loop(client=None, time_res='daily', ind_var_name='cc_loss', dep_var_name='heatwaves'):
     for coarsen_factor in COARSEN_FACTORS:
@@ -505,21 +399,10 @@ def run_mwa_coarsen_loop(client=None, time_res='daily', ind_var_name='cc_loss', 
 #%%
 if __name__ == "__main__":
     
-    with local_cluster(n_workers=6, threads_per_worker=6, memory_limit='100GB',
-                       suppress_dask_warnings=True) as client:
+    with local_cluster(n_workers=24, threads_per_worker=2, memory_limit='20GB',
+                       suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
         run_mwa_coarsen_loop(client=client, time_res='annual_mean', ind_var_name='cc_loss', dep_var_name='tmax')
         run_mwa_coarsen_loop(client=client, time_res='annual_sum', ind_var_name='cc_loss', dep_var_name='heatwaves')
         run_mwa_coarsen_loop(client=client, time_res='annual_sum', ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed')
-        run_mwa_coarsen_loop(client=client, time_res='daily', ind_var_name='cc_loss', dep_var_name='tmax')
+        # run_mwa_coarsen_loop(client=client, time_res='daily', ind_var_name='cc_loss', dep_var_name='tmax')
 
-
-
-
-#%% test
-
-# get results for
-# time_res = 'daily'
-# ind_var_name = 'cc_loss'
-# dep_var_name = 'tmax'
-# ind_ds = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{dep_var_name}_vs_{ind_var_name}_{time_res}_mwa_results_ind.zarr'), consolidated=False)
-# dep_ds = xr.open_zarr(os.path.join(MWA_DAILY_DIR, f'{dep_var_name}_vs_{ind_var_name}_{time_res}_mwa_results_dep.zarr'), consolidated=False)

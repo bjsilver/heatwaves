@@ -6,8 +6,9 @@ import os
 import shutil
 import dask
 from ufuncs import add_metadata_to_zarr
+from constants import LAT_CHUNK_SIZE, LON_CHUNK_SIZE
 
-TARGET_CHUNKS = (365, 250, 250)
+TARGET_CHUNKS = (365, LAT_CHUNK_SIZE, LON_CHUNK_SIZE)
 FILLVALUE = -9999
 
 RECHUNK_JOBS = [

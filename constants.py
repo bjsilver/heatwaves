@@ -7,6 +7,7 @@ STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 HANSEN_PATH = '/uolstore/Research/b/b0122/ee13c2s/datasets/hansen_v1.9/output/'
+MWA_DAILY_DIR = STORAGE_DIR+ 'mwa_results/'
 
 FIGDIR = '/uolstore/Research/b/b0256/Users/earbsi/figs/heatwaves/'
 
@@ -17,6 +18,9 @@ ZZ_RECHUNKED_PATH = STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr
 
 PERCENTILE_KEYS = ['zz_2003-2020', 'zz_2003-2020_smooth']#, 'era_2003-2020', 'era_1970-1999'] --- IGNORE ---
 
+# chunk sizes
+LAT_CHUNK_SIZE = 250
+LON_CHUNK_SIZE = 250
 
 # areas
 AMAZON_BBOX = {'latitude':slice(-30, 20), 'longitude':slice(-82, -34.5)}

@@ -7,6 +7,7 @@ import os
 import shutil
 import dask
 from ufuncs import add_metadata_to_zarr
+import regionmask
 
 TARGET_STORE = HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr'
 
@@ -28,29 +29,38 @@ def open_hansen():
     da = da[:, :-1, :-1]
     return da
 
+
+# mask out non-land areas using the regionmask package
+def mask_non_land(da):
+    land_mask = regionmask.defined_regions.natural_earth_v5_1_2.land_10.mask(da[0].lon, da[0].lat)
+    da = da.where(~land_mask.isnull())
+    return da
+
 #%%
+
 
 if __name__ == '__main__':
     hansen = open_hansen()
 
     # change lat lon coords to float32 and round to 2dp
-    hansen = hansen.assign_coords(lat=hansen.lat.astype('float32').round(2), lon=hansen.lon.astype('float32').round(2))
+    # hansen = hansen.assign_coords(lat=hansen.lat.astype('float32').round(2), lon=hansen.lon.astype('float32').round(2))
     hansen = hansen.drop_vars('spatial_ref')
     
-    # round to 0dp and convert to int16 to save space
-    hansen = hansen.round(0)
-    hansen = hansen.astype('uint8')
+    hansen = hansen.round(1)
+    # hansen = hansen.astype('float32')
+    hansen = hansen.fillna(0)
+    hansen = mask_non_land(hansen)
 
     hansen.encoding = {}
 
-    da = hansen.chunk().data
+    # da = hansen.chunk().data
     with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
-        rechunked = da.rechunk((1, 250, 250))
+        rechunked = hansen.chunk({'time': 1, 'lat': 250, 'lon': 250})
 
     with LocalCluster(n_workers=4, threads_per_worker=8, memory_limit='128GB') as cluster:
             with Client(cluster) as client:
                 print(f"Dask Dashboard available at: {client.dashboard_link}")
-                rechunked.to_zarr(TARGET_STORE, mode='w', consolidated=False, align_chunks=True)
+                rechunked.to_zarr(TARGET_STORE, mode='w')
 
         
     add_metadata_to_zarr(
