@@ -3,7 +3,7 @@ import os
 from distributed import Client, LocalCluster
 import xarray as xr
 import dask.array as da
-from constants import STORAGE_DIR
+from constants import STORAGE_DIR, HEATDAY_TEMP_THRESH, HEATWAVE_DAY_THRESH
 from ufuncs import ensure_match_coords
 from dask.diagnostics import ProgressBar
 import numpy as np
@@ -61,7 +61,8 @@ def calculate_heatdays(zz, pctda, write_path):
         zz_time_coords = zz_year.coords['time']
         zz_year_doy = zz_year.assign_coords(time=np.arange(1, zz_year.sizes['time'] + 1))
 
-        heatdays_year = ((zz_year_doy > 28.5) & (zz_year_doy > pctda)).assign_coords(time=zz_time_coords)
+        heatdays_year = ((zz_year_doy > HEATDAY_TEMP_THRESH) & (zz_year_doy > pctda))
+        heatdays_year = heatdays_year.assign_coords(time=zz_time_coords)
         heatdays_year.name = 'heatdays'
 
         if i == 0:
