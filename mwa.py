@@ -9,20 +9,9 @@ import matplotlib.pyplot as plt
 import gc
 from ufuncs import local_cluster
 
-
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
-
 SPATH_SUFFIX = None
-
-
-def _extract_years_from_time(time_coord):
-    values = np.asarray(time_coord.values)
-    if np.issubdtype(values.dtype, np.integer):
-        return values.astype(np.int32)
-    return np.asarray(time_coord.dt.year.values, dtype=np.int32)
-
 USE_DASK_DASHBOARD = True
-
 
 def load_ind_dep_data(ind_var_name, dep_var_name):
 
@@ -31,10 +20,7 @@ def load_ind_dep_data(ind_var_name, dep_var_name):
         tc = ds['tree_cover']
         ind_var = -(tc - tc[0])
         ind_var = ind_var.loc[{'time': slice('2003', '2020')}]
-        
-        ind_var = ind_var.assign_coords(time=xr.date_range(start='2003-01-01', end='2020-12-31', 
-                                                freq='YS', calendar='noleap', use_cftime=True))
-        
+        ind_var = ind_var.rename({'time': 'year'})
         ind_var.name = ind_var_name
         
     else:
@@ -58,7 +44,7 @@ def load_ind_dep_data(ind_var_name, dep_var_name):
 
 
 
-def _mwa_kernel_time(block, window_radius):
+def _mwa_kernel(block, window_radius):
     """
     block: (2, T, H+2wr, W+2wr) — channel 0 = independent var, channel 1 = dependent var.
     Returns same shape, with results embedded in centre for each timestep.
@@ -108,32 +94,30 @@ def _mwa_kernel_time(block, window_radius):
 
     return out
 
-def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name,
-                                 time_res='daily'):
+def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name):
     """Moving-window analysis on (time, lat, lon) inputs."""
     ind_arr = ds[ind_var_name].data
     dep_arr = ds[dep_var_name].data
 
-    years = np.unique(_extract_years_from_time(ds.time))
 
     stacked = da.stack([ind_arr, dep_arr]).rechunk({0: -1})
     stacked = stacked.persist()
     
     result = da.map_overlap(
-        partial(_mwa_kernel_time, window_radius=window_radius),
+        partial(_mwa_kernel, window_radius=window_radius),
         stacked,
         depth={0: 0, 1: 0, 2: window_radius, 3: window_radius},
         boundary=np.nan,
         trim=False,
         dtype=np.float32,
     )
-
+    
     ind_ds = xr.Dataset(
     data_vars={
-        f'{ind_var_name}_cdiff': (("time", "lat", "lon"), result[0]),
+        f'{ind_var_name}_cdiff': (("year", "lat", "lon"), result[0]),
     },
     coords={
-        "time": ds.coords["time"],
+        "year": ds.coords["year"],
         "lat": ds.coords["lat"],
         "lon": ds.coords["lon"]
     }
@@ -141,10 +125,10 @@ def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name,
 
     dep_ds = xr.Dataset(
     data_vars={
-        f'{dep_var_name}_cdiff': (("year", "lat", "lon"), result[1].mean(axis=0, keepdims=True) if time_res == 'daily' else result[1]),
+        f'{dep_var_name}_cdiff': (("year", "lat", "lon"), result[1]),
     },
     coords={
-        "year": [int(years[0])] if time_res == 'daily' else years,
+        "year": ds.coords["year"],
         "lat": ds.coords["lat"],
         "lon": ds.coords["lon"]
     }
@@ -194,7 +178,7 @@ def _generate_coarsened_versions(ind_var, dep_var, coarsen_factor):
     return dss
 
 
-def calc_moving_window(ind_var, dep_var, client=None, time_res='daily',
+def calc_moving_window(ind_var, dep_var, client=None, time_res='annual_mean',
                              coarsen_factor=None, window_radius=1, sname=None):
     
     ind_var_name = ind_var.name
@@ -227,120 +211,37 @@ def calc_moving_window(ind_var, dep_var, client=None, time_res='daily',
         if time_res in ('annual_mean', 'annual_sum'):
             dep_var_version = aggregate_independent_variable(dep_var_version, time_res)
 
-        if time_res == 'daily':
-            _calc_moving_window_daily(
-                ind_var=ind_var_version,
-                dep_var=dep_var_version,
-                ind_var_name=ind_var_name,
-                dep_var_name=dep_var_name,
-                out_path_ind=out_path_ind,
-                out_path_dep=out_path_dep,
-                client=client,
+        if time_res in ('annual_mean', 'annual_sum'):
+            years = ind_var.years
+            dep_years = dep_var.years
+            dep_var = dep_var.isel(time=np.isin(dep_years, years))
+            dep_var = dep_var.assign_coords(time=ind_var.time)
+
+            ds_all = xr.Dataset({ind_var_name: ind_var_version, dep_var_name: dep_var_version})
+            ind_ds, dep_ds = moving_window_analysis(
+                ds_all,
                 window_radius=window_radius,
-            )
-        elif time_res in ('annual_mean', 'annual_sum'):
-            _calc_moving_window_annual(
-                ind_var=ind_var_version,
-                dep_var=dep_var_version,
                 ind_var_name=ind_var_name,
-                dep_var_name=dep_var_name,
-                out_path_ind=out_path_ind,
-                out_path_dep=out_path_dep,
-                client=client,
-                window_radius=window_radius,
-                time_res=time_res,
+                dep_var_name=dep_var_name
             )
+
+            ind_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
+            dep_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
+
+            if client is not None:
+                client.cancel(ind_ds)
+                client.cancel(dep_ds)
+            gc.collect()
+            print(f"All-year results written to {out_path_ind} and {out_path_dep}")
         else:
             raise ValueError(f"Unsupported time_res: {time_res}")
 
-
-def _calc_moving_window_daily(ind_var, dep_var, ind_var_name, dep_var_name,
-                              out_path_ind, out_path_dep, client,
-                              window_radius):
-    year_list = np.unique(_extract_years_from_time(dep_var.time))
-
-    write_mode = 'w'
-    for year in year_list:
-        print(f"Running moving window analysis for year {year}...")
-        ind_year = ind_var.sel(time=ind_var.time.dt.year == year)
-        dep_year = dep_var.sel(time=dep_var.time.dt.year == year)
-
-        if ind_year.sizes['time'] == dep_year.sizes['time']:
-            ind_year_for_kernel = ind_year
-            dep_year_for_kernel = dep_year
-        elif ind_year.sizes['time'] == 1 and dep_year.sizes['time'] > 1:
-            ind_year_for_kernel = ind_year.squeeze('time', drop=True).expand_dims(time=dep_year.time)
-            ind_year_for_kernel = ind_year_for_kernel.assign_coords(time=dep_year.time)
-            dep_year_for_kernel = dep_year
-        elif dep_year.sizes['time'] == 1 and ind_year.sizes['time'] > 1:
-            dep_year_for_kernel = dep_year.squeeze('time', drop=True).expand_dims(time=ind_year.time)
-            dep_year_for_kernel = dep_year_for_kernel.assign_coords(time=ind_year.time)
-            ind_year_for_kernel = ind_year
-        else:
-            raise ValueError(
-                f"Cannot align yearly time dimensions for year {year}: "
-                f"ind={ind_year.sizes['time']}, dep={dep_year.sizes['time']}"
-            )
-
-        ds_year = xr.Dataset({ind_var_name: ind_year_for_kernel, dep_var_name: dep_year_for_kernel})
-
-        ind_ds, dep_ds = moving_window_analysis(
-            ds_year,
-            window_radius=window_radius,
-            ind_var_name=ind_var_name,
-            dep_var_name=dep_var_name,
-            time_res='daily',
-        )
-
-        if write_mode == 'w':
-            ind_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
-            dep_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
-            write_mode = 'a'
-        else:
-            ind_ds.to_zarr(out_path_ind, mode='a', append_dim='time', consolidated=False)
-            dep_ds.to_zarr(out_path_dep, mode='a', append_dim='year', consolidated=False)
-
-        if client is not None:
-            client.cancel(ind_ds)
-            client.cancel(dep_ds)
-        gc.collect()
-        print(f"Year {year} results written to {out_path_ind} and {out_path_dep}")
-
-
-def _calc_moving_window_annual(ind_var, dep_var, ind_var_name, dep_var_name,
-                               out_path_ind, out_path_dep, client,
-                               window_radius, time_res):
-    years = np.unique(_extract_years_from_time(ind_var.time))
-    dep_years = _extract_years_from_time(dep_var.time)
-    dep_var = dep_var.isel(time=np.isin(dep_years, years))
-    dep_var = dep_var.assign_coords(time=ind_var.time)
-
-    ds_all = xr.Dataset({ind_var_name: ind_var, dep_var_name: dep_var})
-    ind_ds, dep_ds = moving_window_analysis(
-        ds_all,
-        window_radius=window_radius,
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        time_res=time_res,
-    )
-
-    ind_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
-    dep_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
-
-    if client is not None:
-        client.cancel(ind_ds)
-        client.cancel(dep_ds)
-    gc.collect()
-    print(f"All-year results written to {out_path_ind} and {out_path_dep}")
 
 
 def aggregate_independent_variable(ind_var, time_res):
 
 
-    if time_res == "daily":
-        return ind_var
-
-    elif time_res == "annual_mean":
+    if time_res == "annual_mean":
         annual = ind_var.groupby("time.year").mean()
         annual = annual.rename({"year": "time"})
         annual = annual.assign_coords(time=annual.time.astype(np.int32))
@@ -369,7 +270,7 @@ def _check_zarrs_exist(sname):
     return os.path.exists(out_path_ind) and os.path.exists(out_path_dep)
 
 
-def run_mwa(coarsen_factor=None, window_radius=1, time_res='daily', client=None,
+def run_mwa(coarsen_factor=None, window_radius=1, time_res='annual_mean', client=None,
             ind_var_name='cc_loss', dep_var_name='heatwaves'):
 
     ind_var, dep_var = load_ind_dep_data(ind_var_name=ind_var_name, dep_var_name=dep_var_name)
@@ -391,7 +292,7 @@ def run_mwa(coarsen_factor=None, window_radius=1, time_res='daily', client=None,
 
 
 
-def run_mwa_coarsen_loop(client=None, time_res='daily', ind_var_name='cc_loss', dep_var_name='heatwaves'):
+def run_mwa_coarsen_loop(client=None, time_res='annual_mean', ind_var_name='cc_loss', dep_var_name='heatwaves'):
     for coarsen_factor in COARSEN_FACTORS:
         run_mwa(coarsen_factor=coarsen_factor, window_radius=1, time_res=time_res, client=client,
                 ind_var_name=ind_var_name, dep_var_name=dep_var_name)
