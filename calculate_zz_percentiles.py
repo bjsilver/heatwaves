@@ -14,7 +14,7 @@ from dask.distributed import Client, LocalCluster
 import metpy
 
 # --- CONFIGURATION ---
-DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/regridded/'
+DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 OUT_ZARR = os.path.join(PERCENTILES_DIR, 'zz_tmax_95pc.zarr')
 PAD = 7
@@ -23,8 +23,8 @@ PERCENTILE = 0.95
 USE_LOCAL_CLUSTER = True
 N_WORKERS = 32
 THREADS_PER_WORKER = 4
-MEMORY_LIMIT = '16GB'
-TILE_SIZE = 120  # spatial tile size for lat/lon
+MEMORY_LIMIT = '22GB'
+TILE_SIZE = 125  # spatial tile size for lat/lon
 
 # Ensure output directory exists.
 Path(PERCENTILES_DIR).mkdir(parents=True, exist_ok=True)
@@ -74,14 +74,17 @@ def quantile_over_window_view_skipna(win_view, q):
 # --- HELPER FUNCTIONS ---
 
 def load_tmax_da():
-    print(f"Opening input Zarr: {DPATH}zhang_zhou_regridded.zarr")
+    print(f"Opening input Zarr: {DPATH}zhang_zhou_regridded_rechunked.zarr")
     # Use consolidated=False to support stores without .zmetadata.
-    ds = xr.open_zarr(DPATH + 'zhang_zhou_regridded.zarr', chunks={}, consolidated=False)
+    ds = xr.open_zarr(DPATH + 'zhang_zhou_regridded_rechunked.zarr', chunks={}, consolidated=False)
     da = ds['Ta_TMAX']
     # check if zz time has duplicates
     if len(da.time) != len(np.unique(da.time)):
         print("Warning: Duplicate time entries found in zz dataset. Removing duplicates.")
         da = da.drop_duplicates('time')
+    # replace -9999 with NaN
+    da = da.where(da != -9999, np.nan)
+    da.attrs['units'] = 'tenths of degC'
 
     return da
 
@@ -126,8 +129,8 @@ def compute_percentiles_dask(tmax_da):
         n_years=n_years,
         pad=PAD,
         q=PERCENTILE,
-        drop_axis=0,
-        new_axis=0,
+        # drop_axis=0,
+        # new_axis=0,
         chunks=((365,), arr.chunks[1], arr.chunks[2]),
     )
 
@@ -162,6 +165,8 @@ def maybe_local_cluster():
 
 def save_percentiles(p95_da, out_path=OUT_ZARR):
     ds_out = p95_da.to_dataset(name='Ta_TMAX_p95')
+    # rechunk back to 250
+    ds_out = ds_out.chunk({'doy': -1, 'lat': 250, 'lon': 250})
     print(f'Writing output to {out_path}...')
     with ProgressBar():
         ds_out.to_zarr(out_path, mode='w', consolidated=True)
@@ -176,3 +181,14 @@ if __name__ == "__main__":
         print('Processing Complete.')
 
 
+#%%
+
+with ProgressBar():
+    tmax = load_tmax_da()
+    tmax.isnull().sum(['lat', 'lon']).compute(num_workers=32).plot()
+
+#%%
+
+with ProgressBar():
+    all_nan = tmax.isnull().all('time').sum().compute(num_workers=32)
+    any_nan = tmax.isnull().any('time').sum().compute(num_workers=32)

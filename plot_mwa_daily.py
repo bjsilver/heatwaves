@@ -16,9 +16,7 @@ COARSEN_FACTORS = [None, 2, 5, 10, 25]
 
 
 
-def sort_bin_labels(bin_labels):
-    """Sort bin labels like '0-10', '10-20', ... by their lower bound."""
-    return sorted(bin_labels, key=lambda interval: int(str(interval).split('-')[0]))
+
 
 def format_count(count):
     if count >= 1e6:
@@ -32,8 +30,7 @@ def pickle_to_df(pickle_path):
         # read pickle
         with open(pickle_path, 'rb') as f:
             ds = pickle.load(f)
-            ds.coords['time'] = ds.time.dt.year
-            ds = ds.rename({'time': 'year', 'cc_loss_cdiff_bins':'bins'})
+            ds = ds.rename({'cc_loss_cdiff_bins':'bins'})
 
         df = ds.to_dataframe()
 
@@ -60,11 +57,11 @@ def pickle_to_df(pickle_path):
 
         return df, meandf
 
-def plot_binned_results(ind_var_name, dep_var_name, time_res, coarsen_factor=None,
+def plot_binned_results(ind_var_name, dep_var_name, aggregation, coarsen_factor=None,
                         ylabel='neighbour mean temperature change (°C)',
                         xlabel='canopy cover loss bin (%)'):
 
-    sname = f'{dep_var_name}_vs_{ind_var_name}_{time_res}'
+    sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
     pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
@@ -107,11 +104,11 @@ def plot_binned_results(ind_var_name, dep_var_name, time_res, coarsen_factor=Non
     return fig, ax
 
 
-def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
+def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
                         ylabel=None,
                         xlabel='canopy cover loss bin (%)'):
     
-    sname = f'{dep_var_name}_vs_{ind_var_name}_{time_res}'
+    sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
 
     pickle_paths = sorted(glob(MWA_DAILY_DIR + f'{sname}*_stats.P'))
     if not pickle_paths:
@@ -133,12 +130,16 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
         raise ValueError(f"No valid CSVs to plot for {sname}")
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    colors = plt.cm.Greys(np.linspace(.25, .75, n_cfs))
+    colors = plt.cm.magma(np.linspace(.25, .75, n_cfs))
 
     # Build a shared x-axis from the union of all df indexes
     bin_labels = set()
     for df in dfs.values():
         bin_labels.update(df.index)
+
+    # make readable xtick labels from pandas interval index
+    xticklabels = [f"{int(interval.left)}-{int(interval.right)}" for interval in sorted(bin_labels)]
+    
 
     n_bins = len(bin_labels)
 
@@ -147,21 +148,19 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
 
     for i, cf in enumerate(cfs):
         df = dfs[cf]
-        offset = (i - n_cfs / 2 + 0.5) * bar_width
         label = 'original' if cf is None else f'≈{cf} km'
         
 
         
 
-        ax.bar(
-            x + offset,
+        ax.errorbar(
+            x,
             df['mean'].values,
-            width=bar_width,
             label=label,
             color=colors[i],
             alpha=0.85,
-            yerr=[df['yerr_lower'], df['yerr_upper']],
-            capsize=4,
+            yerr=[df['yerr_lower'].values, df['yerr_upper'].values],
+            capsize=2,
         )
 
     if ylabel is None:
@@ -170,7 +169,7 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xticks(x)
-    ax.set_xticklabels(bin_labels, rotation=0)
+    ax.set_xticklabels(xticklabels, rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.legend(title='downsampled\nresolution', bbox_to_anchor=(1.01, 1), loc='upper left')
     ax.set_title(f'{dep_var_name} vs {ind_var_name} by downsampled resolution')
@@ -183,37 +182,46 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, time_res,
     return fig, ax
 
 
-def plot_mwa_results(ind_var_name, dep_var_name, time_res,
+
+
+def plot_mwa_results(ind_var_name, dep_var_name, aggregation,
                      xlabel, ylabel,
                      coarsen_factors=COARSEN_FACTORS):
     
-    for coarsen_factor in coarsen_factors:
-        plot_binned_results(ind_var_name=ind_var_name, dep_var_name=dep_var_name, coarsen_factor=coarsen_factor,
-                            time_res=time_res,
-                                     ylabel=ylabel,
-                                     xlabel=xlabel)
+
+    # for coarsen_factor in coarsen_factors:
+    #     plot_binned_results(ind_var_name=ind_var_name, dep_var_name=dep_var_name, coarsen_factor=coarsen_factor,
+    #                         aggregation=aggregation,
+    #                                  ylabel=ylabel,
+    #                                  xlabel=xlabel)
     plot_mwa_results_all(ind_var_name=ind_var_name, dep_var_name=dep_var_name,
-                         time_res=time_res,
+                         aggregation=aggregation,
                             xlabel=xlabel,
                             ylabel=ylabel)
+    
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_95pct',
+                 xlabel='canopy cover loss bin (%)',
+                 ylabel='mean difference in annual 95th percentile tmax (°C)')
 
-
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', time_res='annual_mean',
+#%%
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_mean',
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual mean tmax (°C)')
 
 #%%
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves', time_res='annual_sum',
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves', aggregation='annual_sum',
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual heatwave count')
 
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed', time_res='annual_sum',
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed', aggregation='annual_sum',
                  xlabel='canopy cover loss bin (%)',
                  ylabel='mean difference in annual heatwave count')
 
+#%%
 
-# #%% 
-coarsen_factor=25
-
-ind_var_name='cc_loss'
-dep_var_name='tmax'
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_mean',
+                 xlabel='canopy cover loss bin (%)',
+                 ylabel='mean difference in annual mean tmax (°C)')
+plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_95pct',
+                 xlabel='canopy cover loss bin (%)',
+                 ylabel='mean difference in annual 95th percentile tmax (°C)')

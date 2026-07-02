@@ -16,6 +16,8 @@ ind, dep = retrieve_ind_dep_results(sname, ind_var_name, dep_var_name)
 ind = ind.rename({'time': 'year'})
 ind.coords['year'] = dep.year
 
+#%%
+
 with ProgressBar():
 
     da = dep.where(ind > 70).mean('year').compute(num_workers=18)

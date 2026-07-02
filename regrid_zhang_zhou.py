@@ -12,6 +12,8 @@ from numcodecs import Blosc
 from dask.diagnostics import ProgressBar
 import dask
 
+from constants import STORAGE_DIR
+
 
 
 # ---------------------------
@@ -30,14 +32,15 @@ RESET_OUTPUT = True
 def get_regridder(source_ds, target_ds):
     if not os.path.exists(WEIGHTS_FILE):
         print("Computing weights...")
-        ds_sample = source_ds[0]
+        ds_sample = source_ds.isel(time=0)
 
         regridder = xe.Regridder(
             ds_sample,
             target_ds,
             method="bilinear",
             periodic=False,
-            parallel=False
+            parallel=False,
+            unmapped_to_nan=True
         )
         regridder.to_netcdf(WEIGHTS_FILE)
     else:
@@ -48,6 +51,7 @@ def get_regridder(source_ds, target_ds):
                         method="bilinear",
                         periodic=False,
                         filename=WEIGHTS_FILE,
+                        unmapped_to_nan=True,
                         reuse_weights=True
                     )
     return regridder
@@ -68,24 +72,18 @@ def get_regridder_and_data(year):
         "lon": (["lon"], lons),
     })
 
-    # add all-True spatial mask variable
-    target_ds["mask"] = xr.DataArray(
-        np.ones((len(target_ds.lat), len(target_ds.lon)), dtype=bool),
-        dims=["lat", "lon"]
-    )
-
-
     
     source_ds = xr.open_dataset(f"{SOURCE_DIR}SouthAmerica_Ta_SVCMsp_{year}TMAX_daily_tropics30N30S.nc",
                                 chunks={'DOY':1, 'lat':1024, 'lon':1024}).drop_vars('spatial_ref', errors='ignore')
     
+    mask = xr.open_zarr(STORAGE_DIR + 'regrid/zz_tmax_nanmask.zarr')['mask'].all('year').astype('int8')
+    source_ds['mask'] = mask
+
     source_ds = fix_time_coord(source_ds, year)
     regridder = get_regridder(source_ds, target_ds)
 
 
-
-
-    regridded_ds = regridder(source_ds)
+    regridded_ds = regridder(source_ds['Ta_TMAX'])
     return regridded_ds, regridder
 
 def load_or_create_progress(years):
@@ -144,3 +142,5 @@ if __name__ == "__main__":
                 completed_years.add(year)
                 progress['completed_years'] = sorted(completed_years)
                 save_progress(progress)
+
+

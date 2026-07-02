@@ -24,3 +24,7 @@ LON_CHUNK_SIZE = 250
 
 # areas
 AMAZON_BBOX = {'latitude':slice(-30, 20), 'longitude':slice(-82, -34.5)}
+
+# heatwave thresholds
+HEATDAY_TEMP_THRESH = 28.5
+HEATWAVE_DAY_THRESH = 3

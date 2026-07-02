@@ -11,7 +11,7 @@ from dask.diagnostics import ProgressBar
 
 
 # area to test: [2600:2700, 2800:2900]
-PCTL_ZARR = STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr'
+PCTL_ZARR = STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr'
 pctls = xr.open_zarr(PCTL_ZARR, consolidated=True)['Ta_TMAX_p95'] / 10.0
 
 def _add_gridlines(ax, tick_interval, alpha=0.5):
