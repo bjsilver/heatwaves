@@ -14,15 +14,14 @@ westlimit=-69.7; southlimit=-13.7; eastlimit=-46.4; northlimit=5.6
 RESULTS_BBOX = {'lat':slice(southlimit, northlimit), 'lon':slice(westlimit, eastlimit)}
 
 def retrieve_ind_dep_results(sname, ind_var_name, dep_var_name):
-    
 
-    # get file paths for all versions of the zarr files
-    zarr_filepaths_ind = sorted(glob(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind*.zarr')))
-    zarr_filepaths_dep = sorted(glob(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep*.zarr')))
+    # get file paths for all versions of the combined zarr files
+    zarr_filepaths = sorted(glob(os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results*.zarr')))
+    if not zarr_filepaths:
+        raise FileNotFoundError(f'No combined MWA result stores found for {sname}')
 
-
-    all_inds = [xr.open_zarr(path, consolidated=False)[ind_var_name+'_cdiff'] for path in zarr_filepaths_ind]
-    all_deps = [xr.open_zarr(path, consolidated=False)[dep_var_name+'_cdiff'] for path in zarr_filepaths_dep]
+    all_inds = [xr.open_zarr(path, consolidated=False)[ind_var_name + '_cdiff'] for path in zarr_filepaths]
+    all_deps = [xr.open_zarr(path, consolidated=False)[dep_var_name + '_cdiff'] for path in zarr_filepaths]
 
 
     # Concatenate across versions (if multiple)
@@ -72,14 +71,22 @@ def calculate_binned_stats(dep_var_name, ind_var_name, sname=None,
     else:
         return stats_computed
     
-def calc_stats_all_coarsens(dep_var_name, ind_var_name, aggregation='annual_mean', coarsen_factors=COARSEN_FACTORS):
+def calc_stats_all_coarsens(dep_var_name, ind_var_names, driver_ind_var_name,
+                            ind_var_name_for_bins, aggregation='annual_mean',
+                            coarsen_factors=COARSEN_FACTORS):
     """Calculate binned statistics for all specified coarsen factors."""
+    ind_tag = '+'.join(ind_var_names)
     for coarsen_factor in coarsen_factors:
-        sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
+        sname = f'{dep_var_name}_vs_{ind_tag}_driver_{driver_ind_var_name}_{aggregation}'
         if coarsen_factor:
             sname += f'_coarsened{coarsen_factor}'
         print(f"Calculating binned statistics for {sname}...")
-        calculate_binned_stats(dep_var_name=dep_var_name, ind_var_name=ind_var_name, sname=sname, save_pickle=True)
+        calculate_binned_stats(
+            dep_var_name=dep_var_name,
+            ind_var_name=ind_var_name_for_bins,
+            sname=sname,
+            save_pickle=True,
+        )
 #%%
 
 
@@ -106,7 +113,16 @@ def calc_stats_all_coarsens(dep_var_name, ind_var_name, aggregation='annual_mean
 if __name__ == "__main__":
     with local_cluster(n_workers=24, threads_per_worker=1, memory_limit='6GB',
                        suppress_dask_warnings=False, use_dask_dashboard=True) as client:
-        # calc_stats_all_coarsens(dep_var_name='tmax', ind_var_name='cc_loss', aggregation='annual_mean', coarsen_factors=COARSEN_FACTORS)
-        calc_stats_all_coarsens(dep_var_name='tmax', ind_var_name='cc_loss', aggregation='annual_95pct', coarsen_factors=COARSEN_FACTORS)
-        # calc_stats_all_coarsens(dep_var_name='heatwaves', ind_var_name='cc_loss', aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
-        # calc_stats_all_coarsens(dep_var_name='heatwaves_smoothed', ind_var_name='cc_loss', aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
+        pass
+        # calc_stats_all_coarsens(dep_var_name='tmax', ind_var_names=['cc_loss'],
+        #                        driver_ind_var_name='cc_loss', ind_var_name_for_bins='cc_loss',
+        #                        aggregation='annual_mean', coarsen_factors=COARSEN_FACTORS)
+        calc_stats_all_coarsens(dep_var_name='tmax', ind_var_names=['cc_loss', 'forest_loss_age'],
+                    driver_ind_var_name='cc_loss', ind_var_name_for_bins='cc_loss',
+                    aggregation='annual_95pct', coarsen_factors=COARSEN_FACTORS)
+        # calc_stats_all_coarsens(dep_var_name='heatwaves', ind_var_names=['cc_loss'],
+        #                        driver_ind_var_name='cc_loss', ind_var_name_for_bins='cc_loss',
+        #                        aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
+        # calc_stats_all_coarsens(dep_var_name='heatwaves_smoothed', ind_var_names=['cc_loss'],
+        #                        driver_ind_var_name='cc_loss', ind_var_name_for_bins='cc_loss',
+        #                        aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
