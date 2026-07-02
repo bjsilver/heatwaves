@@ -22,10 +22,10 @@ def load_data():
         print("Warning: Duplicate time entries found in zz dataset. Removing duplicates.")
         zz = zz.drop_duplicates('time')
 
-    zz_pct = xr.open_zarr(STORAGE_DIR + 'rechunked/zz_pct_rechunked.zarr',
+    zz_pct = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
                         consolidated=True)['Ta_TMAX_p95'] / 10
     zz_pct = zz_pct[:, :-1, :-1]  # remove last row and column to match zz dimensions
-    zz_pct_smooth = xr.open_zarr(STORAGE_DIR + 'rechunked/zz_pct_smooth_rechunked.zarr',
+    zz_pct_smooth = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr',
                         consolidated=True)['Ta_TMAX_p95_smooth']
     zz_pct_smooth = zz_pct_smooth[:, :-1, :-1]  # remove last row and column to match zz dimensions
     zz_pct_smooth = zz_pct_smooth.rename({'doy':'time'})

@@ -16,7 +16,7 @@ RECHUNK_JOBS = [
         'input_path': STORAGE_DIR + 'regridded/zhang_zhou_regridded.zarr',
         'output_path': STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
         'var_name': 'Ta_TMAX',
-        'dtype': 'int16',
+        'dtype': 'float32',
         'dims': ('time', 'lat', 'lon'),
         'consolidated': False,
         'units':'tenths of degC'

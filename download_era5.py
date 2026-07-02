@@ -1,4 +1,4 @@
-"""Download ERA5 daily-mean skin temperature for the Amazon region via CDS API.
+"""Download ERA5 daily-maximum 2m temperature for the Amazon region via CDS API.
 
 This script requests the CDS dataset
 `derived-era5-single-levels-daily-statistics` using `cdsapi` and saves one
@@ -9,9 +9,8 @@ Notes
 - The CDS daily-statistics form currently requires `product_type`, `variable`,
   `year`, `month`, `day`, `daily_statistic`, `time_zone`, `frequency`, and
   `area`.
-- CDS request field names have changed over time. This script first tries the
-  newer `data_format` / `download_format` keys and falls back to the older
-  `format` key if needed.
+- CDS request field names have changed over time. This script uses
+    `data_format` / `download_format` keys expected by the current CDS API.
 - `AMAZON_BBOX` in `constants.py` is stored as xarray-style slices; CDS expects
   `[north, west, south, east]`.
 """
@@ -32,7 +31,8 @@ except ImportError as exc:  # pragma: no cover
 
 
 DATASET = "derived-era5-single-levels-daily-statistics"
-VARIABLE = "skin_temperature"
+# Use CDS enum key to avoid ambiguous MARS name matching.
+VARIABLE = "2m_temperature"
 PRODUCT_TYPE = "reanalysis"
 DAILY_STATISTIC = "daily_maximum"
 TIME_ZONE = "utc+00:00"
@@ -43,7 +43,7 @@ START_YEAR = 2001
 END_YEAR = 2020
 
 OUTPUT_DIR = Path('/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/')
-OUTPUT_TEMPLATE = "era5_land_skinT_dailymax_{year}.nc"
+OUTPUT_TEMPLATE = "era5_land_t2m_dailymax_{year}.nc"
 
 MONTHS = [f"{month:02d}" for month in range(1, 13)]
 DAYS = [f"{day:02d}" for day in range(1, 32)]
@@ -102,26 +102,14 @@ def retrieve_year(client: cdsapi.Client, year: int, overwrite: bool = False) -> 
         print(f"Skipping existing file: {output_path}")
         return output_path
 
-    base_request = build_base_request(year)
-    new_style_request = {
-        **base_request,
+    request = {
+        **build_base_request(year),
         "data_format": "netcdf",
         "download_format": "unarchived",
     }
-    old_style_request = {
-        **base_request,
-        "format": "netcdf",
-    }
 
     print(f"Requesting {year} -> {output_path.name}")
-    try:
-        client.retrieve(DATASET, new_style_request, str(output_path))
-    except Exception as exc:
-        print(
-            "New-style CDS request keys failed; retrying with legacy `format` key. "
-            f"Original error: {exc}"
-        )
-        client.retrieve(DATASET, old_style_request, str(output_path))
+    client.retrieve(DATASET, request, str(output_path))
 
     return output_path
 

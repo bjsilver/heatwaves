@@ -51,36 +51,13 @@ def calculate_binned_stats(dep_var_name, ind_var_name, sname=None,
         reduce_dims.append('version')
 
     bins = np.arange(10, 110, 10)
-    if ind.sizes.get('time', -1) == dep.sizes.get('year', -2):
-        dep_time = dep.rename({'year': 'time'}).assign_coords(time=ind.time if 'time' in ind.dims else ind.time)
-        binned = dep_time.groupby_bins(ind, bins=bins)
-        stats_summed = xr.Dataset({
-            'sum': binned.sum(reduce_dims),
-            'count': binned.count(reduce_dims),
-            'sumsq': (dep_time**2).groupby_bins(ind, bins=bins).sum(reduce_dims),
-        })
-    else:
-        stats_dss = []
-        for year in dep.year.values:
-            if 'time' in ind.dims:
-                ind_year = ind.sel(time=ind.time.dt.year == year)
-            else:
-                ind_year = ind
-            dep_year = dep.sel(year=year)
+    binned = dep.groupby_bins(ind, bins=bins)
+    stats_summed = xr.Dataset({
+        'sum': binned.sum(reduce_dims),
+        'count': binned.count(reduce_dims),
+        'sumsq': (dep**2).groupby_bins(ind, bins=bins).sum(reduce_dims),
+    })
 
-            ind_bins = ind_year.mean('time') if 'time' in ind_year.dims else ind_year
-            binned = dep_year.groupby_bins(ind_bins, bins=bins)
-
-            stats = xr.Dataset({
-                'sum': binned.sum(reduce_dims),
-                'count': binned.count(reduce_dims),
-                'sumsq': (dep_year**2).groupby_bins(ind_bins, bins=bins).sum(reduce_dims)
-            })
-            stats = stats.expand_dims(year=[year])
-            stats_dss.append(stats)
-
-        stats_ds = xr.concat(stats_dss, dim='year', join='outer', coords='minimal')
-        stats_summed = stats_ds.sum('year')
 
     stats_summed['mean'] = stats_summed['sum'] / stats_summed['count']
     stats_summed['std'] = np.sqrt(stats_summed['sumsq'] / stats_summed['count'] - stats_summed['mean']**2)
@@ -95,10 +72,10 @@ def calculate_binned_stats(dep_var_name, ind_var_name, sname=None,
     else:
         return stats_computed
     
-def calc_stats_all_coarsens(dep_var_name, ind_var_name, time_res='annual_mean', coarsen_factors=COARSEN_FACTORS):
+def calc_stats_all_coarsens(dep_var_name, ind_var_name, aggregation='annual_mean', coarsen_factors=COARSEN_FACTORS):
     """Calculate binned statistics for all specified coarsen factors."""
     for coarsen_factor in coarsen_factors:
-        sname = f'{dep_var_name}_vs_{ind_var_name}_{time_res}'
+        sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
         if coarsen_factor:
             sname += f'_coarsened{coarsen_factor}'
         print(f"Calculating binned statistics for {sname}...")
@@ -108,11 +85,10 @@ def calc_stats_all_coarsens(dep_var_name, ind_var_name, time_res='annual_mean', 
 
 # dep_var_name = 'tmax'
 # ind_var_name = 'cc_loss'
-# time_res = 'annual_mean'
-# coarsen_factor = None
+# aggregation = 'annual_95pct'
+# coarsen_factor = 25
+# sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
 
-
-# sname = f'{dep_var_name}_vs_{ind_var_name}_{time_res}'
 # if coarsen_factor:
 #     sname += f'_coarsened{coarsen_factor}'
 
@@ -130,6 +106,7 @@ def calc_stats_all_coarsens(dep_var_name, ind_var_name, time_res='annual_mean', 
 if __name__ == "__main__":
     with local_cluster(n_workers=24, threads_per_worker=1, memory_limit='6GB',
                        suppress_dask_warnings=False, use_dask_dashboard=True) as client:
-        calc_stats_all_coarsens(dep_var_name='tmax', ind_var_name='cc_loss', time_res='annual_mean', coarsen_factors=COARSEN_FACTORS)
-        calc_stats_all_coarsens(dep_var_name='heatwaves', ind_var_name='cc_loss', time_res='annual_sum', coarsen_factors=COARSEN_FACTORS)
-        calc_stats_all_coarsens(dep_var_name='heatwaves_smoothed', ind_var_name='cc_loss', time_res='annual_sum', coarsen_factors=COARSEN_FACTORS)
+        # calc_stats_all_coarsens(dep_var_name='tmax', ind_var_name='cc_loss', aggregation='annual_mean', coarsen_factors=COARSEN_FACTORS)
+        calc_stats_all_coarsens(dep_var_name='tmax', ind_var_name='cc_loss', aggregation='annual_95pct', coarsen_factors=COARSEN_FACTORS)
+        # calc_stats_all_coarsens(dep_var_name='heatwaves', ind_var_name='cc_loss', aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
+        # calc_stats_all_coarsens(dep_var_name='heatwaves_smoothed', ind_var_name='cc_loss', aggregation='annual_sum', coarsen_factors=COARSEN_FACTORS)
