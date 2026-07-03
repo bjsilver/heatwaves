@@ -6,13 +6,10 @@ import contextily as ctx
 import cartopy.crs as ccrs
 import numpy as np
 from scipy.ndimage import gaussian_filter
-import numpy as np
 from dask.diagnostics import ProgressBar
+from ufuncs import local_cluster
 
 
-# area to test: [2600:2700, 2800:2900]
-PCTL_ZARR = STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr'
-pctls = xr.open_zarr(PCTL_ZARR, consolidated=True)['Ta_TMAX_p95'] / 10.0
 
 def _add_gridlines(ax, tick_interval, alpha=0.5):
     minlon, maxlon, minlat, maxlat = ax.get_extent(crs=ccrs.PlateCarree())
@@ -83,15 +80,20 @@ def plot_satellite_comparison(data, extent, tick_interval=2,
     if save_fig and sfigname is not None:
         fig.savefig(FIGDIR+'percentiles/'+sfigname+'.png', dpi=300, bbox_inches='tight')
 
-#%% plots to show issue
-extent = [-4, -3, -54, -53]
-plot_satellite_comparison(pctls[250], extent, tick_interval=.25, save_fig=True,
-                          sfigname='percentile_satellite_unsmoothed',
-                          vmin=35.6, vmax=36.8)
 
+def _gaussian_nan_safe(block, sigma):
+    block = np.asarray(block, dtype=np.float64)
+    valid = np.isfinite(block)
 
+    filled = np.where(valid, block, 0.0)
+    weights = valid.astype(np.float64)
 
-#%% do gaussian smoothing with ndimage.gaussian_filter
+    smoothed = gaussian_filter(filled, sigma=sigma, mode="nearest")
+    weight_sum = gaussian_filter(weights, sigma=sigma, mode="nearest")
+
+    out = np.full_like(smoothed, np.nan, dtype=np.float64)
+    np.divide(smoothed, weight_sum, out=out, where=weight_sum > 0)
+    return out
 
 
 def smooth_latlon_chunked(da, sigma=1.0):
@@ -110,35 +112,67 @@ def smooth_latlon_chunked(da, sigma=1.0):
     depth_all[lat_ax] = halo
     depth_all[lon_ax] = halo
 
+    sigma_all = tuple(sigma_all)
+
     out = da.data.map_overlap(
-        gaussian_filter,
+        _gaussian_nan_safe,
         depth=tuple(depth_all),
         boundary="nearest",
         trim=True,
-        dtype=da.dtype,
-        sigma=tuple(sigma_all),
-        mode="nearest",
+        dtype=np.float64,
+        sigma=sigma_all,
     )
 
     return xr.DataArray(
-        out, coords=da.coords, dims=da.dims, attrs=da.attrs, name=da.name
+        out.astype(da.dtype, copy=False),
+        coords=da.coords,
+        dims=da.dims,
+        attrs=da.attrs,
+        name=da.name,
     )
 
-pctls_smooth = smooth_latlon_chunked(pctls, sigma=40.0)
-pctls_smooth = pctls_smooth.interp(lat=pctls.lat, lon=pctls.lon, method='nearest')
+def plot_smoothing_examples(pctls, pctls_smooth, extent, tick_interval=.25):
+    plot_satellite_comparison(
+        pctls,
+        extent,
+        tick_interval=tick_interval,
+        save_fig=True,
+        sfigname='percentile_satellite_unsmoothed',
+        vmin=35.6,
+        vmax=36.8,
+    )
+    plot_satellite_comparison(
+        pctls_smooth,
+        extent,
+        tick_interval=tick_interval,
+        save_fig=True,
+        sfigname='percentile_satellite_smoothed',
+        vmin=35.6,
+        vmax=36.8,
+    )
 
-OUT_ZARR_SMOOTH = STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr'
+def main(plot_examples=True):
+ 
+    with local_cluster(n_workers=10, threads_per_worker=4, memory_limit='50GB',
+                       suppress_dask_warnings=False, use_dask_dashboard=True) as client:
+        # area to test: [2600:2700, 2800:2900]
+        pctls = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr', consolidated=True)['Ta_TMAX_p95']
+
+        pctls_smooth = smooth_latlon_chunked(pctls, sigma=30.0)
+        # pctls_smooth = pctls_smooth.interp(lat=pctls.lat, lon=pctls.lon, method='nearest')
+
+        out_zarr_smooth = STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr'
+        print(f"Computing and saving smoothed percentiles to {out_zarr_smooth}...")
+        ds_out = pctls_smooth.to_dataset(name='Ta_TMAX_p95_smooth')
+        ds_out.to_zarr(out_zarr_smooth, mode='w', consolidated=True)
+
+    if plot_examples:
+        extent = [-4, -3, -54, -53]
+        plot_smoothing_examples(pctls, pctls_smooth, extent, tick_interval=.25)
+
 #%%
-with ProgressBar():
-    pctls_smooth = pctls_smooth.compute(num_workers=128, memory_limit='4GB')
-    ds_out = pctls_smooth.to_dataset(name='Ta_TMAX_p95_smooth')
-    ds_out.to_zarr(OUT_ZARR_SMOOTH, mode='w', consolidated=True)
+if __name__ == '__main__':
+    main(plot_examples=False)
 
 #%%
-pctls_smooth = xr.open_zarr(OUT_ZARR_SMOOTH, consolidated=True)['Ta_TMAX_p95_smooth']
-extent = [-4, -3, -54, -53]
-plot_satellite_comparison(pctls_smooth[250], extent, tick_interval=.25, save_fig=True,
-                          sfigname='percentile_satellite_smoothed',
-                          vmin=35.6, vmax=36.8)
-
-#%% save smoothed percentiles to zarr
+pctl_smoothed = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr', consolidated=True)['Ta_TMAX_p95_smooth']

@@ -1,11 +1,11 @@
 #%%
 import os
 import pickle
+import re
 
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from pathlib import Path
 from constants import FIGDIR, STORAGE_DIR
 from glob import glob
 
@@ -13,6 +13,44 @@ MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
+
+
+def build_stats_sname(dep_var_name, ind_var_name, aggregation,
+                      ind_var_names=None, driver_ind_var_name=None,
+                      coarsen_factor=None):
+    if ind_var_names is None:
+        ind_var_names = [ind_var_name]
+    ind_tag = '+'.join(ind_var_names)
+    if driver_ind_var_name is None:
+        driver_ind_var_name = ind_var_name
+
+    sname = f'{dep_var_name}_vs_{ind_tag}_driver_{driver_ind_var_name}_{aggregation}'
+    if coarsen_factor:
+        sname += f'_coarsened{coarsen_factor}'
+    return sname
+
+
+def extract_coarsen_factor(path):
+    match = re.search(r'_coarsened(\d+)_binned_stats\.P$', os.path.basename(path))
+    return int(match.group(1)) if match else None
+
+
+def resolve_stats_pickles(dep_var_name, ind_var_name, aggregation,
+                          ind_var_names=None, driver_ind_var_name=None,
+                          coarsen_factor=None):
+    sname = build_stats_sname(
+        dep_var_name=dep_var_name,
+        ind_var_name=ind_var_name,
+        aggregation=aggregation,
+        ind_var_names=ind_var_names,
+        driver_ind_var_name=driver_ind_var_name,
+        coarsen_factor=coarsen_factor,
+    )
+    pattern = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
+    matches = sorted(glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f'No stats pickle found for pattern {pattern}')
+    return sname, matches
 
 
 
@@ -58,13 +96,19 @@ def pickle_to_df(pickle_path):
         return df, meandf
 
 def plot_binned_results(ind_var_name, dep_var_name, aggregation, coarsen_factor=None,
+                        ind_var_names=None, driver_ind_var_name=None,
                         ylabel='neighbour mean temperature change (°C)',
                         xlabel='canopy cover loss bin (%)'):
 
-    sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
-    if coarsen_factor:
-        sname += f'_coarsened{coarsen_factor}'
-    pickle_path = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_stats.P')
+    sname, pickle_paths = resolve_stats_pickles(
+        dep_var_name=dep_var_name,
+        ind_var_name=ind_var_name,
+        aggregation=aggregation,
+        ind_var_names=ind_var_names,
+        driver_ind_var_name=driver_ind_var_name,
+        coarsen_factor=coarsen_factor,
+    )
+    pickle_path = pickle_paths[0]
     df, meandf = pickle_to_df(pickle_path)
     df = meandf
 
@@ -105,23 +149,33 @@ def plot_binned_results(ind_var_name, dep_var_name, aggregation, coarsen_factor=
 
 
 def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
+                        ind_var_names=None, driver_ind_var_name=None,
                         ylabel=None,
                         xlabel='canopy cover loss bin (%)'):
-    
-    sname = f'{dep_var_name}_vs_{ind_var_name}_{aggregation}'
 
-    pickle_paths = sorted(glob(MWA_DAILY_DIR + f'{sname}*_stats.P'))
-    if not pickle_paths:
-        raise FileNotFoundError(f"No pickle files found for pattern: {MWA_DAILY_DIR}{sname}*_stats.P")
+    sname, pickle_paths = resolve_stats_pickles(
+        dep_var_name=dep_var_name,
+        ind_var_name=ind_var_name,
+        aggregation=aggregation,
+        ind_var_names=ind_var_names,
+        driver_ind_var_name=driver_ind_var_name,
+        coarsen_factor=None,
+    )
+
+    # If only the uncoarsened file was matched exactly, try to include sibling coarsened files.
+    if len(pickle_paths) == 1:
+        stem = sname
+        if '_coarsened' in stem:
+            stem = stem.split('_coarsened')[0]
+        expanded = sorted(glob(os.path.join(MWA_DAILY_DIR, f'{stem}*_binned_stats.P')))
+        if expanded:
+            pickle_paths = expanded
 
     dfs = {}
     for pickle_path in pickle_paths:
         df, meandf = pickle_to_df(pickle_path)
         df = meandf
-        # Extract coarsen factor from filename
-        coarsen_factor = None
-        if 'coarsened' in pickle_path:
-            coarsen_factor = int(pickle_path.split('coarsened')[-1].split('_')[0])
+        coarsen_factor = extract_coarsen_factor(pickle_path)
         dfs[coarsen_factor] = df
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
@@ -186,6 +240,7 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
 
 def plot_mwa_results(ind_var_name, dep_var_name, aggregation,
                      xlabel, ylabel,
+                     ind_var_names=None, driver_ind_var_name=None,
                      coarsen_factors=COARSEN_FACTORS):
     
 
@@ -196,32 +251,44 @@ def plot_mwa_results(ind_var_name, dep_var_name, aggregation,
     #                                  xlabel=xlabel)
     plot_mwa_results_all(ind_var_name=ind_var_name, dep_var_name=dep_var_name,
                          aggregation=aggregation,
-                            xlabel=xlabel,
-                            ylabel=ylabel)
-    
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_95pct',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual 95th percentile tmax (°C)')
+                                 ind_var_names=ind_var_names,
+                                 driver_ind_var_name=driver_ind_var_name,
+                                 xlabel=xlabel,
+                                 ylabel=ylabel)
 
-#%%
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_mean',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual mean tmax (°C)')
 
-#%%
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves', aggregation='annual_sum',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual heatwave count')
+if __name__ == '__main__':
+    common_args = {
+        'ind_var_name': 'cc_loss',
+        'ind_var_names': ['cc_loss'],
+        'driver_ind_var_name': 'cc_loss',
+        'xlabel': 'canopy cover loss bin (%)',
+    }
 
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='heatwaves_smoothed', aggregation='annual_sum',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual heatwave count')
+    # plot_mwa_results(
+    #     dep_var_name='tmax',
+    #     aggregation='annual_95pct',
+    #     ylabel='mean difference in annual 95th percentile tmax (°C)',
+    #     **common_args,
+    # )
 
-#%%
+    plot_mwa_results(
+        dep_var_name='tmax',
+        aggregation='annual_mean',
+        ylabel='mean difference in annual mean tmax (°C)',
+        **common_args,
+    )
 
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_mean',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual mean tmax (°C)')
-plot_mwa_results(ind_var_name='cc_loss', dep_var_name='tmax', aggregation='annual_95pct',
-                 xlabel='canopy cover loss bin (%)',
-                 ylabel='mean difference in annual 95th percentile tmax (°C)')
+    # plot_mwa_results(
+    #     dep_var_name='heatwaves',
+    #     aggregation='annual_sum',
+    #     ylabel='mean difference in annual heatwave count',
+    #     **common_args,
+    # )
+
+    # plot_mwa_results(
+    #     dep_var_name='heatwaves_smoothed',
+    #     aggregation='annual_sum',
+    #     ylabel='mean difference in annual heatwave count',
+    #     **common_args,
+    # )

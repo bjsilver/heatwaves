@@ -49,6 +49,9 @@ def rechunk_and_save(input_path, output_path, var_name, dtype, dims, units, cons
     
     print(f"Loading {var_name} from {input_path}")
     ds = xr.open_zarr(input_path, consolidated=consolidated)
+    # temp fix
+    if '__xarray_dataarray_variable__' in ds:
+        ds = ds.rename({'__xarray_dataarray_variable__': var_name})
     da = ds[var_name]
     da.encoding = {}
 

@@ -3,7 +3,13 @@ import os
 from distributed import Client, LocalCluster
 import xarray as xr
 import dask.array as da
-from constants import STORAGE_DIR, HEATDAY_TEMP_THRESH, HEATWAVE_DAY_THRESH
+from constants import (
+    STORAGE_DIR,
+    HEATDAY_TEMP_THRESH,
+    HEATWAVE_DAY_THRESH,
+    LAT_CHUNK_SIZE,
+    LON_CHUNK_SIZE,
+)
 from ufuncs import ensure_match_coords
 from dask.diagnostics import ProgressBar
 import numpy as np
@@ -24,11 +30,8 @@ def load_data():
 
     zz_pct = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
                         consolidated=True)['Ta_TMAX_p95'] / 10
-    zz_pct = zz_pct[:, :-1, :-1]  # remove last row and column to match zz dimensions
     zz_pct_smooth = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr',
-                        consolidated=True)['Ta_TMAX_p95_smooth']
-    zz_pct_smooth = zz_pct_smooth[:, :-1, :-1]  # remove last row and column to match zz dimensions
-    zz_pct_smooth = zz_pct_smooth.rename({'doy':'time'})
+                        consolidated=True)['Ta_TMAX_p95_smooth'] / 10
 
     # era_pct_1970_1999 = xr.open_zarr(STORAGE_DIR + 'rechunked/era5_skt_p95_1970-1999_rechunked.zarr',
     #                     consolidated=True)['Ta_TMAX']
@@ -40,7 +43,6 @@ def load_data():
     
     
     pct = xr.Dataset({'zz_2003-2020': zz_pct, 'zz_2003-2020_smooth': zz_pct_smooth})
-    pct.coords['time'] = list(range(1, 366))
     zz, pct = ensure_match_coords(zz, pct)
     return zz, pct
 
@@ -52,23 +54,56 @@ def remove_previous_zarr(path):
         print(f"Deleting existing store at {path}")
         shutil.rmtree(path)
 
-def calculate_heatdays(zz, pctda, write_path):
+
+def safe_zarr_chunks(da_in, year_chunk=1, lat_chunk=LAT_CHUNK_SIZE, lon_chunk=LON_CHUNK_SIZE):
+    """Apply stable chunking; keep spatial chunks fixed for output efficiency."""
+    chunk_spec = {}
+    if 'year' in da_in.dims:
+        chunk_spec['year'] = min(year_chunk, da_in.sizes['year'])
+    if 'lat' in da_in.dims:
+        chunk_spec['lat'] = min(lat_chunk, da_in.sizes['lat'])
+    if 'lon' in da_in.dims:
+        chunk_spec['lon'] = min(lon_chunk, da_in.sizes['lon'])
+    return da_in.chunk(chunk_spec)
+
+def calculate_annual_heatwave_sum(zz, pctda, write_path):
+
+    if 'doy' not in pctda.dims:
+        if 'time' in pctda.dims:
+            pctda = pctda.rename({'time': 'doy'})
+        else:
+            raise ValueError(f"Expected percentile dims to include 'doy', got {pctda.dims}")
+
+    pctda = pctda.chunk({'doy': -1, 'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
 
     years = np.unique(zz.time.dt.year)
 
     for i, year in enumerate(years):
         zz_year = zz.sel(time=str(year))
-        zz_time_coords = zz_year.coords['time']
-        zz_year_doy = zz_year.assign_coords(time=np.arange(1, zz_year.sizes['time'] + 1))
 
-        heatdays_year = ((zz_year_doy > HEATDAY_TEMP_THRESH) & (zz_year_doy > pctda))
-        heatdays_year = heatdays_year.assign_coords(time=zz_time_coords)
+        # noleap calendar: day-of-year must already be in 1..365.
+        doy_index = zz_year.time.dt.dayofyear
+        doy_min = int(doy_index.min().compute())
+        doy_max = int(doy_index.max().compute())
+        if doy_min < 1 or doy_max > 365:
+            raise ValueError(
+                f"Expected noleap day-of-year in 1..365, got range {doy_min}..{doy_max} for year {int(year)}"
+            )
+        pct_for_time = pctda.sel(doy=doy_index)
+
+        heatdays_year = ((zz_year > HEATDAY_TEMP_THRESH) & (zz_year > pct_for_time))
         heatdays_year.name = 'heatdays'
 
+        heatwaves_year = remove_short_runs(heatdays_year)
+        annual_sum = heatwaves_year.sum('time').astype(np.uint16)
+        annual_sum = annual_sum.expand_dims(year=[int(year)])
+        annual_sum = safe_zarr_chunks(annual_sum)
+        annual_sum.name = 'heatwave_days'
+
         if i == 0:
-            heatdays_year.to_zarr(write_path, consolidated=True, mode='w')
+            annual_sum.to_zarr(write_path, consolidated=True, mode='w')
         else:
-            heatdays_year.to_zarr(write_path, consolidated=True, mode='a', append_dim='time')
+            annual_sum.to_zarr(write_path, consolidated=True, mode='a', append_dim='year')
 
 def remove_short_runs(heatdays, thresh=HEATWAVE_DAY_THRESH):
     # 1) True only at run-ends of length >= thresh
@@ -89,27 +124,20 @@ def remove_short_runs(heatdays, thresh=HEATWAVE_DAY_THRESH):
 #%%
 if __name__ == '__main__':
 
-    with LocalCluster(n_workers=32, memory_limit='20GB',
-                      threads_per_worker=1, dashboard_address=':8787') as cluster:
+    with LocalCluster(n_workers=32, memory_limit='8GB',
+                      threads_per_worker=4, dashboard_address=':8787') as cluster:
         with Client(cluster) as client:
             print(f"Dask Dashboard available at: {client.dashboard_link}")
 
             zz, pct = load_data()
-            # pct = pct.chunk({'lat':250, 'lon':250, 'doy':-1})
 
             for pctlkey in  ['zz_2003-2020', 'zz_2003-2020_smooth']:
-                print(f"Calculating heatdays and heatwaves for {pctlkey}...")
+                print(f"Calculating annual heatwave-day sums for {pctlkey}...")
                 pctda = pct[pctlkey]
-                write_path = STORAGE_DIR + f'heatdays/heatdays_{pctlkey}.zarr'
+                write_path = STORAGE_DIR + f'heatdays/heatwaves_annual_sum_{pctlkey}.zarr'
                 remove_previous_zarr(write_path)
-                print(f"Writing heatdays to {write_path} as yearly appends...")
-                calculate_heatdays(zz, pctda, write_path)
-                heatdays = xr.open_zarr(write_path, consolidated=True)['heatdays']
-                heatwaves = remove_short_runs(heatdays)
-                write_path = STORAGE_DIR + f'heatdays/heatwaves_{pctlkey}.zarr'
-                remove_previous_zarr(write_path)
-                print(f"Writing heatwaves to {write_path}...")
-                heatwaves.to_zarr(write_path, consolidated=True, mode='w')
+                print(f"Writing annual sums to {write_path} as yearly appends...")
+                calculate_annual_heatwave_sum(zz, pctda, write_path)
            
 #%%
 

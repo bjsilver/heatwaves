@@ -183,12 +183,12 @@ if __name__ == "__main__":
 
 #%%
 
-with ProgressBar():
-    tmax = load_tmax_da()
-    tmax.isnull().sum(['lat', 'lon']).compute(num_workers=32).plot()
+# with ProgressBar():
+#     tmax = load_tmax_da()
+#     tmax.isnull().sum(['lat', 'lon']).compute(num_workers=32).plot()
 
-#%%
+# #%%
 
-with ProgressBar():
-    all_nan = tmax.isnull().all('time').sum().compute(num_workers=32)
-    any_nan = tmax.isnull().any('time').sum().compute(num_workers=32)
+# with ProgressBar():
+#     all_nan = tmax.isnull().all('time').sum().compute(num_workers=32)
+#     any_nan = tmax.isnull().any('time').sum().compute(num_workers=32)

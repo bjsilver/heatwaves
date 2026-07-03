@@ -84,6 +84,8 @@ def get_regridder_and_data(year):
 
 
     regridded_ds = regridder(source_ds['Ta_TMAX'])
+    regridded_ds.name = 'Ta_TMAX'
+    regridded_ds.attrs['units'] = '0.1degC'
     return regridded_ds, regridder
 
 def load_or_create_progress(years):

@@ -43,10 +43,10 @@ def load_ind_dep_data(ind_var_names, dep_var_name):
         dep_var = dep_var.astype(np.float32).where(dep_var != -9999.0) / 10.0  # convert to °C
         dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves':
-        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020.zarr'))['heatwaves']
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020.zarr'))['heatwave_days']
         dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves_smoothed':
-        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_zz_2003-2020_smooth.zarr'))['heatwaves']
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020_smooth.zarr'))['heatwave_days']
         dep_var.name = dep_var_name
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
@@ -290,19 +290,22 @@ def calc_moving_window(ind_vars, dep_var, client=None, dep_var_agg='annual_mean'
 
 
 def aggregate_dependent_variable(dep_var, aggregation):
-    if aggregation == "annual_mean":
-        annual = dep_var.groupby('time.year').mean()
-    elif aggregation == "annual_sum":
-        annual = dep_var.groupby("time.year").sum()
-    elif aggregation == "annual_95pct":
-        annual = dep_var.groupby("time.year").quantile(0.95)
+    if 'annual' in aggregation and 'year' in dep_var.dims:
+        return dep_var
+    match aggregation:
+        case "annual_mean":
+            annual = dep_var.groupby('time.year').mean()
+        case "annual_sum":
+            annual = dep_var.groupby('time.year').sum()
+        case "annual_95pct":
+            annual = dep_var.groupby('time.year').quantile(0.95)
+        case s if s in ["DJF_mean", "MAM_mean", "JJA_mean", "SON_mean"]:
+            season = s.split("_")[0]
+            months = SEASON_MAP[season]
+            annual = dep_var.where(dep_var['time.month'].isin(months)).groupby('time.year').mean()
+        case _:
+            raise ValueError(f"Unsupported aggregation: {aggregation}")
 
-    elif aggregation in ["DJF_mean", "MAM_mean", "JJA_mean", "SON_mean"]:
-        season = aggregation.split("_")[0]
-        months = SEASON_MAP[season]
-        annual = dep_var.where(dep_var['time.month'].isin(months)).groupby('time.year').mean()
-    else:
-        raise ValueError(f"Unsupported aggregation: {aggregation}")
     return annual
 
 
@@ -371,12 +374,11 @@ if __name__ == "__main__":
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
         # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
         #                      dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='tmax', dep_var_agg='annual_95pct', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
-
+        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+                             dep_var_name='tmax', dep_var_agg='annual_95pct', client=client)
+        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+                             dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
+        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+                             dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
         run_mwa_coarsen_loop(ind_var_names=['cc_loss', 'forest_loss_age'], driver_ind_var_name='cc_loss',
                      dep_var_name='tmax', dep_var_agg='JJA_mean', client=client)
