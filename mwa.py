@@ -388,10 +388,10 @@ if __name__ == "__main__":
         #                      dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
         # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
         #                      dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
+        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+                             dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
         # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
         #                      dep_var_name='heatwaves_era5-p95', dep_var_agg='annual_sum', client=client)
-        for season in ['DJF', 'MAM', 'JJA', 'SON']:
-            run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-                        dep_var_name='tmax', dep_var_agg=f'{season}_mean', client=client)
+        # for season in ['DJF', 'MAM', 'JJA', 'SON']:
+        #     run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                 dep_var_name='tmax', dep_var_agg=f'{season}_mean', client=client)
