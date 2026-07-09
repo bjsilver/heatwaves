@@ -25,18 +25,22 @@ CPU_COUNT = 32
 zz, pctl = load_zz_era_pct()
 
 pretty_percentile = {
-    "zz_2003-2020": "Zhang and Zhou 2003-2020",
-    "zz_2003-2020_smooth": "Zhang and Zhou 2003-2020 (percentile smoothed)"}
+    "zz_2003-2020": "Zhang and Zhou",
+    "zz_2003-2020_smooth": "Zhang and Zhou (gaussian smoothed)",
+    "zz_2003-2020_gapfilled": "Zhang and Zhou (IDW gap-filled)",
+    "era5_2003-2020": "ERA5 (bilinear regridded)"}
 
 #%%
 with ProgressBar():
-    pctlmean = pctl.mean("time").compute(num_workers=CPU_COUNT, memory_limit="120GB")
+    pctlmean = pctl.mean("doy").compute(num_workers=CPU_COUNT, memory_limit="120GB")
 
 #%%
 
 cmap_lims = {
     "zz_2003-2020": (28, 40),
-    "zz_2003-2020_smooth": (28, 40)
+    "zz_2003-2020_smooth": (28, 40),
+    "zz_2003-2020_gapfilled": (28, 40),
+    "era5_2003-2020": (28, 40)
 }
 
 
@@ -45,7 +49,7 @@ for pctlkey in PERCENTILE_KEYS:
     fig, ax = plt.subplots()
     pctlmean[pctlkey].plot.imshow(ax=ax, cmap="magma", vmin=cmap_lims[pctlkey][0], vmax=cmap_lims[pctlkey][1],
                                 cbar_kwargs={'shrink': 0.8})
-    ax.set_title(f"Annual mean {pctlkey} daily max temperature 95th percentile")
+    ax.set_title(f"mean 95th percentile tmax 2003-2020\n{pretty_percentile[pctlkey]}")
     fig.savefig(FIGDIR + f"percentiles/{pctlkey}_mean.png", dpi=300, bbox_inches="tight")
 
 #%% amazon zoom 
@@ -114,7 +118,91 @@ plot_satellite_comparison(pctlmean['zz_2003-2020'], extent=(4, 6, -68, -66), tic
 plot_satellite_comparison(pctlmean['zz_2003-2020'], extent=(-16, -14, -61, -59), tick_interval=.4, save_fig=True)
 
 #%%
-plot_satellite_comparison(pctlmean, extent=(-11, -9, -56, -54), tick_interval=.4, save_fig=False)
+plot_satellite_comparison(pctlmean['zz_2003-2020'], extent=(-11, -9, -56, -54), tick_interval=.4, save_fig=False)
+
+#%% 4-way percentile comparison
+extent = (-11, -7, -65, -61)
+minlat, maxlat, minlon, maxlon = extent
+vmin = 34
+vmax = 37
+
+fig, axes = plt.subplots(2,2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+for i, pctlkey in enumerate(['zz_2003-2020', 'zz_2003-2020_smooth', 'zz_2003-2020_gapfilled']):
+    ax = axes.flatten()[i]
+    da = pctlmean[pctlkey].sel(lat=slice(minlat, maxlat), lon=slice(minlon, maxlon))
+    da.plot.imshow(ax=ax, cmap="magma", vmin=vmin, vmax=vmax,
+                                add_colorbar=False)
+    ax.set_title(f"{pretty_percentile[pctlkey]}")
+    _add_gridlines(ax, tick_interval=1, alpha=0.2)
+
+    #colorbar
+    left_pos = ax.get_position()
+    cbar_width = 0.01
+    cbar_pad = -.04
+    cax = fig.add_axes([left_pos.x1 + cbar_pad, left_pos.y0+left_pos.height/1.6, cbar_width, left_pos.height/3])
+    fig.colorbar(plt.cm.ScalarMappable(cmap="magma", norm=plt.Normalize(vmin=vmin, vmax=vmax)), cax=cax, orientation='vertical', label='',
+                 ticks=[vmin, vmax])
+    # reduce tick label size
+    cax.tick_params(labelsize=9, colors='white')
+    
+
+
+sat = axes.flatten()[3]
+sat.set_xlim(minlon, maxlon)
+sat.set_ylim(minlat, maxlat)
+sat.set_aspect('equal', adjustable='box')
+ctx.add_basemap(sat, crs="EPSG:4326", source=ctx.providers.Esri.WorldImagery,
+attribution='')
+_add_gridlines(sat, tick_interval=1, alpha=0.2)
+
+
+#%% plot diffs
+
+extent = (-14, -11, -63, -60)
+minlat, maxlat, minlon, maxlon = extent
+diffs = {
+    "zz_2003-2020_smooth - zz_2003-2020": pctlmean['zz_2003-2020_smooth'] - pctlmean['zz_2003-2020'],
+    "zz_2003-2020_gapfilled - zz_2003-2020": pctlmean['zz_2003-2020_gapfilled'] - pctlmean['zz_2003-2020'],
+}
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+for i, (diff_name, diff_da) in enumerate(diffs.items()):
+    ax = axes.flatten()[i]
+    diff_da.sel(lat=slice(minlat, maxlat), lon=slice(minlon, maxlon)).plot.imshow(ax=ax, cmap="RdBu_r", vmin=-1, vmax=1,
+                                add_colorbar=False)
+    ax.set_title(f"{diff_name}")
+    _add_gridlines(ax, tick_interval=1, alpha=0.2)
+
+    #colorbar
+    left_pos = ax.get_position()
+    cbar_width = 0.01
+    cbar_pad = -.04
+    cax = fig.add_axes([left_pos.x1 + cbar_pad, left_pos.y0+left_pos.height/1.6, cbar_width, left_pos.height/3])
+    fig.colorbar(plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(vmin=-1, vmax=1)), cax=cax, orientation='vertical', label='',
+                 ticks=[-1, 0, 1])
+    # reduce tick label size
+    cax.tick_params(labelsize=9, colors='black')
+
+# add satellite ax
+sat = axes.flatten()[2]
+sat.set_xlim(minlon, maxlon)
+sat.set_ylim(minlat, maxlat)
+sat.set_aspect('equal', adjustable='box')
+ctx.add_basemap(sat, crs="EPSG:4326", source=ctx.providers.Esri.WorldImagery,
+attribution='') 
+_add_gridlines(sat, tick_interval=1, alpha=0.2)
+
+pct = axes.flatten()[3]
+da = pctlmean['zz_2003-2020'].sel(lat=slice(minlat, maxlat), lon=slice(minlon, maxlon))
+da.plot.imshow(ax=pct, cmap="magma", vmin=34, vmax=37, add_colorbar=False)
+pct.set_title(f"Zhang and Zhou 2003-2020")
+_add_gridlines(pct, tick_interval=1, alpha=0.2)
+
+
+
+
+
+
 
 #%% plot heatwaves
 

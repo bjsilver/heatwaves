@@ -4,14 +4,13 @@ import os
 import numpy as np
 import xarray as xr
 import xesmf as xe
-import regionmask
 
 from constants import ERA5_PATH, STORAGE_DIR
 from calc_era5_percentiles import maybe_local_cluster, save_heatwaves
 
 WEIGHTS_FILE = ERA5_PATH + 'era5_regrid_weights_0.01deg_bilinear.nc'
 INPUT_PATH = STORAGE_DIR + 'percentiles/era5_percentile_2003-2020.zarr'
-OUTPUT_PATH = STORAGE_DIR + 'regridded/era5_skt_p95_2003-2020_regridded.zarr'
+OUTPUT_PATH = STORAGE_DIR + 'regridded/era5_t2m_p95_2003-2020_regridded.zarr'
 
 
 def get_regridder(source_da, target_ds):
@@ -61,8 +60,8 @@ def regrid_to_zz(source_da):
 
 def load_percentile_data(input_path=INPUT_PATH):
     ds = xr.open_zarr(input_path)
-    if 'skt_p95' in ds:
-        return ds['skt_p95']
+    if 't2m_p95' in ds:
+        return ds['t2m_p95']
     if 'heatwaves' in ds:
         return ds['heatwaves']
     return ds[list(ds.data_vars)[0]]

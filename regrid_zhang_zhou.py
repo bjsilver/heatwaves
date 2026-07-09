@@ -11,7 +11,7 @@ from dask.distributed import Client, LocalCluster
 from numcodecs import Blosc
 from dask.diagnostics import ProgressBar
 import dask
-
+from ufuncs import local_cluster
 from constants import STORAGE_DIR
 
 
@@ -63,15 +63,19 @@ def fix_time_coord(ds, year):
     ds.coords['time'] = tindex
     return ds
 
-def get_regridder_and_data(year):
-    # create target grid
+def get_target_grid():
     lats = np.arange(-30, 20, .01)
     lons = np.arange(-82, -34.5, .01)
     target_ds = xr.Dataset({
         "lat": (["lat"], lats),
         "lon": (["lon"], lons),
     })
+    return target_ds
 
+
+def get_regridder_and_data(year):
+    # create target grid
+    target_ds = get_target_grid()
     
     source_ds = xr.open_dataset(f"{SOURCE_DIR}SouthAmerica_Ta_SVCMsp_{year}TMAX_daily_tropics30N30S.nc",
                                 chunks={'DOY':1, 'lat':1024, 'lon':1024}).drop_vars('spatial_ref', errors='ignore')
@@ -103,46 +107,67 @@ def save_progress(progress):
 
 
 #%%
+# if __name__ == "__main__":
+
+#     if RESET_OUTPUT and os.path.exists(ZARR_DESTINATION):
+#         print(f"Removing existing output at {ZARR_DESTINATION}...")
+#         os.system(f"rm -rf {ZARR_DESTINATION}")
+
+#     if RESET_OUTPUT and os.path.exists(PROGRESS_JSON):
+#         print(f"Removing existing progress file at {PROGRESS_JSON}...")
+#         os.remove(PROGRESS_JSON)
+
+
+#     progress = load_or_create_progress(list(YEAR_RANGE))
+#     completed_years = set(progress['completed_years'])
+
+#     with local_cluster(n_workers=24, memory_limit='15GB',
+#                       threads_per_worker=16):
+#         for year in YEAR_RANGE:
+
+#             if year in completed_years:
+#                 print(f'{year}: already completed, skipping')
+#                 continue
+#             print(f'  [{year}] Starting regridding...')
+
+#             regridded_ds, regridder = get_regridder_and_data(year)
+
+            
+
+#             print('saving to zarr...')
+#             if not os.path.exists(ZARR_DESTINATION):
+#                 print("Creating new Zarr store...")
+#                 regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='w', consolidated=False)
+#             else:
+#                 print("Appending to existing Zarr store...")
+#                 regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='time', consolidated=False)
+
+#             completed_years.add(year)
+#             progress['completed_years'] = sorted(completed_years)
+#             save_progress(progress)
+
+#%% also regrid the mask
+def regrid_mask():
+    target_ds = get_target_grid()
+
+    mask = xr.open_zarr(STORAGE_DIR + 'regrid/zz_tmax_nanmask.zarr').all('year').astype('int8')
+    with ProgressBar():
+        mask = mask.compute(num_workers=32, memory_limit='12GB')
+
+
+    MASK_WEIGHTS_FILE = WEIGHTS_FILE.replace('.nc', '_mask.nc')
+    if not os.path.exists(MASK_WEIGHTS_FILE):
+        print("Computing mask weights...")
+        regridder = xe.Regridder(mask, target_ds, method='nearest_s2d', periodic=False, unmapped_to_nan=True)
+        regridder.to_netcdf(MASK_WEIGHTS_FILE)
+    else:
+        print("Reusing existing mask weights...")
+        regridder = xe.Regridder(mask, target_ds, method='nearest_s2d', periodic=False, filename=MASK_WEIGHTS_FILE, reuse_weights=True)
+
+    mask_regridded = regridder(mask)
+    mask_regridded.name = 'mask'
+    mask_regridded.to_zarr(STORAGE_DIR + 'regrid/zz_tmax_nanmask_regridded.zarr', mode='w', consolidated=True)
+
 if __name__ == "__main__":
-
-    if RESET_OUTPUT and os.path.exists(ZARR_DESTINATION):
-        print(f"Removing existing output at {ZARR_DESTINATION}...")
-        os.system(f"rm -rf {ZARR_DESTINATION}")
-
-    if RESET_OUTPUT and os.path.exists(PROGRESS_JSON):
-        print(f"Removing existing progress file at {PROGRESS_JSON}...")
-        os.remove(PROGRESS_JSON)
-
-
-    progress = load_or_create_progress(list(YEAR_RANGE))
-    completed_years = set(progress['completed_years'])
-
-    with LocalCluster(n_workers=24, memory_limit='15GB',
-                      threads_per_worker=16,
-                      dashboard_address=':8787') as cluster:
-        with Client(cluster) as client:
-            print(f"Dask Dashboard available at: {client.dashboard_link}")
-            for year in YEAR_RANGE:
-
-                if year in completed_years:
-                    print(f'{year}: already completed, skipping')
-                    continue
-                print(f'  [{year}] Starting regridding...')
-
-                regridded_ds, regridder = get_regridder_and_data(year)
-
-                
-
-                print('saving to zarr...')
-                if not os.path.exists(ZARR_DESTINATION):
-                    print("Creating new Zarr store...")
-                    regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='w', consolidated=False)
-                else:
-                    print("Appending to existing Zarr store...")
-                    regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='time', consolidated=False)
-
-                completed_years.add(year)
-                progress['completed_years'] = sorted(completed_years)
-                save_progress(progress)
-
-
+    with local_cluster(n_workers=24, memory_limit='15GB', threads_per_worker=16):
+        regrid_mask()

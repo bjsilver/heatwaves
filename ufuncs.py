@@ -17,7 +17,8 @@ def lon_to_180(ds):
     return ds
 
 
-def _add_gridlines(ax, tick_interval, alpha=0.5):
+def _add_gridlines(ax, tick_interval, alpha=0.5,
+                   color='white'):
     minlon, maxlon, minlat, maxlat = ax.get_extent(crs=ccrs.PlateCarree())
     eps = tick_interval * 1e-9
     xstart = np.ceil((minlon - eps) / tick_interval) * tick_interval
@@ -39,7 +40,7 @@ def _add_gridlines(ax, tick_interval, alpha=0.5):
         xlocs=xticks,
         ylocs=yticks,
         linewidth=0.6,
-        color='white',
+        color=color,
         alpha=alpha,
         linestyle='--',
     )
@@ -128,7 +129,7 @@ def open_hansen():
 
 @contextmanager
 def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
-                  suppress_dask_warnings=False, use_dask_dashboard=True):
+                  suppress_dask_warnings=False, use_dask_dashboard=True, dashboard_address=':7878'):
 
     if suppress_dask_warnings:
         warnings.filterwarnings(
@@ -140,7 +141,7 @@ def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
 
     if use_dask_dashboard:
         with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
-                        memory_limit=memory_limit, dashboard_address=':7878') as cluster:
+                        memory_limit=memory_limit, dashboard_address=dashboard_address) as cluster:
             with Client(cluster) as client:
                 print(f'LocalCluster started: {client.dashboard_link}')
                 yield client

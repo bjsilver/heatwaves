@@ -13,7 +13,7 @@ from constants import AMAZON_BBOX, ERA5_PATH
 from ufuncs import lon_to_180
 from dask.distributed import Client, LocalCluster
 
-ERA_YEAR_RANGE = range(1970, 2000)
+ERA_YEAR_RANGE = range(2003, 2020)
 
 
 PAD = 7
@@ -29,7 +29,7 @@ MEMORY_LIMIT = '80GB'
 ERA5_OPEN_CHUNKS = {'time': 365}
 ERA5_ANALYSIS_CHUNKS = {'time': 365, 'lat': 120, 'lon': 120}
 ERA5_YEAR_DOY_CHUNKS = {'year': 1, 'doy': 365, 'lat': 120, 'lon': 120}
-OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/era5_percentile_1970-1999.zarr'
+OUTPUT_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/era5_percentile_2003-2020.zarr'
 
 @njit
 def _quantile_skipna_1d(vals, q):
@@ -100,10 +100,10 @@ def maybe_local_cluster():
 
 def load_era5_skt_celsius():
     da = xr.open_mfdataset(
-        ERA5_PATH + 'era5_land_skinT_dailymax*.nc',
+        ERA5_PATH + 'era5_land_t2m_dailymax_*.nc',
         chunks=ERA5_OPEN_CHUNKS,
         parallel=False,
-    )['skt'].astype(np.float32)
+    )['t2m'].astype(np.float32)
     da = da.rename({'valid_time': 'time'})
     da = da.sel(time=slice(f'{ERA_YEAR_RANGE.start}-01-01', f'{ERA_YEAR_RANGE.stop - 1}-12-31'))
     da = lon_to_180(da)
@@ -112,7 +112,8 @@ def load_era5_skt_celsius():
     da = da.rename({'latitude': 'lat', 'longitude': 'lon'})
     da = da.chunk(ERA5_ANALYSIS_CHUNKS)
     da = (da - np.float32(273.15)).astype(np.float32)
-    da.name = 'skt_c'
+    da.name = 't2m'
+    da.attrs['units'] = 'degC'
     return da
 
 def reshape_to_year_doy(da):
@@ -135,7 +136,7 @@ def reshape_to_year_doy(da):
     da = da.transpose('year', 'doy', 'lat', 'lon')
     da = da.sortby('year')
     da = da.chunk(ERA5_YEAR_DOY_CHUNKS)
-    da.name = 'skt_c'
+    da.name = 't2m'
     return da
 
 def stack_time(heatdays):
@@ -183,7 +184,7 @@ def calculate_percentile95(era_year_doy):
             'lat': era_year_doy['lat'].values,
             'lon': era_year_doy['lon'].values,
         },
-        name='skt_p95',
+        name='t2m_p95',
     )
 
 def calculate_heatdays(era_year_doy, p95):

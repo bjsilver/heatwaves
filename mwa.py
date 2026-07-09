@@ -1,4 +1,6 @@
 #%%
+from pdb import run
+
 import xarray as xr
 import numpy as np
 import os
@@ -47,6 +49,12 @@ def load_ind_dep_data(ind_var_names, dep_var_name):
         dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves_smoothed':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020_smooth.zarr'))['heatwave_days']
+        dep_var.name = dep_var_name
+    elif dep_var_name == 'heatwaves_gapfilled':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020_gapfilled.zarr'))['heatwave_days']
+        dep_var.name = dep_var_name
+    elif dep_var_name == 'heatwaves_era5-p95':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_era5_2003-2020.zarr'))['heatwave_days']
         dep_var.name = dep_var_name
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
@@ -374,11 +382,16 @@ if __name__ == "__main__":
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
         # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
         #                      dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
-        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-                             dep_var_name='tmax', dep_var_agg='annual_95pct', client=client)
-        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-                             dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
-        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-                             dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
-        run_mwa_coarsen_loop(ind_var_names=['cc_loss', 'forest_loss_age'], driver_ind_var_name='cc_loss',
-                     dep_var_name='tmax', dep_var_agg='JJA_mean', client=client)
+        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                      dep_var_name='tmax', dep_var_agg='annual_95pct', client=client)
+        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                      dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
+        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                      dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
+        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                      dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
+        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        #                      dep_var_name='heatwaves_era5-p95', dep_var_agg='annual_sum', client=client)
+        for season in ['DJF', 'MAM', 'JJA', 'SON']:
+            run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+                        dep_var_name='tmax', dep_var_agg=f'{season}_mean', client=client)

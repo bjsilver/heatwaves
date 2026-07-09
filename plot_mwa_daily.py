@@ -12,7 +12,7 @@ from glob import glob
 MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
-COARSEN_FACTORS = [None, 2, 5, 10, 25]
+COARSEN_FACTORS = [None]#[None, 2, 5, 10, 25]
 
 
 def build_stats_sname(dep_var_name, ind_var_name, aggregation,
@@ -68,9 +68,12 @@ def pickle_to_df(pickle_path):
         # read pickle
         with open(pickle_path, 'rb') as f:
             ds = pickle.load(f)
-            ds = ds.rename({'cc_loss_cdiff_bins':'bins'})
+
+        # get bin coord name
+        bin_coord_name = [name for name in ds.dims if 'bins' in name][0]
 
         df = ds.to_dataframe()
+
 
         df['se'] = df['std'] / np.sqrt(df['count'])
         df['ci_lower'] = df['mean'] - 1.96 * df['se']
@@ -80,11 +83,11 @@ def pickle_to_df(pickle_path):
         df['yerr_lower'] = df['mean'] - df['ci_lower']
         df['yerr_upper'] = df['ci_upper'] - df['mean']
 
-        meandf = pd.DataFrame(index=df.index.get_level_values('bins').unique().sort_values())
-        meandf['sum'] = df.groupby('bins')['sum'].sum() 
-        meandf['count'] = df.groupby('bins')['count'].sum()
+        meandf = pd.DataFrame(index=df.index.get_level_values(bin_coord_name).unique().sort_values())
+        meandf['sum'] = df.groupby(bin_coord_name)['sum'].sum()
+        meandf['count'] = df.groupby(bin_coord_name)['count'].sum()
         meandf['mean'] = meandf['sum'] / meandf['count']
-        meandf['sumsq'] = df.groupby('bins')['sumsq'].sum()
+        meandf['sumsq'] = df.groupby(bin_coord_name)['sumsq'].sum()
         meandf['std'] = np.sqrt(meandf['sumsq'] / meandf['count'] - meandf['mean']**2)
         meandf['se'] = meandf['std'] / np.sqrt(meandf['count'])
         meandf['ci_lower'] = meandf['mean'] - 1.96 * meandf['se']
@@ -147,19 +150,16 @@ def plot_binned_results(ind_var_name, dep_var_name, aggregation, coarsen_factor=
         ax.set_title(f"coarsen_factor: {coarsen_factor}")
     return fig, ax
 
-
-def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
+def load_binned_results(dep_var_name, ind_var_name, aggregation,
                         ind_var_names=None, driver_ind_var_name=None,
-                        ylabel=None,
-                        xlabel='canopy cover loss bin (%)'):
-
+                        coarsen_factor=None):
     sname, pickle_paths = resolve_stats_pickles(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
         ind_var_names=ind_var_names,
         driver_ind_var_name=driver_ind_var_name,
-        coarsen_factor=None,
+        coarsen_factor=coarsen_factor,
     )
 
     # If only the uncoarsened file was matched exactly, try to include sibling coarsened files.
@@ -177,6 +177,17 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
         df = meandf
         coarsen_factor = extract_coarsen_factor(pickle_path)
         dfs[coarsen_factor] = df
+    return sname, dfs
+
+
+def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
+                        ind_var_names=None, driver_ind_var_name=None,
+                        ylabel=None,
+                        xlabel='canopy cover loss bin (%)'):
+
+    sname, dfs = load_binned_results(dep_var_name, ind_var_name, aggregation,
+                                    ind_var_names=ind_var_names,
+                                    driver_ind_var_name=driver_ind_var_name)
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
     n_cfs = len(cfs)
@@ -226,7 +237,7 @@ def plot_mwa_results_all(ind_var_name, dep_var_name, aggregation,
     ax.set_xticklabels(xticklabels, rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.legend(title='downsampled\nresolution', bbox_to_anchor=(1.01, 1), loc='upper left')
-    ax.set_title(f'{dep_var_name} vs {ind_var_name} by downsampled resolution')
+    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name} ', fontsize=14)
     fig.tight_layout()
 
     png_path = f'{sname}_all_coarsen_factors.png'
@@ -256,7 +267,7 @@ def plot_mwa_results(ind_var_name, dep_var_name, aggregation,
                                  xlabel=xlabel,
                                  ylabel=ylabel)
 
-
+#%%
 if __name__ == '__main__':
     common_args = {
         'ind_var_name': 'cc_loss',
@@ -265,12 +276,12 @@ if __name__ == '__main__':
         'xlabel': 'canopy cover loss bin (%)',
     }
 
-    # plot_mwa_results(
-    #     dep_var_name='tmax',
-    #     aggregation='annual_95pct',
-    #     ylabel='mean difference in annual 95th percentile tmax (°C)',
-    #     **common_args,
-    # )
+    plot_mwa_results(
+        dep_var_name='tmax',
+        aggregation='annual_95pct',
+        ylabel='mean difference in annual 95th percentile tmax (°C)',
+        **common_args,
+    )
 
     plot_mwa_results(
         dep_var_name='tmax',
@@ -279,16 +290,81 @@ if __name__ == '__main__':
         **common_args,
     )
 
-    # plot_mwa_results(
-    #     dep_var_name='heatwaves',
-    #     aggregation='annual_sum',
-    #     ylabel='mean difference in annual heatwave count',
-    #     **common_args,
-    # )
+    plot_mwa_results(
 
-    # plot_mwa_results(
-    #     dep_var_name='heatwaves_smoothed',
-    #     aggregation='annual_sum',
-    #     ylabel='mean difference in annual heatwave count',
-    #     **common_args,
-    # )
+        dep_var_name='heatwaves',
+        aggregation='annual_sum',
+        ylabel='mean difference in annual heatwave count',
+        **common_args,
+    )
+
+    plot_mwa_results(
+        dep_var_name='heatwaves_smoothed',
+        aggregation='annual_sum',
+        ylabel='mean difference in annual heatwave count',
+        **common_args,
+    )
+
+    plot_mwa_results(
+        dep_var_name='heatwaves_gapfilled',
+        aggregation='annual_sum',
+        ylabel='mean difference in annual heatwave count',
+        **common_args,
+    )
+
+
+#%%
+
+    plot_mwa_results(
+    
+dep_var_name='tmax',
+aggregation='JJA_mean',
+ylabel='mean difference in JJA mean tmax (°C)',
+ind_var_name='forest_loss_age',
+ind_var_names=['cc_loss', 'forest_loss_age'],
+driver_ind_var_name='cc_loss',
+xlabel='canopy cover loss bin (%)'
+)
+
+
+
+#%%
+dep_var_name='tmax'
+ind_var_name='cc_loss'
+aggregation='annual_mean'
+ind_var_names=['cc_loss']
+driver_ind_var_name='cc_loss'
+
+# dfs = load_binned_results(
+#     dep_var_name=dep_var_name,
+#     ind_var_name=ind_var_name,
+#     aggregation=aggregation,
+#     ind_var_names=ind_var_names,
+#     driver_ind_var_name=driver_ind_var_name
+# )
+
+#%%
+
+# def plot_annual_results(dep_var_name, ind_var_name, aggregation,
+#                      xlabel, ylabel, coarsen_factor,
+#                      ind_var_names=None, driver_ind_var_name=None
+#                      ):
+sname, pickle_paths = resolve_stats_pickles(
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,   
+    ind_var_names=ind_var_names,
+    driver_ind_var_name=driver_ind_var_name,
+    coarsen_factor=coarsen_factor,
+)
+pickle_path = pickle_paths[0]
+df, _ = pickle_to_df(pickle_path)
+
+res = pd.Series(dtype=float, index=df.index.get_level_values('year').unique().sort_values())
+for year in df.index.get_level_values('year'):
+
+    ydf = df.xs(year, level='year')
+    bin_mids = ydf.index.mid
+    stat = ydf['mean'] / bin_mids
+    stat = stat.mean()
+    res.loc[year] = stat
