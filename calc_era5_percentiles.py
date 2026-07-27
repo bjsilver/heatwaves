@@ -98,14 +98,14 @@ def maybe_local_cluster():
             print(f'LocalCluster started: {client.dashboard_link}')
             yield client
 
-def load_era5_skt_celsius():
+def load_era5_t2m():
     da = xr.open_mfdataset(
         ERA5_PATH + 'era5_land_t2m_dailymax_*.nc',
         chunks=ERA5_OPEN_CHUNKS,
         parallel=False,
     )['t2m'].astype(np.float32)
     da = da.rename({'valid_time': 'time'})
-    da = da.sel(time=slice(f'{ERA_YEAR_RANGE.start}-01-01', f'{ERA_YEAR_RANGE.stop - 1}-12-31'))
+    da = da.sel(time=slice(f'{ERA_YEAR_RANGE.start}-01-01', f'{ERA_YEAR_RANGE.stop}-12-31'))
     da = lon_to_180(da)
     da = da.sortby('latitude')
     da = da.sel(AMAZON_BBOX)
@@ -203,7 +203,7 @@ def calculate_heatwaves(heatdays, thresh=HEATWAVE_DAY_THRESH):
 
 def run_pipeline():
     print('Loading ERA5 skin temperature...')
-    era = load_era5_skt_celsius()
+    era = load_era5_t2m()
 
     print('Reshaping ERA5 data to year/doy...')
     era_year_doy = reshape_to_year_doy(era)

@@ -10,6 +10,8 @@ from constants import HANSEN_DIR, MWA_DAILY_DIR, STORAGE_DIR, LAT_CHUNK_SIZE, LO
 import matplotlib.pyplot as plt
 import gc
 from ufuncs import local_cluster
+from calc_era5_percentiles import load_era5_t2m
+
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 SPATH_SUFFIX = None
@@ -17,12 +19,22 @@ USE_DASK_DASHBOARD = True
 SEASON_MAP = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5], 'JJA': [6, 7, 8], 'SON': [9, 10, 11]}
 
 def _load_single_ind_var(ind_var_name):
+
+    def __calc_tc_loss():
+            tc = ds['tree_cover']
+            ind_var = -(tc - tc[0])
+            ind_var = ind_var.loc[{'time': slice('2003', '2020')}]
+            ind_var = ind_var.rename({'time': 'year'})
+            return ind_var
     if ind_var_name == 'cc_loss':
         ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
-        tc = ds['tree_cover']
-        ind_var = -(tc - tc[0])
-        ind_var = ind_var.loc[{'time': slice('2003', '2020')}]
-        ind_var = ind_var.rename({'time': 'year'})
+        ind_var = __calc_tc_loss()
+        ind_var.name = ind_var_name
+        return ind_var
+    
+    if ind_var_name == 'cc_loss_era5grid':
+        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_regridded.zarr'))
+        ind_var = __calc_tc_loss()
         ind_var.name = ind_var_name
         return ind_var
 
@@ -38,7 +50,7 @@ def _load_single_ind_var(ind_var_name):
     raise ValueError(f"Unsupported independent variable name: {ind_var_name}")
 
 
-def load_ind_dep_data(ind_var_names, dep_var_name):
+def load_ind_dep_data(ind_var_name, dep_var_name, driver_ind_var_name=None):
 
     if dep_var_name == 'tmax':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
@@ -56,47 +68,58 @@ def load_ind_dep_data(ind_var_names, dep_var_name):
     elif dep_var_name == 'heatwaves_era5-p95':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_era5_2003-2020.zarr'))['heatwave_days']
         dep_var.name = dep_var_name
+
+    elif dep_var_name == 'tmax_era5':
+        dep_var = load_era5_t2m()
+        dep_var.name = dep_var_name
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
 
-    ind_vars = {}
-    for ind_var_name in ind_var_names:
-        ind_var = _load_single_ind_var(ind_var_name)
-        ind_var = ind_var.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
-        ind_vars[ind_var_name] = ind_var
+    ind_var = _load_single_ind_var(ind_var_name).assign_coords(lat=dep_var.lat, lon=dep_var.lon)
 
-    return ind_vars, dep_var
+    if driver_ind_var_name is None:
+        driver_ind_var_name = ind_var_name
+        driver_ind_var = ind_var
+    elif driver_ind_var_name == ind_var_name:
+        driver_ind_var = ind_var
+    else:
+        driver_ind_var = _load_single_ind_var(driver_ind_var_name).assign_coords(
+            lat=dep_var.lat,
+            lon=dep_var.lon,
+        )
+
+    return ind_var, driver_ind_var, dep_var
 
 
 
-def _mwa_kernel(block, window_radius, driver_ind_idx, n_ind_vars):
+def _mwa_kernel(block, window_radius):
     """
-    block: (N+1, T, H+2wr, W+2wr) where first N channels are independent vars
-           and last channel is dependent var.
-    driver_ind_idx identifies which independent variable drives neighbor selection.
-    Returns same shape, with centre-cell differences for all independent vars
-    and dependent var relative to the selected neighbor.
+    block: (3, T, H+2wr, W+2wr)
+      channel 0 = analysis independent variable
+      channel 1 = driver independent variable used for neighbor selection
+      channel 2 = dependent variable
+    Returns (4, T, H, W): ind_center, ind_neighbor, dep_center, dep_neighbor
     """
 
-    inds = block[:n_ind_vars]
-    dep = block[n_ind_vars]
-    driver_ind = block[driver_ind_idx]
+    ind = block[0]
+    driver_ind = block[1]
+    dep = block[2]
     wr = window_radius
 
     t_size = driver_ind.shape[0]
     h_size = driver_ind.shape[1] - 2 * wr
     w_size = driver_ind.shape[2] - 2 * wr
 
-    out = np.full((n_ind_vars + 1, t_size, h_size, w_size), np.nan, dtype=np.float32)
+    out = np.full((4, t_size, h_size, w_size), np.nan, dtype=np.float32)
 
-    center_inds = inds[:, :, wr:wr+h_size, wr:wr+w_size]
+    center_ind = ind[:, wr:wr+h_size, wr:wr+w_size]
     center_driver = driver_ind[:, wr:wr+h_size, wr:wr+w_size]
     center_dep = dep[:, wr:wr+h_size, wr:wr+w_size]
 
-    max_ind_diffs = np.full((n_ind_vars, t_size, h_size, w_size), np.nan, dtype=np.float32)
     max_driver_diff = np.full((t_size, h_size, w_size), -np.inf, dtype=np.float32)
-    max_dep_diff = np.zeros((t_size, h_size, w_size), dtype=np.float32)
-    has_higher = np.zeros((t_size, h_size, w_size), dtype=np.bool_)
+    neighbor_ind_selected = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
+    neighbor_dep_selected = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
+    has_lower = np.zeros((t_size, h_size, w_size), dtype=np.bool_)
 
     for di in range(-wr, wr + 1):
         for dj in range(-wr, wr + 1):
@@ -104,65 +127,78 @@ def _mwa_kernel(block, window_radius, driver_ind_idx, n_ind_vars):
                 continue
             ri, rj = wr + di, wr + dj
 
-            n_inds = inds[:, :, ri:ri+h_size, rj:rj+w_size]
+            n_ind = ind[:, ri:ri+h_size, rj:rj+w_size]
             n_driver = driver_ind[:, ri:ri+h_size, rj:rj+w_size]
             n_dep = dep[:, ri:ri+h_size, rj:rj+w_size]
 
-            ind_diffs = center_inds - n_inds
-            dep_diff = center_dep - n_dep
             driver_diff = center_driver - n_driver
 
             better = driver_diff > max_driver_diff
             max_driver_diff = np.where(better, driver_diff, max_driver_diff)
-            max_ind_diffs = np.where(better[np.newaxis, :, :, :], ind_diffs, max_ind_diffs)
-            max_dep_diff = np.where(better, dep_diff, max_dep_diff)
+            neighbor_ind_selected = np.where(better, n_ind, neighbor_ind_selected)
+            neighbor_dep_selected = np.where(better, n_dep, neighbor_dep_selected)
 
-            has_higher = has_higher | (n_driver > center_driver)
+            # Keep only locations where at least one neighbor has lower driver value
+            # so center_driver - neighbor_driver can be positive.
+            has_lower = has_lower | (n_driver < center_driver)
 
-    valid = (center_driver >= 0) & ~np.isnan(center_dep) & has_higher
+    valid = (center_driver >= 0) & ~np.isnan(center_dep) & has_lower
 
-    out[:n_ind_vars] = np.where(valid[np.newaxis, :, :, :], max_ind_diffs, np.nan)
-    out[n_ind_vars] = np.where(valid, max_dep_diff, np.nan)
+    out[0] = np.where(valid, center_ind, np.nan)
+    out[1] = np.where(valid, neighbor_ind_selected, np.nan)
+    out[2] = np.where(valid, center_dep, np.nan)
+    out[3] = np.where(valid, neighbor_dep_selected, np.nan)
 
     return out
 
-def moving_window_analysis(ds, window_radius, ind_var_names, dep_var_name,
+def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name,
                            driver_ind_var_name=None, dep_var_agg=None):
     """Moving-window analysis on (time, lat, lon) inputs."""
     if driver_ind_var_name is None:
-        driver_ind_var_name = ind_var_names[0]
+        driver_ind_var_name = ind_var_name
 
-    if driver_ind_var_name not in ind_var_names:
-        raise ValueError(
-            f"driver_ind_var_name '{driver_ind_var_name}' must be one of {ind_var_names}"
-        )
+    if ind_var_name not in ds:
+        raise ValueError(f"Independent variable '{ind_var_name}' is missing from dataset")
+    if driver_ind_var_name not in ds:
+        raise ValueError(f"Driver variable '{driver_ind_var_name}' is missing from dataset")
 
-    ind_arrs = [ds[ind_var_name].data for ind_var_name in ind_var_names]
+    ind_arr = ds[ind_var_name].data
+    driver_arr = ds[driver_ind_var_name].data
     dep_arr = ds[dep_var_name].data
-    driver_ind_idx = ind_var_names.index(driver_ind_var_name)
 
-    stacked = da.stack(ind_arrs + [dep_arr]).rechunk({0: -1})
+    # Stack with a dummy 4th channel so input and output both have 4 channels,
+    # which allows map_overlap with trim=True to work correctly.
+    dummy = da.zeros_like(ind_arr)
+    stacked = da.stack([ind_arr, driver_arr, dep_arr, dummy]).rechunk({0: -1})
     stacked = stacked.persist()
 
+    def _kernel_wrapper(block):
+        # block: (4, T, H+2wr, W+2wr) — channel 3 is dummy, ignored
+        wr = window_radius
+        result = _mwa_kernel(block[:3], wr)  # (4, T, H, W)
+        # Re-pad to match input block size so trim=True can strip the borders
+        return np.pad(
+            result,
+            [(0, 0), (0, 0), (wr, wr), (wr, wr)],
+            mode='constant',
+            constant_values=np.nan,
+        )  # (4, T, H+2wr, W+2wr)
+
     result = da.map_overlap(
-        partial(
-            _mwa_kernel,
-            window_radius=window_radius,
-            driver_ind_idx=driver_ind_idx,
-            n_ind_vars=len(ind_var_names),
-        ),
+        _kernel_wrapper,
         stacked,
         depth={0: 0, 1: 0, 2: window_radius, 3: window_radius},
         boundary=np.nan,
-        trim=False,
+        trim=True,
         dtype=np.float32,
     )
 
     data_vars = {
-        f'{ind_var_name}_cdiff': (("year", "lat", "lon"), result[idx])
-        for idx, ind_var_name in enumerate(ind_var_names)
+        f'{ind_var_name}_center':   (("year", "lat", "lon"), result[0]),
+        f'{ind_var_name}_neighbor': (("year", "lat", "lon"), result[1]),
+        f'{dep_var_name}_center':   (("year", "lat", "lon"), result[2]),
+        f'{dep_var_name}_neighbor': (("year", "lat", "lon"), result[3]),
     }
-    data_vars[f'{dep_var_name}_cdiff'] = (("year", "lat", "lon"), result[len(ind_var_names)])
 
     result_ds = xr.Dataset(
         data_vars=data_vars,
@@ -173,7 +209,7 @@ def moving_window_analysis(ds, window_radius, ind_var_names, dep_var_name,
         },
         attrs={
             "driver_ind_var_name": driver_ind_var_name,
-            "ind_var_names": ",".join(ind_var_names),
+            "ind_var_name": ind_var_name,
             "window_radius": window_radius,
             "dep_var_agg": dep_var_agg if dep_var_agg is not None else "",
         },
@@ -182,27 +218,23 @@ def moving_window_analysis(ds, window_radius, ind_var_names, dep_var_name,
     return result_ds
 
 
-def _generate_coarsened_versions(ind_vars, dep_var, coarsen_factor):
-    """Generate coarsened variable pairs, with offset versions if coarsen_factor >= 10.
+def _generate_coarsened_versions(ind_var, driver_ind_var, dep_var, coarsen_factor):
+    """Generate coarsened variable triplets, with offset versions if coarsen_factor >= 10.
 
-    Returns a list of (ind_vars_coarse, dep_var_coarse) tuples.
+    Returns a list of (ind_var_coarse, driver_ind_var_coarse, dep_var_coarse) tuples.
     For coarsen_factor >= 10, creates offset versions with 5-pixel intervals.
     """
     dss = []
 
     # First version: standard coarsening
-    ind_coarse = {
-        name: var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-        for name, var in ind_vars.items()
-    }
+    ind_coarse = ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    driver_ind_coarse = driver_ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
     dep_coarse = dep_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
     # rechunk for the coarsened versions
-    ind_coarse = {
-        name: var.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
-        for name, var in ind_coarse.items()
-    }
+    ind_coarse = ind_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+    driver_ind_coarse = driver_ind_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
     dep_coarse = dep_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
-    dss.append((ind_coarse, dep_coarse))
+    dss.append((ind_coarse, driver_ind_coarse, dep_coarse))
 
     # Add offset versions if coarsen_factor >= 10
     if coarsen_factor >= 10:
@@ -211,63 +243,68 @@ def _generate_coarsened_versions(ind_vars, dep_var, coarsen_factor):
             offset = (offset_idx + 1) * 5
 
             # Create shifted versions with offset slicing
-            ind_shifted = {
-                name: var.loc[
-                    {
-                        'lat': slice(var.lat.values[offset], var.lat.values[-offset]),
-                        'lon': slice(var.lon.values[offset], var.lon.values[-offset]),
-                    }
-                ]
-                for name, var in ind_vars.items()
-            }
+            ind_shifted = ind_var.loc[
+                {
+                    'lat': slice(ind_var.lat.values[offset], ind_var.lat.values[-offset]),
+                    'lon': slice(ind_var.lon.values[offset], ind_var.lon.values[-offset]),
+                }
+            ]
+            driver_ind_shifted = driver_ind_var.loc[
+                {
+                    'lat': slice(driver_ind_var.lat.values[offset], driver_ind_var.lat.values[-offset]),
+                    'lon': slice(driver_ind_var.lon.values[offset], driver_ind_var.lon.values[-offset]),
+                }
+            ]
             dep_shifted = dep_var.loc[{'lat': slice(dep_var.lat.values[offset], dep_var.lat.values[-offset]),
                                        'lon': slice(dep_var.lon.values[offset], dep_var.lon.values[-offset])}]
 
             # Coarsen the shifted versions
-            ind_shifted_coarse = {
-                name: var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-                for name, var in ind_shifted.items()
-            }
+            ind_shifted_coarse = ind_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+            driver_ind_shifted_coarse = driver_ind_shifted.coarsen(
+                lat=coarsen_factor,
+                lon=coarsen_factor,
+                boundary='trim',
+            ).mean()
             dep_shifted_coarse = dep_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
 
             # rechunk for the coarsened versions
-            ind_shifted_coarse = {
-                name: var.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
-                for name, var in ind_shifted_coarse.items()
-            }
+            ind_shifted_coarse = ind_shifted_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+            driver_ind_shifted_coarse = driver_ind_shifted_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
             dep_shifted_coarse = dep_shifted_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
 
-            dss.append((ind_shifted_coarse, dep_shifted_coarse))
+            dss.append((ind_shifted_coarse, driver_ind_shifted_coarse, dep_shifted_coarse))
 
     return dss
 
 
-def calc_moving_window(ind_vars, dep_var, client=None, dep_var_agg='annual_mean',
+def calc_moving_window(ind_var, driver_ind_var, dep_var, client=None, dep_var_agg='annual_mean',
                        coarsen_factor=None, window_radius=1, sname=None,
                        driver_ind_var_name=None):
 
-    ind_var_names = list(ind_vars.keys())
+    ind_var_name = ind_var.name
     dep_var_name = dep_var.name
 
     if driver_ind_var_name is None:
-        driver_ind_var_name = ind_var_names[0]
+        driver_ind_var_name = ind_var_name
 
-    elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
-    ref_ind_var = ind_vars[ind_var_names[0]]
-    elev = elev.assign_coords(lat=ref_ind_var.lat, lon=ref_ind_var.lon)
-    ind_vars = {name: var.where(elev < 1000) for name, var in ind_vars.items()}
-    dep_var = dep_var.where(elev < 1000)
+    if len(dep_var.lat) == 5000 and len(dep_var.lon) == 4750:    
+        elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
+        ref_ind_var = ind_var
+        elev = elev.assign_coords(lat=ref_ind_var.lat, lon=ref_ind_var.lon)
+        ind_var = ind_var.where(elev < 1000)
+        driver_ind_var = driver_ind_var.where(elev < 1000)
+        dep_var = dep_var.where(elev < 1000)
 
-    # Generate list of variable pairs (with offsets if applicable)
+    # Generate list of variable triplets (with offsets if applicable)
     if coarsen_factor:
-        dss = _generate_coarsened_versions(ind_vars, dep_var, coarsen_factor)
+        dss = _generate_coarsened_versions(ind_var, driver_ind_var, dep_var, coarsen_factor)
     else:
-        dss = [(ind_vars, dep_var)]
+        dss = [(ind_var, driver_ind_var, dep_var)]
 
     os.makedirs(MWA_DAILY_DIR, exist_ok=True)
 
     # Process each version
-    for version_idx, (ind_vars_version, dep_var_version) in enumerate(dss):
+    for version_idx, (ind_var_version, driver_ind_var_version, dep_var_version) in enumerate(dss):
         # Add version suffix to output paths if there are multiple versions
         if len(dss) > 1:
             out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_{version_idx}.zarr')
@@ -276,12 +313,17 @@ def calc_moving_window(ind_vars, dep_var, client=None, dep_var_agg='annual_mean'
 
         dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg)
 
-        ds_vars = {**ind_vars_version, dep_var_name: dep_var_version}
+        ds_vars = {
+            ind_var_name: ind_var_version,
+            dep_var_name: dep_var_version,
+        }
+        if driver_ind_var_name != ind_var_name:
+            ds_vars[driver_ind_var_name] = driver_ind_var_version
         ds_all = xr.Dataset(ds_vars)
         result_ds = moving_window_analysis(
             ds_all,
             window_radius=window_radius,
-            ind_var_names=ind_var_names,
+            ind_var_name=ind_var_name,
             dep_var_name=dep_var_name,
             driver_ind_var_name=driver_ind_var_name,
             dep_var_agg=dep_var_agg,
@@ -331,24 +373,19 @@ def _check_zarrs_exist(sname):
 
 
 def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', client=None,
-            ind_var_names=None, driver_ind_var_name='cc_loss', dep_var_name='heatwaves'):
+            ind_var_name='cc_loss', driver_ind_var_name=None, dep_var_name='heatwaves'):
 
-    if ind_var_names is None:
-        ind_var_names = ['cc_loss']
+    if driver_ind_var_name is None:
+        driver_ind_var_name = ind_var_name
 
-    if len(ind_var_names) != len(set(ind_var_names)):
-        raise ValueError(f"ind_var_names contains duplicates: {ind_var_names}")
-
-    if driver_ind_var_name not in ind_var_names:
-        raise ValueError(
-            f"driver_ind_var_name '{driver_ind_var_name}' must be one of {ind_var_names}"
-        )
-
-    ind_vars, dep_var = load_ind_dep_data(ind_var_names=ind_var_names, dep_var_name=dep_var_name)
+    ind_var, driver_ind_var, dep_var = load_ind_dep_data(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        driver_ind_var_name=driver_ind_var_name,
+    )
 
     # check if output zarr already exists
-    ind_tag = '+'.join(ind_var_names)
-    sname = f'{dep_var.name}_vs_{ind_tag}_driver_{driver_ind_var_name}_{dep_var_agg}'
+    sname = f'{dep_var.name}_vs_{ind_var_name}_driver_{driver_ind_var_name}_{dep_var_agg}'
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
     if SPATH_SUFFIX:
@@ -356,23 +393,23 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', cli
 
     if not _check_zarrs_exist(sname):
         print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
-        calc_moving_window(ind_vars=ind_vars, dep_var=dep_var, client=client, window_radius=window_radius,
+        calc_moving_window(ind_var=ind_var, driver_ind_var=driver_ind_var, dep_var=dep_var, client=client, window_radius=window_radius,
                            coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg,
                            driver_ind_var_name=driver_ind_var_name)
         print(
-            f"Moving window analysis completed for {dep_var.name} vs {ind_var_names} "
+            f"Moving window analysis completed for {dep_var.name} vs {ind_var_name} "
             f"(driver={driver_ind_var_name}) with coarsen factor {coarsen_factor}."
         )
     else:
         print(f"Output zarrs already exist for {sname}. Skipping moving window analysis.")
 
 
-def run_mwa_coarsen_loop(ind_var_names, driver_ind_var_name, dep_var_agg,
+def run_mwa_coarsen_loop(ind_var_name, driver_ind_var_name, dep_var_agg,
                          dep_var_name,
                          client=None):
     for coarsen_factor in COARSEN_FACTORS:
         run_mwa(coarsen_factor=coarsen_factor, window_radius=1, dep_var_agg=dep_var_agg, client=client,
-                ind_var_names=ind_var_names, driver_ind_var_name=driver_ind_var_name,
+                ind_var_name=ind_var_name, driver_ind_var_name=driver_ind_var_name,
                 dep_var_name=dep_var_name)
             
 #%%
@@ -380,18 +417,9 @@ if __name__ == "__main__":
     
     with local_cluster(n_workers=40, threads_per_worker=1, memory_limit='12GB',
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='tmax', dep_var_agg='annual_95pct', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves', dep_var_agg='annual_sum', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves_smoothed', dep_var_agg='annual_sum', client=client)
-        run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
+        run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
+                             dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
+        run_mwa_coarsen_loop(ind_var_name='forest_loss_age', driver_ind_var_name='forest_loss_age',
+                            dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
+        run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
                              dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
-        # run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                      dep_var_name='heatwaves_era5-p95', dep_var_agg='annual_sum', client=client)
-        # for season in ['DJF', 'MAM', 'JJA', 'SON']:
-        #     run_mwa_coarsen_loop(ind_var_names=['cc_loss'], driver_ind_var_name='cc_loss',
-        #                 dep_var_name='tmax', dep_var_agg=f'{season}_mean', client=client)

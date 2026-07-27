@@ -1,4 +1,4 @@
-# FILEPATHS
+import numpy as np
 
 #%%
 MODIS_PATH = '/uolstore/Research/b/b0122/earjba/MODIS_LST/modis_v6.1/processed_from_callum/'
@@ -6,7 +6,6 @@ ERA5_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/'
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
-HANSEN_PATH = '/uolstore/Research/b/b0122/ee13c2s/datasets/hansen_v1.9/output/'
 MWA_DAILY_DIR = STORAGE_DIR+ 'mwa_results/'
 
 FIGDIR = '/uolstore/Research/b/b0256/Users/earbsi/figs/heatwaves/'
@@ -31,3 +30,10 @@ ARC_BBOX = {'lat':slice(southlimit, northlimit), 'lon':slice(westlimit, eastlimi
 # heatwave thresholds
 HEATDAY_TEMP_THRESH = 28.5
 HEATWAVE_DAY_THRESH = 3
+
+# binning used in mwa_bin*.py
+IND_VAR_BINS = {
+    'cc_loss': np.arange(10, 110, 10),
+    'cc_loss_era5grid': np.arange(10, 110, 10),
+    'forest_loss_age': np.arange(0, 18, 1),
+}
