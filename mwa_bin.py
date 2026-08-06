@@ -51,13 +51,13 @@ def _get_bins(ind_var_name):
         raise ValueError(f"No binning specified for variable '{ind_var_name}'")
     return bins
 
-
+#%%
 def _as_versioned(arr):
     if 'version' in arr.dims:
         return arr
     return arr.expand_dims(version=[0])
 
-
+#%%
 def _year_path(base_dir, year):
     return os.path.join(base_dir, f'year={int(year)}')
 
@@ -264,29 +264,37 @@ if __name__ == '__main__':
         suppress_dask_warnings=False,
         use_dask_dashboard=True,
     ):
-        calc_members_all_coarsens(
-            dep_var_name='tmax',
-            ind_var_name='cc_loss',
-            driver_ind_var_name='cc_loss',
-            aggregation='annual_mean',
-            coarsen_factors=COARSEN_FACTORS,
-        )
+        # calc_members_all_coarsens(
+        #     dep_var_name='tmax',
+        #     ind_var_name='cc_loss',
+        #     driver_ind_var_name='forest_loss_age',
+        #     aggregation='annual_mean',
+        #     coarsen_factors=COARSEN_FACTORS,
+        # )
 
         calc_members_all_coarsens(
-            dep_var_name='tmax',
-            ind_var_name='forest_loss_age',
-            driver_ind_var_name='forest_loss_age',
-            aggregation='annual_mean',
-            coarsen_factors=COARSEN_FACTORS,
-        )
+                    dep_var_name='tmax',
+                    ind_var_name='cc_loss',
+                    driver_ind_var_name='cc_loss',
+                    aggregation='annual_mean',
+                    coarsen_factors=COARSEN_FACTORS,
+                )
 
-        calc_members_all_coarsens(
-            dep_var_name='heatwaves_gapfilled',
-            ind_var_name='cc_loss',
-            driver_ind_var_name='cc_loss',
-            aggregation='annual_sum',
-            coarsen_factors=COARSEN_FACTORS,
-        )
+        # calc_members_all_coarsens(
+        #     dep_var_name='tmax',
+        #     ind_var_name='forest_loss_age',
+        #     driver_ind_var_name='forest_loss_age',
+        #     aggregation='annual_mean',
+        #     coarsen_factors=COARSEN_FACTORS,
+        # )
+
+        # calc_members_all_coarsens(
+        #     dep_var_name='heatwaves_gapfilled',
+        #     ind_var_name='cc_loss',
+        #     driver_ind_var_name='cc_loss',
+        #     aggregation='annual_sum',
+        #     coarsen_factors=COARSEN_FACTORS,
+        # )
 
 # #%% era
 # def calc_era_res_stats():

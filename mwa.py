@@ -1,13 +1,10 @@
 #%%
-from pdb import run
 
 import xarray as xr
 import numpy as np
 import os
 import dask.array as da
-from functools import partial
 from constants import HANSEN_DIR, MWA_DAILY_DIR, STORAGE_DIR, LAT_CHUNK_SIZE, LON_CHUNK_SIZE
-import matplotlib.pyplot as plt
 import gc
 from ufuncs import local_cluster
 from calc_era5_percentiles import load_era5_t2m
@@ -138,7 +135,7 @@ def _mwa_kernel(block, window_radius):
             neighbor_ind_selected = np.where(better, n_ind, neighbor_ind_selected)
             neighbor_dep_selected = np.where(better, n_dep, neighbor_dep_selected)
 
-            # Keep only locations where at least one neighbor has lower driver value
+            # keep grid cells where at least one neighbour has lower driver
             # so center_driver - neighbor_driver can be positive.
             has_lower = has_lower | (n_driver < center_driver)
 

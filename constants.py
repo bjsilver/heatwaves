@@ -22,9 +22,11 @@ LAT_CHUNK_SIZE = 250
 LON_CHUNK_SIZE = 250
 
 # areas
-AMAZON_BBOX = {'latitude':slice(-30, 20), 'longitude':slice(-82, -34.5)}
-westlimit=-63.51; southlimit=-16.18; eastlimit=-48.79; northlimit=-2.64
-ARC_BBOX = {'lat':slice(southlimit, northlimit), 'lon':slice(westlimit, eastlimit)}
+# AMAZON_BBOX = {'latitude':slice(-30, 20), 'longitude':slice(-82, -34.5)}
+# westlimit=-63.51; southlimit=-16.18; eastlimit=-48.79; northlimit=-2.64
+# ARC_BBOX = {'lat':slice(southlimit, northlimit), 'lon':slice(westlimit, eastlimit)}
+
+RESULTS_BBOX = dict(westlimit=-70, southlimit=-20, eastlimit=-50, northlimit=0)
 
 
 # heatwave thresholds

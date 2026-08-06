@@ -2,21 +2,41 @@
 import os
 import re
 from glob import glob
+from turtle import width
 import cartopy.crs as ccrs
+from matplotlib import cm
 import matplotlib.pyplot as plt
+from mercantile import xy_bounds
 import numpy as np
 import pandas as pd
 import contextily as ctx
-from scipy.fftpack import tilbert
-
-from constants import FIGDIR, STORAGE_DIR
+from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX
 
 MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 
-AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
+# AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
+
+top_bins = {'cc_loss': '90-100', 'forest_loss_age': '16-17'}
+
+pretty = {
+    'heatwaves_gapfilled': 'gap-filled heatwaves',
+    'heatwaves': 'heatwaves',
+    'forest_loss_age': 'forest loss age',
+    'cc_loss': 'canopy cover loss',
+    'tmax': 'daily maximum temperature',
+}
+
+units = {
+    'heatwaves_gapfilled': 'days/year',
+    'heatwaves': 'days/year',
+    'cc_loss': '%',
+    'tmax': '°C',
+    'forest_loss_age': 'years',
+}
+
 
 def build_stats_sname(
     dep_var_name,
@@ -84,6 +104,7 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
         ignore_index=True,
     )
 
+    stat_col_name = 'dep_diff'
     
     if area_slice is not None:
         df = df[
@@ -94,7 +115,7 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
         ]
 
     statsdf = (
-        df.groupby(['bin_left', 'bin_right'])['dep_diff']
+        df.groupby(['bin_left', 'bin_right'])[stat_col_name]
         .agg(
             count='size',
             sum='sum',
@@ -108,7 +129,7 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
         .reset_index()
     )
     statsdf['sumsq'] = (
-        df.groupby(['bin_left', 'bin_right'])['dep_diff']
+        df.groupby(['bin_left', 'bin_right'])[stat_col_name]
         .apply(lambda s: np.square(s.to_numpy(dtype=np.float64)).sum())
         .values
     )
@@ -148,8 +169,9 @@ def plot_binned_results(
     driver_ind_var_name=None,
     years=None,
     stat='mean',
-    ylabel='neighbour mean temperature change (degC)',
-    xlabel='canopy cover loss bin (%)',
+    area_slice=None,
+    relative=False,
+    print_stats=False,
 ):
     sname, member_dir = resolve_member_dirs(
         dep_var_name=dep_var_name,
@@ -159,10 +181,52 @@ def plot_binned_results(
         coarsen_factor=coarsen_factor,
     )
 
-    _, statsdf = member_dir_to_df(member_dir, years=years)
+    df, statsdf = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
+
+    bin_means = (
+        df.groupby(['bin_left', 'bin_right'])
+        .agg(
+            dep_neighbor_mean=('dep_neighbor', 'mean'),
+            dep_center_mean=('dep_center', 'mean'),
+        )
+        .reset_index()
+    )
+    interval_index = statsdf.index
+    statsdf = statsdf.merge(bin_means, on=['bin_left', 'bin_right'], how='left')
+    statsdf.index = interval_index
+
+    if relative:
+        # Convert per-bin dep_diff stats to percent relative to that bin's
+        # average dep_neighbor to avoid row-level divide-by-zero blowups.
+        eps = 1e-12
+        scale = np.where(np.abs(statsdf['dep_neighbor_mean']) > eps,
+                         100.0 / statsdf['dep_neighbor_mean'],
+                         np.nan)
+
+        cols_to_scale = [
+            'sum', 'mean', 'median', 'q25', 'q75', 'min', 'max',
+            'std', 'se', 'ci_lower', 'ci_upper',
+            'yerr_lower', 'yerr_upper',
+            'median_yerr_lower', 'median_yerr_upper',
+        ]
+        for col in cols_to_scale:
+            statsdf[col] = statsdf[col] * scale
 
     if stat not in statsdf.columns:
         raise ValueError(f"Unsupported stat '{stat}'. Available: {sorted(statsdf.columns.tolist())}")
+
+    if print_stats:
+        print('Key stats by bin:')
+        print(f"stat column: {stat} | spread column: std")
+        out = pd.DataFrame({
+            'bin': [f'{int(interval.left)}-{int(interval.right)}' for interval in statsdf.index],
+            'y': statsdf[stat].values,
+            'std': statsdf['std'].values,
+            'count': statsdf['count'].values,
+            'dep_neighbor_mean': statsdf['dep_neighbor_mean'].values,
+            'dep_center_mean': statsdf['dep_center_mean'].values,
+        })
+        print(out.to_string(index=False))
 
     fig, ax = plt.subplots(figsize=(10, 6))
     plot_kwargs = {'ax': ax, 'color': 'steelblue'}
@@ -176,7 +240,12 @@ def plot_binned_results(
 
     xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in statsdf.index]
 
-    ax.set_xlabel(xlabel, fontsize=12)
+    if relative:
+        ylabel = f'mean relative difference in {pretty[dep_var_name]} [%]'
+    else:
+        ylabel = f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]'
+
+    ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xticklabels(xticklabels, rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
@@ -200,7 +269,8 @@ def plot_binned_results(
 
     os.makedirs(MWA_FIGDIR, exist_ok=True)
     suffix = '' if years is None else f"_years_{min(years)}-{max(years)}"
-    png_path = f'{sname}{suffix}.png'
+    rel_suffix = '_relative' if relative else ''
+    png_path = f'{sname}{suffix}{rel_suffix}.png'
     fig.savefig(os.path.join(MWA_FIGDIR, png_path), dpi=400, bbox_inches='tight')
     print(f'Saved figure to {os.path.join(MWA_FIGDIR, png_path)}')
 
@@ -212,8 +282,9 @@ def plot_map_results(
     aggregation,
     coarsen_factor=None,
     driver_ind_var_name=None,
-    canopy_cover_loss_bin='90-100',
-    cbar_label='mean difference in annual sum of heatwaves (heatwave days/year)'
+    area_slice=None,
+    ind_bin='90-100',
+    show_box=False
 ):
 
 
@@ -229,7 +300,7 @@ def plot_map_results(
     df['lon'] = df['lon'].round(0)
     df['lat'] = df['lat'].round(0)
     # select canopy cover loss bin
-    interval = pd.Interval(left=int(canopy_cover_loss_bin.split('-')[0]), right=int(canopy_cover_loss_bin.split('-')[1]), closed='right')
+    interval = pd.Interval(left=int(ind_bin.split('-')[0]), right=int(ind_bin.split('-')[1]), closed='right')
     df = df[df['bin_label'] == str(interval)]
     # take mean across years
     mdf = df.groupby(['lat', 'lon'])['dep_diff'].mean()
@@ -242,24 +313,33 @@ def plot_map_results(
     size_norm = plt.Normalize(vmin=cdf.min(), vmax=cdf.max())
     fig = plt.figure(figsize=(12, 6))
     ax = fig.add_subplot(projection=ccrs.PlateCarree())
+
+    mapped_colors = cmap(norm(mdf.values))
     sc = ax.scatter(
-        mdf.index.get_level_values('lon'),
-        mdf.index.get_level_values('lat'),
-        c=mdf.values,
-        cmap=cmap,
-        norm=norm,
-        s=size_norm(cdf.values)*1000,
-        edgecolor='none',
-        linewidth=0.5,
-        alpha=.8
+    mdf.index.get_level_values("lon"),
+    mdf.index.get_level_values("lat"),
+    facecolors="none",
+    edgecolors=mapped_colors,  # Pass mapped RGBA colors to edges
+    s=size_norm(cdf.values) * 250,
+    linewidths=1.5,  # Plural 'linewidths' & slightly thicker for visibility
+    alpha=1,
     )
     ax.coastlines()
     ctx.add_basemap(ax, crs=ccrs.PlateCarree(), source=ctx.providers.CartoDB.Voyager, alpha=0.5)
     # add colorbar
-    cbar = plt.colorbar(sc, ax=ax, orientation='vertical', pad=0.02, aspect=30)
-    cbar.set_label(cbar_label, fontsize=12)
-    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name} - coarsen_factor: {coarsen_factor} - bin: {canopy_cover_loss_bin}', fontsize=14)
+    cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical',
+                        shrink=0.5 )
+    cbar.set_label(f'mean difference in\n{pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=10)
+    ax.set_title('')
 
+    if show_box and area_slice is not None:
+        # Draw a rectangle around the specified area
+        ax.add_patch(plt.Rectangle((area_slice['westlimit'], area_slice['southlimit']),
+                                   area_slice['eastlimit'] - area_slice['westlimit'],
+                                   area_slice['northlimit'] - area_slice['southlimit'],
+                                   fill=False, edgecolor='black', linewidth=2, zorder=5))
+
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_map_{ind_bin}.png'), dpi=400, bbox_inches='tight')
 
 def plot_hist_results(
     ind_var_name,
@@ -267,10 +347,10 @@ def plot_hist_results(
     aggregation,
     coarsen_factor=None,
     driver_ind_var_name=None,
-    canopy_cover_loss_bin='90-100',
+    ind_bin='90-100',
     bins=np.arange(-5, 5, 0.02),
-    ylabel='neighbour mean temperature change (degC)',
-    xlabel='canopy cover loss bin (%)',
+    area_slice=None,
+
 ):
 
     sname, member_dir = resolve_member_dirs(
@@ -281,25 +361,25 @@ def plot_hist_results(
         coarsen_factor=coarsen_factor,
     )
 
-    df, _ = member_dir_to_df(member_dir, years=None)
+    df, _ = member_dir_to_df(member_dir, years=None, area_slice=area_slice)
     
     # convert string to interval
-    bin_left, bin_right = map(int, canopy_cover_loss_bin.split('-'))
+    bin_left, bin_right = map(int, ind_bin.split('-'))
     bdf = df.where(df['bin_left'] == bin_left).where(df['bin_right'] == bin_right).dropna()
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bdf['dep_diff'].plot.hist(ax=ax, color='steelblue', bins=bins, label=f'canopy cover loss bin: {canopy_cover_loss_bin}')
-    ax.set_xlim(bdf['dep_diff'].quantile(.001), bdf['dep_diff'].quantile(.999))
+    bdf['dep_diff'].plot.hist(ax=ax, color='steelblue', bins=bins, label=f'canopy cover loss bin: {ind_bin}')
+    ax.set_xlim(bdf['dep_diff'].dropna().quantile(.001), bdf['dep_diff'].dropna().quantile(.999))
     # plot the median
     median = bdf['dep_diff'].median()
     ax.axvline(median, color='red', linestyle='--', label=f'Median: {median:.2f}')
     # add grid
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.legend()
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name} - coarsen_factor: {coarsen_factor}')
-
+    ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
+    ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
+    ax.set_title(f'{pretty[dep_var_name]} ({aggregation.replace("_", " ")}) vs {pretty[ind_var_name]} - coarsen_factor: {coarsen_factor}')
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_hist_{ind_bin}.png'), dpi=400, bbox_inches='tight')
     return fig, ax
 
 
@@ -318,9 +398,6 @@ def plot_hexbin_results(
     mincnt=1000,
     vmin=None,
     vmax=None,
-    xlabel='canopy cover loss in center bin (%)',
-    ylabel='canopy cover loss in neighbor bin (%)',
-    cbar_label=None,
 ):
     sname, member_dir = resolve_member_dirs(
         dep_var_name=dep_var_name,
@@ -336,14 +413,12 @@ def plot_hexbin_results(
         cvals = (df.loc[valid, 'dep_diff'] / df.loc[valid, 'ind_diff']).to_numpy()
         xvals = df.loc[valid, 'ind_center'].to_numpy()
         yvals = df.loc[valid, 'ind_neighbor'].to_numpy()
-        if cbar_label is None:
-            cbar_label = f'{dep_var_name} difference per 1% {ind_var_name}'
+
     else:
         cvals = df['dep_diff'].to_numpy()
         xvals = df['ind_center'].to_numpy()
         yvals = df['ind_neighbor'].to_numpy()
-        if cbar_label is None:
-            cbar_label = f'mean {dep_var_name} difference'
+
 
     fig, ax = plt.subplots(figsize=(9, 8))
     hb = ax.hexbin(
@@ -357,9 +432,9 @@ def plot_hexbin_results(
         vmax=vmax,
         mincnt=mincnt,
     )
-    plt.colorbar(hb, ax=ax, label=cbar_label)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    plt.colorbar(hb, ax=ax, label=f'{pretty[dep_var_name]} difference per 1% {pretty[ind_var_name]}', orientation='vertical')
+    ax.set_xlabel(f'{pretty[ind_var_name]} in centre bin [%]', fontsize=12)
+    ax.set_ylabel(f'{pretty["cc_loss"]} in neighbor bin [%]', fontsize=12)
 
     norm_label = 'normalized' if normalize_by_ind_diff else 'raw'
     ax.set_title(
@@ -367,8 +442,9 @@ def plot_hexbin_results(
         f'- coarsen_factor: {coarsen_factor} - {norm_label} hexbin'
     )
 
-    return fig, ax
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_hexbin.png'), dpi=400, bbox_inches='tight')
 
+    return fig, ax
 
 def plot_dep_response_vs_ind_diff(
     ind_var_name,
@@ -380,8 +456,7 @@ def plot_dep_response_vs_ind_diff(
     area_slice=None,
     normalize_by_ind_diff=True,
     round_digits=0,
-    xlabel=None,
-    ylabel=None,
+    xbin_cutoff=10,
 ):
     sname, member_dir = resolve_member_dirs(
         dep_var_name=dep_var_name,
@@ -396,37 +471,58 @@ def plot_dep_response_vs_ind_diff(
         valid = df['ind_diff'] != 0
         response = df.loc[valid, 'dep_diff'] / df.loc[valid, 'ind_diff']
         ind_vals = df.loc[valid, 'ind_diff']
-        if ylabel is None:
-            ylabel = f'{dep_var_name} difference per 1% {ind_var_name}'
+        quantifier = 'per 1% change '
     else:
         response = df['dep_diff']
         ind_vals = df['ind_diff']
-        if ylabel is None:
-            ylabel = f'mean {dep_var_name} difference'
+        quantifier = ''
 
-    summary = response.groupby(ind_vals.round(round_digits)).mean().sort_index()
+    cuts = pd.cut(df['ind_diff'], IND_VAR_BINS[ind_var_name])
+    summary = response.groupby(cuts).agg(['mean', 'count', 'std'])
+    summary['se'] = summary['std'] / np.sqrt(summary['count'])
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    summary.plot(ax=ax, marker='o', color='steelblue')
+    # summary.plot(ax=ax, marker='o', color='steelblue')
 
-    if xlabel is None:
-        xlabel = f'rounded {ind_var_name} difference (%)'
+    summary['mean'].plot(ax=ax, marker='o', color='black')
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+
+
+
+    ax.set_xlabel(f'{pretty[ind_var_name]} difference [{units[ind_var_name]}]')
+    ax.set_ylabel(f'{pretty[dep_var_name]} difference {quantifier}')
     ax.grid(axis='y', linestyle='--', alpha=0.7)
 
-    norm_label = 'normalized' if normalize_by_ind_diff else 'raw'
-    ax.set_title(
-        f'{dep_var_name} vs {ind_var_name} ({aggregation.replace("_", " ")}) '
-        f'- coarsen_factor: {coarsen_factor} - {norm_label} grouped by ind_diff'
-    )
+    ax.set_title('')
 
     mean_response = response.mean()
     unit = 'per 1% change' if normalize_by_ind_diff else 'difference'
-    print(f'Average {dep_var_name} response ({unit}): {mean_response:.5f}')
-
+    print(f'Average {pretty[dep_var_name]} response ({unit}): {mean_response.mean():.5f}')
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_dep_response_vs_ind_diff.png'), dpi=400, bbox_inches='tight')
     return fig, ax, summary
+
+# ind_var_name = 'cc_loss'
+# dep_var_name = 'tmax'
+# aggregation = 'annual_mean'
+# coarsen_factor = None
+# driver_ind_var_name = 'cc_loss'
+# years = None
+# area_slice = RESULTS_BBOX
+# normalize_by_ind_diff = True
+# round_digits = 0
+# xbin_cutoff = 10
+# plot_dep_response_vs_ind_diff(
+#     ind_var_name=ind_var_name,
+#     dep_var_name=dep_var_name,
+#     aggregation=aggregation,
+#     coarsen_factor=coarsen_factor,
+#     driver_ind_var_name=driver_ind_var_name,
+#     years=years,
+#     area_slice=area_slice,
+#     normalize_by_ind_diff=normalize_by_ind_diff,
+#     round_digits=round_digits,
+#     xbin_cutoff=xbin_cutoff,
+# )
 
 def plot_trend_results(
     ind_var_name,
@@ -434,8 +530,8 @@ def plot_trend_results(
     aggregation,
     coarsen_factor=None,
     driver_ind_var_name=None,
-    ylabel='neighbour mean temperature change (degC)',
-    xlabel='canopy cover loss bin (%)'):
+
+    area_slice=None):
 
     sname, member_dir = resolve_member_dirs(
         dep_var_name=dep_var_name,
@@ -445,7 +541,7 @@ def plot_trend_results(
         coarsen_factor=coarsen_factor,
     )
 
-    df, _ = member_dir_to_df(member_dir, years=None)
+    df, _ = member_dir_to_df(member_dir, years=None, area_slice=area_slice)
     # make interval columns from bin_left and bin_right
     df['bin_interval'] = pd.IntervalIndex.from_arrays(df['bin_left'], df['bin_right'], closed='right')
     
@@ -456,130 +552,14 @@ def plot_trend_results(
     fig, ax = plt.subplots(figsize=(10, 6))
     trend_df.plot(ax=ax, color='steelblue', marker='o')
     ax.set_xlabel('year', fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_ylabel(f'mean {pretty[dep_var_name]} response per % {pretty[ind_var_name]}', fontsize=12)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
-    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name} - coarsen_factor: {coarsen_factor}')
+    ax.set_title(f'{pretty[dep_var_name]} ({aggregation.replace("_", " ")}) vs {pretty[ind_var_name]} \n coarsen_factor: {coarsen_factor}')
     ax.set_xticks(range(int(trend_df.index.min()), int(trend_df.index.max()) + 1, 3))
 
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_trend.png'), dpi=400, bbox_inches='tight')
     return fig, ax  
 
-# plot_trend_results(
-#     ind_var_name='cc_loss',
-#     dep_var_name='tmax',
-#     aggregation='annual_mean',
-#     coarsen_factor=None,
-#     driver_ind_var_name='cc_loss',
-#     ylabel='neighbour mean temperature change (degC)',
-#     xlabel='canopy cover loss bin (%)'
-# )
-
-
-def plot_binned_violin(
-    ind_var_name,
-    dep_var_name,
-    aggregation,
-    coarsen_factor,
-    driver_ind_var_name=None,
-    years=None,
-    ylabel='distribution of dependent-variable differences',
-    xlabel='canopy cover loss bin (%)',
-    max_points_per_bin=None,
-    show_p5_p95=True,
-):
-    """Plot one violin per bin for a single coarsen factor.
-
-    This uses raw row-level values from the binned-members parquet output.
-    """
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
-        coarsen_factor=coarsen_factor,
-    )
-    raw_df, statsdf = member_dir_to_df(member_dir, years=years)
-
-    grouped = raw_df.groupby(['bin_left', 'bin_right'])['dep_diff']
-    violin_data = []
-    xticklabels = []
-    p5_vals = []
-    p50_vals = []
-    p95_vals = []
-
-    for interval in statsdf.index:
-        key = (float(interval.left), float(interval.right))
-        if key not in grouped.groups:
-            continue
-        vals_full = grouped.get_group(key).to_numpy()
-        p5, p50, p95 = np.percentile(vals_full, [5, 50, 95])
-        p5_vals.append(p5)
-        p50_vals.append(p50)
-        p95_vals.append(p95)
-
-        vals = vals_full
-        if max_points_per_bin is not None and vals_full.size > max_points_per_bin:
-            # Randomly downsample very large bins to keep plotting responsive.
-            rng = np.random.default_rng(42)
-            vals = rng.choice(vals_full, size=max_points_per_bin, replace=False)
-        violin_data.append(vals)
-        xticklabels.append(f'{int(interval.left)}-{int(interval.right)}')
-
-    if not violin_data:
-        raise ValueError(f'No data available for violin plot: {sname}')
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    vp = ax.violinplot(
-        violin_data,
-        positions=np.arange(1, len(violin_data) + 1),
-        showmeans=False,
-        showmedians=True,
-        showextrema=False,
-        widths=0.85,
-    )
-    for body in vp['bodies']:
-        body.set_facecolor('steelblue')
-        body.set_edgecolor('black')
-        body.set_alpha(0.45)
-
-    if show_p5_p95:
-        positions = np.arange(1, len(violin_data) + 1)
-        ax.vlines(
-            positions,
-            p5_vals,
-            p95_vals,
-            colors='black',
-            linewidth=1.2,
-            alpha=0.9,
-            label='5th-95th percentile',
-        )
-        ax.scatter(
-            positions,
-            p50_vals,
-            color='black',
-            s=12,
-            zorder=3,
-            label='median',
-        )
-        ax.legend(loc='upper left')
-
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_xticks(np.arange(1, len(xticklabels) + 1))
-    ax.set_xticklabels(xticklabels, rotation=0)
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-    cf_label = 'original' if coarsen_factor is None else f'coarsen_factor: {coarsen_factor}'
-    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name} - {cf_label}')
-    fig.tight_layout()
-
-    os.makedirs(MWA_FIGDIR, exist_ok=True)
-    suffix = '' if years is None else f"_years_{min(years)}-{max(years)}"
-    cf_suffix = 'original' if coarsen_factor is None else f'coarsened{coarsen_factor}'
-    png_path = f'{sname}_{cf_suffix}_violin{suffix}.png'
-    fig.savefig(os.path.join(MWA_FIGDIR, png_path), dpi=400, bbox_inches='tight')
-    print(f'Saved figure to {os.path.join(MWA_FIGDIR, png_path)}')
-
-    return fig, ax
 
 
 def load_binned_results(
@@ -589,6 +569,8 @@ def load_binned_results(
     driver_ind_var_name=None,
     coarsen_factor=None,
     years=None,
+    area_slice=None,
+    relative=False,
 ):
     if driver_ind_var_name is None:
         driver_ind_var_name = ind_var_name
@@ -603,7 +585,36 @@ def load_binned_results(
 
     dfs = {}
     for members_dir in member_dirs:
-        _, statsdf = member_dir_to_df(members_dir, years=years)
+        df, statsdf = member_dir_to_df(members_dir, years=years, area_slice=area_slice)
+
+        bin_means = (
+            df.groupby(['bin_left', 'bin_right'])
+            .agg(
+                dep_neighbor_mean=('dep_neighbor', 'mean'),
+                dep_center_mean=('dep_center', 'mean'),
+            )
+            .reset_index()
+        )
+        interval_index = statsdf.index
+        statsdf = statsdf.merge(bin_means, on=['bin_left', 'bin_right'], how='left')
+        statsdf.index = interval_index
+
+        if relative:
+            # Convert per-bin dep_diff stats to percent relative to that bin's
+            # average dep_neighbor to avoid divide-by-zero at row level.
+            eps = 1e-12
+            scale = np.where(np.abs(statsdf['dep_neighbor_mean']) > eps,
+                             100.0 / statsdf['dep_neighbor_mean'],
+                             np.nan)
+            cols_to_scale = [
+                'sum', 'mean', 'median', 'q25', 'q75', 'min', 'max',
+                'std', 'se', 'ci_lower', 'ci_upper',
+                'yerr_lower', 'yerr_upper',
+                'median_yerr_lower', 'median_yerr_upper',
+            ]
+            for col in cols_to_scale:
+                statsdf[col] = statsdf[col] * scale
+
         base = os.path.basename(members_dir).replace('_binned_members_parquet', '')
         cf = extract_coarsen_factor(base)
         dfs[cf] = statsdf
@@ -618,8 +629,12 @@ def plot_mwa_results_all(
     driver_ind_var_name=None,
     years=None,
     stat='mean',
-    ylabel=None,
-    xlabel='canopy cover loss bin (%)',
+    area_slice=None,
+    min_count_per_bin=20,
+    print_summary=False,
+    plot_resolution_corr=True,
+    relative=False,
+    print_stats=False,
 ):
     sname, dfs = load_binned_results(
         dep_var_name=dep_var_name,
@@ -627,13 +642,20 @@ def plot_mwa_results_all(
         aggregation=aggregation,
         driver_ind_var_name=driver_ind_var_name,
         years=years,
+        area_slice=area_slice,
+        relative=relative,
     )
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
     if not cfs:
         raise ValueError(f'No valid parquet outputs to plot for {sname}')
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    if not plot_resolution_corr:
+        fig, ax = plt.subplots(figsize=(14, 6))
+    else:
+        fig, axes = plt.subplots(figsize=(14, 6), nrows=1, ncols=2,
+                                 width_ratios=[3, 2], gridspec_kw={'wspace': 0.15})
+        ax = axes[0]
     colors = plt.cm.magma(np.linspace(0.25, 0.75, len(cfs)))
 
     all_bins = set()
@@ -645,7 +667,7 @@ def plot_mwa_results_all(
 
     for i, cf in enumerate(cfs):
         df = dfs[cf].reindex(sorted_bins)
-        label = 'original' if cf is None else f'approx {cf} km'
+        label = 'original (~1 km)' if cf is None else f'~{cf} km'
 
         if stat not in df.columns:
             raise ValueError(f"Unsupported stat '{stat}'. Available: {sorted(df.columns.tolist())}")
@@ -656,9 +678,12 @@ def plot_mwa_results_all(
         elif stat == 'median':
             yerr = [df['median_yerr_lower'].values, df['median_yerr_upper'].values]
 
+        y = df[stat].values
+        # Mask bins with insufficient count
+        y = np.ma.masked_where(df['count'].values < min_count_per_bin, y)
         ax.errorbar(
             x,
-            df[stat].values,
+            y,
             label=label,
             color=colors[i],
             alpha=0.85,
@@ -666,31 +691,110 @@ def plot_mwa_results_all(
             capsize=2,
         )
 
-    if ylabel is None:
-        ylabel = f'mean difference in {dep_var_name}'
+        if print_summary:
+            print(f'Coarsen factor: {cf}')
+            print(df[['count', stat, 'yerr_lower', 'yerr_upper']].to_string())
+
+        if print_stats:
+            print(f'Key stats for coarsen factor {cf}:')
+            out = pd.DataFrame({
+                'bin': [f'{int(interval.left)}-{int(interval.right)}' for interval in sorted_bins],
+                'y': df[stat].values,
+                'std': df['std'].values,
+                'count': df['count'].values,
+                'dep_neighbor_mean': df['dep_neighbor_mean'].values,
+                'dep_center_mean': df['dep_center_mean'].values,
+            })
+            print(out.to_string(index=False))
+
 
     xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in sorted_bins]
 
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_xlabel(f'{pretty[ind_var_name]} bin [{units["cc_loss"]}]', fontsize=12)
+    if relative:
+        ax.set_ylabel(f'mean relative difference in {pretty[dep_var_name]} [%]', fontsize=12)
+    else:
+        ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels(xticklabels, rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
-    ax.legend(title='downsampled\nresolution', bbox_to_anchor=(1.01, 1), loc='upper left')
-    ax.set_title(f'{dep_var_name} ({aggregation.replace("_", " ")}) vs {ind_var_name}', fontsize=14)
+    ax.legend(title='downsampled\nresolution', bbox_to_anchor=(0, 1), loc='upper left')
+    ax.set_title(f'{pretty[dep_var_name]} ({aggregation.replace("_", " ")}) vs {pretty[ind_var_name]}', fontsize=14)
     fig.tight_layout()
+
+
+    if plot_resolution_corr:
+        ax2 = axes[1]
+        psr = pd.Series(index=cfs, dtype=float)
+        for i, cf in enumerate(cfs):
+            df = dfs[cf]
+            if relative:
+                nmean = df['mean'].mean()
+            else:
+                # get normalised mean
+                nmean = (df['mean'] / df.index.mid).mean()
+            ax2.plot(nmean, cf if cf is not None else 1, 
+                     marker='o', color=colors[i])
+            psr.loc[cf if cf is not None else 1] = nmean
+
+        ax2.grid(linestyle='--', alpha=0.7)
+        if relative:
+            ax2.set_xlabel(f'mean relative difference in\n{pretty[dep_var_name]} [%]', fontsize=12)
+        else:
+            ax2.set_xlabel(f'normalised mean difference in\n{pretty[dep_var_name]}\n[{units[dep_var_name]} per % canopy cover loss]', fontsize=12)
+        ax2.set_ylabel('downsampleed resolution (km)', fontsize=12)
+
+
+
 
     os.makedirs(MWA_FIGDIR, exist_ok=True)
     suffix = '' if years is None else f"_years_{min(years)}-{max(years)}"
-    png_path = f'{sname}_all_coarsen_factors{suffix}.png'
+    rel_suffix = '_relative' if relative else ''
+    png_path = f'{sname}_all_coarsen_factors{suffix}{rel_suffix}.png'
     fig.savefig(os.path.join(MWA_FIGDIR, png_path), dpi=400, bbox_inches='tight')
     print(f'Saved figure to {os.path.join(MWA_FIGDIR, png_path)}')
 
     return fig, ax
 
-#%%
+# ind_var_name = 'cc_loss'
+# dep_var_name = 'tmax'
+# aggregation = 'annual_mean'
+# driver_ind_var_name = 'cc_loss'
+# years = None
+# stat = 'mean'
+# area_slice = RESULTS_BBOX
+# print_summary = False
+# min_count_per_bin = 20
+# plot_resolution_corr = True
+# plot_mwa_results_all(
+#     ind_var_name=ind_var_name,
+#     dep_var_name=dep_var_name,
+#     aggregation=aggregation,
+#     driver_ind_var_name=driver_ind_var_name,
+#     years=years,
+#     stat=stat,
+#     area_slice=area_slice,
+#     print_summary=print_summary,
+#     min_count_per_bin=min_count_per_bin,
+#     plot_resolution_corr=plot_resolution_corr
+# )
 
-def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=None, years=None):
+
+
+
+def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=None, years=None,
+                   area_slice=None):
+
+    # plot_hist_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     area_slice=area_slice,
+    #     ind_bin=top_bins[ind_var_name],
+    # )
+
+
     plot_mwa_results_all(
         ind_var_name=ind_var_name,
         dep_var_name=dep_var_name,
@@ -698,8 +802,75 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=
         driver_ind_var_name=driver_ind_var_name,
         years=years,
         stat='mean',
-        ylabel=f'mean difference in {dep_var_name}',
+        area_slice=area_slice,
+        plot_resolution_corr=False,
+        print_summary=True,
+        min_count_per_bin=20,
+        relative=False,
+        print_stats=True
     )
+
+
+    # plot_binned_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     years=years,
+    #     stat='mean',
+    #     area_slice=area_slice,
+    #     relative=False,
+    #     print_stats=True
+    # )
+
+    # plot_dep_response_vs_ind_diff(
+
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     years=years,
+    #     area_slice=area_slice,
+    #     normalize_by_ind_diff=True,
+    #     round_digits=0,
+
+    # )
+
+    # plot_map_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     ind_bin=top_bins[ind_var_name],
+    #     show_box=True,
+    #     area_slice=area_slice
+    # )
+
+    # plot_trend_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     area_slice=area_slice,
+    # )
+
+    # plot_hexbin_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     driver_ind_var_name=driver_ind_var_name,
+    #     years=years,
+    #     area_slice=area_slice,
+    #     normalize_by_ind_diff=True,
+    #     gridsize=30,
+    #     cmap='viridis',
+    #     reduce_C_function=np.mean,
+    #     mincnt=1000,
+    #     vmin=None,
+    #     vmax=None,
+    # )   
+
+
 
 make_all_plots(
     ind_var_name='cc_loss',
@@ -707,17 +878,72 @@ make_all_plots(
     aggregation='annual_mean',
     driver_ind_var_name='cc_loss',
     years=None,
+    area_slice=RESULTS_BBOX
 )
 
+# make_all_plots(
+#     ind_var_name='forest_loss_age',
+#     dep_var_name='tmax',
+#     aggregation='annual_mean',
+#     driver_ind_var_name='forest_loss_age',
+#     years=None,
+#     area_slice=RESULTS_BBOX
+# )
 
-#%%
-sname, member_dir = resolve_member_dirs(
-        dep_var_name='tmax',
-        ind_var_name='cc_loss',
-        aggregation='annual_mean',
-        driver_ind_var_name='cc_loss',
-        coarsen_factor=25,
-    )
+# make_all_plots(
+#     ind_var_name='cc_loss',
+#     dep_var_name='heatwaves_gapfilled',
+#     aggregation='annual_sum',
+#     driver_ind_var_name='cc_loss',
+#     years=None,
+#     area_slice=RESULTS_BBOX
+# )
 
-df, _ = member_dir_to_df(member_dir, years=None)
 
+# #%%
+# years = None
+# dep_var_name = 'tmax'
+# ind_var_name = 'cc_loss'
+# aggregation = 'annual_mean'
+# area_slice = RESULTS_BBOX
+# driver_ind_var_name = 'cc_loss'
+# coarsen_factor = 5
+
+# sname, member_dir = resolve_member_dirs(
+#     dep_var_name=dep_var_name,
+#     ind_var_name=ind_var_name,
+#     aggregation=aggregation,
+#     driver_ind_var_name=driver_ind_var_name,
+#     coarsen_factor=coarsen_factor,
+# )
+
+# df, _ = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
+# df['bin_label'] = pd.IntervalIndex.from_arrays(df['bin_left'], df['bin_right'], closed='right')
+# #%%
+# res = {}
+# for cc_bin in range(10, 100, 10):
+#     print(cc_bin)
+#     bdf = df.loc[(df.ind_neighbor >=cc_bin) & (df.ind_neighbor < cc_bin+10)]
+#     binned = (bdf['dep_diff']).groupby(bdf.ind_diff.round(-1)).mean()
+#     # binned.index = binned.index.mid
+#     res[cc_bin] = binned
+
+
+# #%%
+# fig, ax = plt.subplots(figsize=(10, 6))
+# cmap = plt.get_cmap('viridis')
+# norm = plt.Normalize(vmin=min(res.keys()), vmax=max(res.keys()))
+# for cc_bin, binned in res.items():
+#     color = cmap(norm(cc_bin))
+#     binned.plot(ax=ax, marker='o', color=color, label=f'{cc_bin}-{cc_bin+10}')
+
+# ax.legend(title='canopy cover loss in neighbor bin (%)', bbox_to_anchor=(1.01, 1), loc='upper left')
+# ax.set_xlabel(f'canopy cover loss (%)')
+# ax.set_ylabel(f'mean difference in {dep_var_name}')
+
+# #%%
+# cdf = pd.DataFrame(res)
+# fig, ax = plt.subplots(figsize=(10, 6))
+# cdf.div(cdf.columns, axis=1).mean().plot(ax=ax)
+# ax.set_ylabel(f'mean difference in {dep_var_name} per 1% canopy cover loss')
+# ax.set_xlabel('canopy cover loss in center bin (%)')
