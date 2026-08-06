@@ -190,17 +190,18 @@ def moving_window_analysis(ds, window_radius, ind_var_name, dep_var_name,
         dtype=np.float32,
     )
 
+    time_dim = "year" if "year" in ds.dims else "time"
     data_vars = {
-        f'{ind_var_name}_center':   (("year", "lat", "lon"), result[0]),
-        f'{ind_var_name}_neighbor': (("year", "lat", "lon"), result[1]),
-        f'{dep_var_name}_center':   (("year", "lat", "lon"), result[2]),
-        f'{dep_var_name}_neighbor': (("year", "lat", "lon"), result[3]),
+        f'{ind_var_name}_center':   ((time_dim, "lat", "lon"), result[0]),
+        f'{ind_var_name}_neighbor': ((time_dim, "lat", "lon"), result[1]),
+        f'{dep_var_name}_center':   ((time_dim, "lat", "lon"), result[2]),
+        f'{dep_var_name}_neighbor': ((time_dim, "lat", "lon"), result[3]),
     }
 
     result_ds = xr.Dataset(
         data_vars=data_vars,
         coords={
-            "year": ds.coords["year"],
+            time_dim: ds.coords[time_dim],
             "lat": ds.coords["lat"],
             "lon": ds.coords["lon"],
         },
@@ -274,9 +275,27 @@ def _generate_coarsened_versions(ind_var, driver_ind_var, dep_var, coarsen_facto
     return dss
 
 
+def upsample_independent_variable(ind_var, dep_var_time):
+    """
+    Convert annual independent variable to daily by interpolation.
+    """
+
+    noleap_annual = xr.date_range(start=str(ind_var.year[0].item()), 
+                                    end=str(ind_var.year[-1].item()+1),
+                                      freq="YS", calendar="noleap",
+                                      use_cftime=True)
+    ind_var = ind_var.rename({'year': 'time'}).assign_coords(time=noleap_annual[:-1])
+    last = ind_var.isel(time=-1).assign_coords(time=noleap_annual[-1])
+    ind_var = xr.concat([ind_var, last], dim='time')
+    ind_var_reindexed = ind_var.resample(time='1D').ffill()
+    # trim off the last day to match the dependent variable time range
+    ind_var_reindexed = ind_var_reindexed.isel(time=slice(0, -1))
+    ind_var_reindexed = ind_var_reindexed.chunk({'time': 365})
+    return ind_var_reindexed
+
 def calc_moving_window(ind_var, driver_ind_var, dep_var, client=None, dep_var_agg='annual_mean',
                        coarsen_factor=None, window_radius=1, sname=None,
-                       driver_ind_var_name=None):
+                       driver_ind_var_name=None, time_scale='annual'):
 
     ind_var_name = ind_var.name
     dep_var_name = dep_var.name
@@ -308,7 +327,18 @@ def calc_moving_window(ind_var, driver_ind_var, dep_var, client=None, dep_var_ag
         else:
             out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results.zarr')
 
-        dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg)
+        dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg, time_scale=time_scale)
+
+        if time_scale == "daily":
+            ind_var_version = upsample_independent_variable(
+                ind_var_version,
+                dep_var_version.time,
+            )
+
+            driver_ind_var_version = upsample_independent_variable(
+                driver_ind_var_version,
+                dep_var_version.time,
+            )
 
         ds_vars = {
             ind_var_name: ind_var_version,
@@ -336,7 +366,10 @@ def calc_moving_window(ind_var, driver_ind_var, dep_var, client=None, dep_var_ag
 
 
 
-def aggregate_dependent_variable(dep_var, aggregation):
+def aggregate_dependent_variable(dep_var, aggregation, time_scale='annual'):
+    if time_scale == 'daily':
+        return dep_var
+
     if 'annual' in aggregation and 'year' in dep_var.dims:
         return dep_var
     match aggregation:
@@ -352,6 +385,8 @@ def aggregate_dependent_variable(dep_var, aggregation):
             annual = dep_var.where(dep_var['time.month'].isin(months)).groupby('time.year').mean()
         case _:
             raise ValueError(f"Unsupported aggregation: {aggregation}")
+    
+
 
     return annual
 
@@ -370,7 +405,8 @@ def _check_zarrs_exist(sname):
 
 
 def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', client=None,
-            ind_var_name='cc_loss', driver_ind_var_name=None, dep_var_name='heatwaves'):
+            ind_var_name='cc_loss', driver_ind_var_name=None, dep_var_name='heatwaves',
+            time_scale='annual'):
 
     if driver_ind_var_name is None:
         driver_ind_var_name = ind_var_name
@@ -385,6 +421,8 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', cli
     sname = f'{dep_var.name}_vs_{ind_var_name}_driver_{driver_ind_var_name}_{dep_var_agg}'
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
+    if time_scale != "annual":
+        sname += f"_{time_scale}"
     if SPATH_SUFFIX:
         sname += f'_{SPATH_SUFFIX}'
 
@@ -392,7 +430,7 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', cli
         print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
         calc_moving_window(ind_var=ind_var, driver_ind_var=driver_ind_var, dep_var=dep_var, client=client, window_radius=window_radius,
                            coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg,
-                           driver_ind_var_name=driver_ind_var_name)
+                           driver_ind_var_name=driver_ind_var_name, time_scale=time_scale)
         print(
             f"Moving window analysis completed for {dep_var.name} vs {ind_var_name} "
             f"(driver={driver_ind_var_name}) with coarsen factor {coarsen_factor}."
@@ -401,22 +439,25 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg='annual_mean', cli
         print(f"Output zarrs already exist for {sname}. Skipping moving window analysis.")
 
 
-def run_mwa_coarsen_loop(ind_var_name, driver_ind_var_name, dep_var_agg,
-                         dep_var_name,
+def run_mwa_coarsen_loop(ind_var_name, driver_ind_var_name,
+                         dep_var_name, dep_var_agg='annual_mean', time_scale='annual',
                          client=None):
     for coarsen_factor in COARSEN_FACTORS:
         run_mwa(coarsen_factor=coarsen_factor, window_radius=1, dep_var_agg=dep_var_agg, client=client,
                 ind_var_name=ind_var_name, driver_ind_var_name=driver_ind_var_name,
-                dep_var_name=dep_var_name)
+                dep_var_name=dep_var_name, time_scale=time_scale)
             
 #%%
 if __name__ == "__main__":
     
     with local_cluster(n_workers=40, threads_per_worker=1, memory_limit='12GB',
-                       suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
+                       suppress_dask_warnings=False, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
+        # run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
+        #                      dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
+        # run_mwa_coarsen_loop(ind_var_name='forest_loss_age', driver_ind_var_name='forest_loss_age',
+        #                     dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
+        # run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
+        #                      dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
+
         run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
-                             dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
-        run_mwa_coarsen_loop(ind_var_name='forest_loss_age', driver_ind_var_name='forest_loss_age',
-                            dep_var_name='tmax', dep_var_agg='annual_mean', client=client)
-        run_mwa_coarsen_loop(ind_var_name='cc_loss', driver_ind_var_name='cc_loss',
-                             dep_var_name='heatwaves_gapfilled', dep_var_agg='annual_sum', client=client)
+                                    dep_var_name='tmax', time_scale='daily', client=client)

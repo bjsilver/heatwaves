@@ -9,7 +9,7 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 from numba import njit, prange
 import os
-from constants import AMAZON_BBOX, ERA5_PATH
+from constants import ERA5_PATH
 from ufuncs import lon_to_180
 from dask.distributed import Client, LocalCluster
 
@@ -108,7 +108,6 @@ def load_era5_t2m():
     da = da.sel(time=slice(f'{ERA_YEAR_RANGE.start}-01-01', f'{ERA_YEAR_RANGE.stop}-12-31'))
     da = lon_to_180(da)
     da = da.sortby('latitude')
-    da = da.sel(AMAZON_BBOX)
     da = da.rename({'latitude': 'lat', 'longitude': 'lon'})
     da = da.chunk(ERA5_ANALYSIS_CHUNKS)
     da = (da - np.float32(273.15)).astype(np.float32)

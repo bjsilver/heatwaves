@@ -6,7 +6,7 @@ ERA5_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/'
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
-MWA_DAILY_DIR = STORAGE_DIR+ 'mwa_results/'
+MWA_DAILY_DIR = STORAGE_DIR+ 'mwa_results_daily/'
 
 FIGDIR = '/uolstore/Research/b/b0256/Users/earbsi/figs/heatwaves/'
 
