@@ -11,7 +11,7 @@ from calc_era5_percentiles import load_era5_t2m
 from numba import njit
 from functools import partial
 
-COARSEN_FACTORS = [None]#, 2, 5, 10, 25]
+COARSEN_FACTORS = [None, 2, 5, 10, 25]
 SPATH_SUFFIX = None
 USE_DASK_DASHBOARD = False
 SEASON_MAP = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5], 'JJA': [6, 7, 8], 'SON': [9, 10, 11]}
@@ -128,44 +128,56 @@ def _mwa_kernel(block, window_radius):
 
 def _get_mwa_neighbour_map(ind_var, ind_var_name, window_radius, sname):
     spath = os.path.join(MWA_DAILY_DIR, f'neighbour_maps/{sname}.zarr')
-    if not os.path.exists(spath):
-       
-        ind_arr = ind_var.data
-
-        neighbour_maps = da.map_overlap(
-            _mwa_kernel,
-            ind_arr,
-            window_radius=window_radius,
-            depth={0: 0, 1: window_radius, 2: window_radius},
-            boundary=np.nan,
-            trim=True,
-            dtype=np.int8,
-            new_axis=0,
-            chunks=((2,),) + ind_arr.chunks
-        )
-        neighbour_maps_ds = xr.Dataset(
-            {
-                'neighbour_maps': (('offset', 'year', 'lat', 'lon'), neighbour_maps),
-            },
-            coords={
-                'offset': ['i', 'j'],
-                'year': ind_var['year'],
-                'lat': ind_var['lat'],
-                'lon': ind_var['lon'],
-            },
-        )
-        neighbour_maps_ds['neighbour_maps'].attrs['missing_offset_value'] = int(NEIGHBOUR_MAP_FILL_VALUE)
-
-        encoding = {
-            'neighbour_maps': {
-                'dtype': 'int8',
-                '_FillValue': int(NEIGHBOUR_MAP_FILL_VALUE),
-            }
-        }
-
-        neighbour_maps_ds.to_zarr(spath, mode='w', consolidated=False, encoding=encoding)
-    else:
+    if os.path.exists(spath):
         print(f"Neighbour map zarr already exists for {sname}.\nLoading from {spath}.")
+        neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
+
+        years_match = np.array_equal(neighbour_maps_ds['year'].values, ind_var['year'].values)
+        lats_match = np.array_equal(neighbour_maps_ds['lat'].values, ind_var['lat'].values)
+        lons_match = np.array_equal(neighbour_maps_ds['lon'].values, ind_var['lon'].values)
+
+        if years_match and lats_match and lons_match:
+            return neighbour_maps_ds
+
+        print(
+            "Existing neighbour map grid does not match current input grid. "
+            "Recomputing and overwriting existing neighbour map store."
+        )
+
+    ind_arr = ind_var.data
+
+    neighbour_maps = da.map_overlap(
+        _mwa_kernel,
+        ind_arr,
+        window_radius=window_radius,
+        depth={0: 0, 1: window_radius, 2: window_radius},
+        boundary=np.nan,
+        trim=False,
+        dtype=np.int8,
+        new_axis=0,
+        chunks=((2,),) + ind_arr.chunks
+    )
+    neighbour_maps_ds = xr.Dataset(
+        {
+            'neighbour_maps': (('offset', 'year', 'lat', 'lon'), neighbour_maps),
+        },
+        coords={
+            'offset': ['i', 'j'],
+            'year': ind_var['year'],
+            'lat': ind_var['lat'],
+            'lon': ind_var['lon'],
+        },
+    )
+    neighbour_maps_ds['neighbour_maps'].attrs['missing_offset_value'] = int(NEIGHBOUR_MAP_FILL_VALUE)
+
+    encoding = {
+        'neighbour_maps': {
+            'dtype': 'int8',
+            '_FillValue': int(NEIGHBOUR_MAP_FILL_VALUE),
+        }
+    }
+
+    neighbour_maps_ds.to_zarr(spath, mode='w', consolidated=False, encoding=encoding)
     neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
     return neighbour_maps_ds
 
@@ -216,7 +228,7 @@ def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_n
         {0: 0, 1: window_radius, 2: window_radius},
         {0: 0, 1: 0, 2: 0, 3: 0},
         ],
-        boundary=np.nan,
+        boundary=[np.nan, NEIGHBOUR_MAP_FILL_VALUE],
         trim=False,
         dtype=np.float32,
         chunks=((2,),) + ind_arr.chunks,
@@ -249,7 +261,7 @@ def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_n
                     {0: 0, 1: window_radius, 2: window_radius},
                     {0: 0, 1: 0, 2: 0, 3: 0},
                     ],
-            boundary=np.nan,
+            boundary=[np.nan, NEIGHBOUR_MAP_FILL_VALUE],
             trim=False,
             dtype=np.float32,
             chunks=((2,),) + dep_arr.chunks,
@@ -278,7 +290,7 @@ def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_n
                     {0: 0, 1: window_radius, 2: window_radius},
                     {0: 0, 1: 0, 2: 0, 3: 0},
                 ],
-                boundary=np.nan,
+                boundary=[np.nan, NEIGHBOUR_MAP_FILL_VALUE],
                 trim=False,
                 dtype=np.float32,
                 chunks=((2,),) + dep_var_year.data.chunks,
@@ -286,7 +298,7 @@ def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_n
             dep_results_list.append(dep_results_year)
             
             
-    dep_results = da.concatenate(dep_results_list, axis=1)
+        dep_results = da.concatenate(dep_results_list, axis=1)
     dep_results_ds = xr.Dataset(
         {
             'dep_results': (('position', dep_time_dim, 'lat', 'lon'), 
@@ -387,11 +399,15 @@ def calc_moving_window(ind_var, dep_var, ind_var_name, dep_var_name,
 
     # Process each version
     for version_idx, (ind_var_version, dep_var_version) in enumerate(dss):
-        # Add version suffix to output paths if there are multiple versions
         if len(dss) > 1:
-            out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_{version_idx}')
+            suffix = f'_{version_idx}'
         else:
-            out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results')
+            suffix = ''
+
+        map_sname = f'{sname}{suffix}'
+
+        out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind{suffix}.zarr')
+        out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep{suffix}.zarr')
 
         if dep_var_agg is not None:
             dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg)
@@ -402,21 +418,20 @@ def calc_moving_window(ind_var, dep_var, ind_var_name, dep_var_name,
             window_radius=window_radius,
             ind_var_name=ind_var_name,
             dep_var_name=dep_var_name,
-            sname=sname
+            sname=map_sname
         )
 
-        ind_results_ds.to_zarr(out_path+ '_ind.zarr', mode='w', consolidated=False)
-        dep_results_ds.to_zarr(out_path + '_dep.zarr', mode='w', consolidated=False)
+        ind_results_ds.to_zarr(out_path_ind, mode='w', consolidated=False)
+        dep_results_ds.to_zarr(out_path_dep, mode='w', consolidated=False)
 
         gc.collect()
-        print(f"All-year results written to {out_path}")
+        print(f"All-year results written to {out_path_ind} and {out_path_dep}")
 
 
 
 
-def aggregate_dependent_variable(dep_var, aggregation, time_scale='annual'):
-    if time_scale == 'daily':
-        return dep_var
+def aggregate_dependent_variable(dep_var, aggregation):
+
 
     if 'annual' in aggregation and 'year' in dep_var.dims:
         return dep_var
@@ -440,16 +455,25 @@ def aggregate_dependent_variable(dep_var, aggregation, time_scale='annual'):
 
 
 
-def _check_zarrs_exist(sname):
-    """Check if output zarrs exist (either indexed or non-indexed versions)."""
-    # Check for indexed versions (from offset resampling)
-    indexed_out = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_0.zarr')
-    if os.path.exists(indexed_out):
+def _check_zarrs_exist(sname, coarsen_factor=None):
+    """Check whether the expected ind/dep zarr pairs already exist."""
+    if coarsen_factor and coarsen_factor >= 10:
+        num_offsets = (coarsen_factor - 10) // 5 + 1
+        expected_versions = 1 + num_offsets
+        for version_idx in range(expected_versions):
+            out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind_{version_idx}.zarr')
+            out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep_{version_idx}.zarr')
+            if not (os.path.exists(out_path_ind) and os.path.exists(out_path_dep)):
+                return False
         return True
 
-    # Check for non-indexed versions
-    out_path = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results.zarr')
-    return os.path.exists(out_path)
+    out_path_ind = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_ind.zarr')
+    out_path_dep = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_dep.zarr')
+    if os.path.exists(out_path_ind) and os.path.exists(out_path_dep):
+        return True
+
+    legacy_out = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_results_0.zarr')
+    return os.path.exists(legacy_out)
 
 
 def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
@@ -465,12 +489,11 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     sname = f'{dep_var.name}_{agg_name}_vs_{ind_var_name}'
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
-    if time_scale != "annual":
-        sname += f"_{time_scale}"
+
     if SPATH_SUFFIX:
         sname += f'_{SPATH_SUFFIX}'
 
-    if not _check_zarrs_exist(sname):
+    if not _check_zarrs_exist(sname, coarsen_factor=coarsen_factor):
         print(f"Output zarrs do not exist for {sname}. Proceeding with moving window analysis.")
         calc_moving_window(ind_var=ind_var, dep_var=dep_var, 
                            ind_var_name=ind_var_name, dep_var_name=dep_var_name,
@@ -495,7 +518,7 @@ def run_mwa_coarsen_loop(ind_var_name, dep_var_agg,
 #%%
 if __name__ == "__main__":
     
-    with local_cluster(n_workers=24, threads_per_worker=1, memory_limit='18GB',
+    with local_cluster(n_workers=24, threads_per_worker=1, memory_limit='24GB',
                        suppress_dask_warnings=False, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
         run_mwa_coarsen_loop(ind_var_name='cc_loss', dep_var_agg=None,
                              dep_var_name='tmax', client=client)
