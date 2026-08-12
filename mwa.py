@@ -244,10 +244,6 @@ def _gather_mwa_results_kernel_daily(arr, neighbour_maps, window_radius):
     out[1] = neighbour_arr
     return out
 
-
-
-
-
 def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_name, window_radius):
 
 
@@ -413,6 +409,8 @@ def _write_chunk_parquet(
         }
     )
     df = df.dropna(subset=[centre_col])
+    if df.empty:
+        return None
     df.to_parquet(out_path, engine='pyarrow', compression=compression, index=False)
     return out_path
 
@@ -748,7 +746,7 @@ if __name__ == "__main__":
     
     with local_cluster(n_workers=32, threads_per_worker=1, memory_limit='20GB',
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
-        run_mwa_coarsen_loop(ind_var_name='cc_loss', dep_var_agg=None,
+        run_mwa_coarsen_loop(ind_var_name='cc_loss', dep_var_agg='annual_mean',
                              dep_var_name='tmax', client=client)
         # run_mwa_coarsen_loop(ind_var_name='forest_loss_age', dep_var_agg='annual_mean',
         #                     dep_var_name='tmax', client=client)

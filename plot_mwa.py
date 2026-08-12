@@ -2,22 +2,25 @@
 import os
 import re
 from glob import glob
-from turtle import width
 import cartopy.crs as ccrs
 from matplotlib import cm
 import matplotlib.pyplot as plt
-from mercantile import xy_bounds
 import numpy as np
 import pandas as pd
 import contextily as ctx
 from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX
+import dask.dataframe as dd
+from dask import delayed
+from dask.diagnostics import ProgressBar
 
-MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results/'
+MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results_daily/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 
 # AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
+
+IND_DIFF_THRESH = {'cc_loss':10}
 
 top_bins = {'cc_loss': '90-100', 'forest_loss_age': '16-17'}
 
@@ -37,26 +40,170 @@ units = {
     'forest_loss_age': 'years',
 }
 
+IND_DIFF_BINS  = {
+    'cc_loss':np.arange(10, 110, 10)
+}
+
+
 
 def build_stats_sname(
     dep_var_name,
     ind_var_name,
     aggregation,
-    driver_ind_var_name=None,
     coarsen_factor=None,
 ):
-    if driver_ind_var_name is None:
-        driver_ind_var_name = ind_var_name
 
-    sname = f'{dep_var_name}_vs_{ind_var_name}_driver_{driver_ind_var_name}_{aggregation}'
-    if coarsen_factor:
-        sname += f'_coarsened{coarsen_factor}'
+    sname = f'{dep_var_name}_{aggregation}_vs_{ind_var_name}_'
+    if coarsen_factor is not None:
+        sname += f'coarsened{coarsen_factor}_'
+    sname += 'mwa_members_parquet'
+
+    
     return sname
 
 
-def extract_coarsen_factor(text):
-    match = re.search(r'_coarsened(\d+)', text)
-    return int(match.group(1)) if match else None
+def _join_member_partition(ind_path, dep_path, join_keys, ind_cols, dep_cols, output_cols, derive_year_from_time=False):
+    ind_df = pd.read_parquet(ind_path, columns=ind_cols)
+    dep_df = pd.read_parquet(dep_path, columns=dep_cols)
+
+    if derive_year_from_time:
+        dep_df['year'] = pd.to_datetime(dep_df['time']).dt.year.astype(str)
+
+    merged = dep_df.merge(ind_df, how='inner', on=join_keys, sort=False)
+    return merged.loc[:, output_cols]
+
+
+def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
+    
+    if aggregation == 'daily':
+        raise ValueError('daily aggregation not yet supported')
+    
+    version_dirs = sorted(glob(os.path.join(MWA_DAILY_DIR, sname, 'version=*')))
+    if not version_dirs:
+        raise FileNotFoundError(f'No version directories found for {sname}')
+
+    if aggregation == 'daily':
+        time_dim = 'time'
+        join_keys = ['year', 'lat', 'lon']
+        output_cols = [
+            'time', 'year', 'lat', 'lon',
+            'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour'
+        ]
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour']
+        dep_cols = ['lat', 'lon', 'time', 'dep_centre', 'dep_neighbour']
+        derive_year_from_time = True
+    else:
+        time_dim = 'year'
+        join_keys = ['year', 'lat', 'lon']
+        output_cols = ['year', 'lat', 'lon', 'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour']
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour']
+        dep_cols = ['lat', 'lon', 'year', 'dep_centre', 'dep_neighbour']
+        derive_year_from_time = False
+
+    delayed_parts = []
+    for version_dir in version_dirs:
+        ind_dir = os.path.join(version_dir, 'ind')
+        dep_dir = os.path.join(version_dir, 'dep')
+        ind_files = {os.path.basename(path) for path in glob(os.path.join(ind_dir, '*.parquet'))}
+        dep_files = {os.path.basename(path) for path in glob(os.path.join(dep_dir, '*.parquet'))}
+
+        common_files = sorted(ind_files.intersection(dep_files))
+        for fname in common_files:
+            delayed_parts.append(
+                delayed(_join_member_partition)(
+                    os.path.join(ind_dir, fname),
+                    os.path.join(dep_dir, fname),
+                    join_keys,
+                    ind_cols,
+                    dep_cols,
+                    output_cols,
+                    derive_year_from_time,
+                )
+            )
+
+    if not delayed_parts:
+        raise FileNotFoundError(
+            f'No common parquet filenames found between ind/dep partitions for {sname}'
+        )
+
+    meta_dict = {
+        time_dim: 'str',
+        'lat': 'float64',
+        'lon': 'float64',
+        'dep_centre': 'float32',
+        'dep_neighbour': 'float32',
+        'ind_centre': 'float32',
+        'ind_neighbour': 'float32',
+    }
+    if aggregation == 'daily':
+        meta_dict['year'] = 'str'
+
+    meta = pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in meta_dict.items()})
+    ddf = dd.from_delayed(delayed_parts, meta=meta)
+    with ProgressBar():
+        df = ddf.compute(num_workers=64, memory_limit='2GB')
+    df = df.dropna(how='any')
+    df = df.set_index([time_dim, 'lat', 'lon'])
+    df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
+    df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+    # drop row if less than ind_diff threshold
+    df = df[df['ind_diff'].abs() >= IND_DIFF_THRESH[ind_var_name]]
+
+    return df
+
+
+def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
+                                reset_caches=False):
+    """compute all dfs for all coarsen factors and cache them to parquet
+       if the cache already exists then load from cache instead of recomputing"""
+
+
+    time_dim = 'year' if aggregation != 'daily' else 'time'
+    cache_root = os.path.join(MWA_DAILY_DIR, 'paired_cache')
+    os.makedirs(cache_root, exist_ok=True)
+
+    coarsen_dfs = {}
+
+    for coarsen_factor in COARSEN_FACTORS:
+        sname = build_stats_sname(dep_var_name, ind_var_name, aggregation, coarsen_factor)
+        cache_dir = os.path.join(cache_root, sname)
+        cache_file = os.path.join(cache_dir, 'data.parquet')
+
+        if reset_caches and os.path.isfile(cache_file):
+            print(f'Removing cached paired dataframe for {sname} at {cache_file}')
+            os.remove(cache_file)
+
+        if os.path.isfile(cache_file):
+            print(f'Loading cached paired dataframe for {sname} from {cache_file}')
+            df = pd.read_parquet(cache_file)
+            # if {time_dim, 'lat', 'lon'}.issubset(df.columns):
+            #     df = df.set_index([time_dim, 'lat', 'lon'])
+            # if 'ind_diff' not in df.columns:
+            #     df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
+            # if 'dep_diff' not in df.columns:
+            #     df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+        else:
+            print(f'Computing paired dataframe for {sname} and caching to {cache_file}')
+            df = load_mwa_results_file_paired(sname=sname, ind_var_name=ind_var_name,
+                                               aggregation=aggregation)
+            os.makedirs(cache_dir, exist_ok=True)
+            df.reset_index().to_parquet(cache_file, engine='pyarrow', index=False)
+
+        coarsen_dfs[coarsen_factor] = df
+
+    return coarsen_dfs
+
+
+
+def bin_df(dfs):
+    bdfs = {}
+    for coarsen_factor in COARSEN_FACTORS:
+        df = dfs[coarsen_factor].set_index(['year', 'lat', 'lon']).sort_index()
+        # calculate the mean dep_value for each bin of ind_diff
+        binsr = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc_loss'])
+        binned = df.groupby(binsr)['dep_diff'].agg(['mean', 'count', 'std']).reset_index()
+        bdfs[coarsen_factor] = binned
+    return bdfs
 
 
 def resolve_member_dirs(
@@ -66,46 +213,43 @@ def resolve_member_dirs(
     driver_ind_var_name=None,
     coarsen_factor=None,
 ):
-    sname = build_stats_sname(
+    # Compatibility shim: keep old call sites working with the new cached paired data.
+    sname = build_stats_sname(dep_var_name, ind_var_name, aggregation, coarsen_factor)
+    coarsen_dfs = load_and_cache_all_coarsens(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
-        coarsen_factor=coarsen_factor,
+        reset_caches=False,
     )
-
-    exact_dir = os.path.join(MWA_DAILY_DIR, f'{sname}_binned_members_parquet')
-    
-    if not os.path.isdir(exact_dir):
-        raise FileNotFoundError(f'No binned member parquet folder found at {exact_dir}')
-    return sname, exact_dir
+    if coarsen_factor not in coarsen_dfs:
+        raise KeyError(f'Coarsen factor {coarsen_factor} not available for {sname}')
+    return sname, coarsen_dfs[coarsen_factor]
 
 
-def _parquet_partitions(members_dir, years=None):
-    if years is None:
-        return sorted(glob(os.path.join(members_dir, 'year=*', '*.parquet')))
+def member_dir_to_df(member_source, years=None, area_slice=None):
+    # Compatibility shim: accepts either a DataFrame (new path) or parquet path (legacy path).
+    if isinstance(member_source, pd.DataFrame):
+        df = member_source.copy()
+    else:
+        df = pd.read_parquet(member_source)
 
-    parquet_paths = []
-    for year in years:
-        year_dir = os.path.join(members_dir, f'year={int(year)}')
-        parquet_paths.extend(sorted(glob(os.path.join(year_dir, '*.parquet'))))
-    return parquet_paths
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
 
+    if 'dep_neighbor' not in df.columns and 'dep_neighbour' in df.columns:
+        df['dep_neighbor'] = df['dep_neighbour']
+    if 'dep_center' not in df.columns and 'dep_centre' in df.columns:
+        df['dep_center'] = df['dep_centre']
+    if 'ind_neighbor' not in df.columns and 'ind_neighbour' in df.columns:
+        df['ind_neighbor'] = df['ind_neighbour']
+    if 'ind_center' not in df.columns and 'ind_centre' in df.columns:
+        df['ind_center'] = df['ind_centre']
 
-def member_dir_to_df(member_dir, years=None, area_slice=None):
-    parquet_paths = _parquet_partitions(member_dir, years=years)
-    if not parquet_paths:
-        raise FileNotFoundError(f'No parquet partitions found under {member_dir}')
+    time_col = 'year' if 'year' in df.columns else 'time'
+    if years is not None and time_col in df.columns:
+        year_vals = pd.to_numeric(df['year'], errors='coerce') if time_col == 'year' else pd.to_datetime(df['time']).dt.year
+        df = df[np.isin(year_vals, years)]
 
-    cols = ['year', 'dep_diff', 'bin_left', 'bin_right', 'lat', 'lon', 'ind_diff',
-            'ind_center', 'ind_neighbor', 'dep_center', 'dep_neighbor', 'bin_label']
-    df = pd.concat(
-        [pd.read_parquet(path, columns=cols) for path in parquet_paths],
-        ignore_index=True,
-    )
-
-    stat_col_name = 'dep_diff'
-    
     if area_slice is not None:
         df = df[
             (df['lon'] >= area_slice['westlimit']) &
@@ -114,8 +258,14 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
             (df['lat'] <= area_slice['northlimit'])
         ]
 
+    if 'bin_left' not in df.columns or 'bin_right' not in df.columns:
+        intervals = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc_loss'])
+        df['bin_left'] = intervals.map(lambda iv: iv.left if pd.notna(iv) else np.nan)
+        df['bin_right'] = intervals.map(lambda iv: iv.right if pd.notna(iv) else np.nan)
+        df['bin_label'] = intervals.astype(str)
+
     statsdf = (
-        df.groupby(['bin_left', 'bin_right'])[stat_col_name]
+        df.groupby(['bin_left', 'bin_right'])['dep_diff']
         .agg(
             count='size',
             sum='sum',
@@ -128,8 +278,9 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
         )
         .reset_index()
     )
+
     statsdf['sumsq'] = (
-        df.groupby(['bin_left', 'bin_right'])[stat_col_name]
+        df.groupby(['bin_left', 'bin_right'])['dep_diff']
         .apply(lambda s: np.square(s.to_numpy(dtype=np.float64)).sum())
         .values
     )
@@ -151,6 +302,18 @@ def member_dir_to_df(member_dir, years=None, area_slice=None):
     statsdf = statsdf.set_index(intervals).sort_index()
 
     return df, statsdf
+
+
+
+#%%
+
+
+dfs = load_and_cache_all_coarsens(dep_var_name='tmax', 
+                                  ind_var_name='cc_loss', 
+                                  aggregation='annual_mean',
+                                  reset_caches=False)
+
+
 
 
 def format_count(count):
@@ -575,37 +738,100 @@ def load_binned_results(
     if driver_ind_var_name is None:
         driver_ind_var_name = ind_var_name
 
-    # Find all matching coarsen factor directories
-    base_sname = f'{dep_var_name}_vs_{ind_var_name}_driver_{driver_ind_var_name}_{aggregation}'
-    pattern = os.path.join(MWA_DAILY_DIR, f'{base_sname}*_binned_members_parquet')
-    member_dirs = sorted([p for p in glob(pattern) if os.path.isdir(p)])
-    
-    if not member_dirs:
-        raise FileNotFoundError(f'No binned member parquet folders found for pattern {pattern}')
+    base_sname = f'{dep_var_name}_{aggregation}_vs_{ind_var_name}'
+
+    paired_dfs = load_and_cache_all_coarsens(
+        dep_var_name=dep_var_name,
+        ind_var_name=ind_var_name,
+        aggregation=aggregation,
+        reset_caches=False,
+    )
+
+    time_dim = 'year' if aggregation != 'daily' else 'time'
+    bins = IND_DIFF_BINS[ind_var_name]
 
     dfs = {}
-    for members_dir in member_dirs:
-        df, statsdf = member_dir_to_df(members_dir, years=years, area_slice=area_slice)
+    for cf, df in paired_dfs.items():
+        if not isinstance(df.index, pd.MultiIndex) and {time_dim, 'lat', 'lon'}.issubset(df.columns):
+            df = df.set_index([time_dim, 'lat', 'lon'])
 
-        bin_means = (
-            df.groupby(['bin_left', 'bin_right'])
+        if years is not None:
+            time_vals = df.index.get_level_values(time_dim)
+            year_ints = pd.to_datetime(time_vals).year if time_dim == 'time' else pd.to_numeric(time_vals, errors='coerce')
+            df = df[np.isin(year_ints, years)]
+
+        if area_slice is not None:
+            lat = df.index.get_level_values('lat')
+            lon = df.index.get_level_values('lon')
+            in_box = (
+                (lon >= area_slice['westlimit']) &
+                (lon <= area_slice['eastlimit']) &
+                (lat >= area_slice['southlimit']) &
+                (lat <= area_slice['northlimit'])
+            )
+            df = df[in_box]
+
+        if df.empty:
+            continue
+
+        binsr = pd.cut(df['ind_diff'], bins)
+        statsdf = (
+            df.groupby(binsr)['dep_diff']
             .agg(
-                dep_neighbor_mean=('dep_neighbor', 'mean'),
-                dep_center_mean=('dep_center', 'mean'),
+                count='size',
+                sum='sum',
+                mean='mean',
+                median='median',
+                q25=lambda s: s.quantile(0.25),
+                q75=lambda s: s.quantile(0.75),
+                min='min',
+                max='max',
             )
             .reset_index()
         )
-        interval_index = statsdf.index
-        statsdf = statsdf.merge(bin_means, on=['bin_left', 'bin_right'], how='left')
-        statsdf.index = interval_index
+
+        statsdf['bin_left'] = statsdf['ind_diff'].apply(lambda interval: interval.left)
+        statsdf['bin_right'] = statsdf['ind_diff'].apply(lambda interval: interval.right)
+        statsdf['sumsq'] = (
+            df.groupby(binsr)['dep_diff']
+            .apply(lambda s: np.square(s.to_numpy(dtype=np.float64)).sum())
+            .values
+        )
+
+        variance = statsdf['sumsq'] / statsdf['count'] - np.square(statsdf['mean'])
+        statsdf['std'] = np.sqrt(np.maximum(variance, 0.0))
+        statsdf['se'] = statsdf['std'] / np.sqrt(statsdf['count'])
+        statsdf['ci_lower'] = statsdf['mean'] - 1.96 * statsdf['se']
+        statsdf['ci_upper'] = statsdf['mean'] + 1.96 * statsdf['se']
+        statsdf['yerr_lower'] = statsdf['mean'] - statsdf['ci_lower']
+        statsdf['yerr_upper'] = statsdf['ci_upper'] - statsdf['mean']
+        statsdf['median_yerr_lower'] = statsdf['median'] - statsdf['q25']
+        statsdf['median_yerr_upper'] = statsdf['q75'] - statsdf['median']
+
+        bin_means = (
+            df.groupby(binsr)
+            .agg(
+                dep_neighbor_mean=('dep_neighbour', 'mean'),
+                dep_center_mean=('dep_centre', 'mean'),
+            )
+            .reset_index()
+        )
+        statsdf = statsdf.merge(bin_means, on='ind_diff', how='left')
+
+        intervals = pd.IntervalIndex.from_arrays(
+            statsdf['bin_left'],
+            statsdf['bin_right'],
+            closed='right',
+        )
+        statsdf = statsdf.set_index(intervals).sort_index()
 
         if relative:
-            # Convert per-bin dep_diff stats to percent relative to that bin's
-            # average dep_neighbor to avoid divide-by-zero at row level.
             eps = 1e-12
-            scale = np.where(np.abs(statsdf['dep_neighbor_mean']) > eps,
-                             100.0 / statsdf['dep_neighbor_mean'],
-                             np.nan)
+            scale = np.where(
+                np.abs(statsdf['dep_neighbor_mean']) > eps,
+                100.0 / statsdf['dep_neighbor_mean'],
+                np.nan,
+            )
             cols_to_scale = [
                 'sum', 'mean', 'median', 'q25', 'q75', 'min', 'max',
                 'std', 'se', 'ci_lower', 'ci_upper',
@@ -615,9 +841,10 @@ def load_binned_results(
             for col in cols_to_scale:
                 statsdf[col] = statsdf[col] * scale
 
-        base = os.path.basename(members_dir).replace('_binned_members_parquet', '')
-        cf = extract_coarsen_factor(base)
         dfs[cf] = statsdf
+
+    if not dfs:
+        raise ValueError(f'No valid paired/binned data available for {base_sname}')
 
     return base_sname, dfs
 
@@ -756,31 +983,6 @@ def plot_mwa_results_all(
 
     return fig, ax
 
-# ind_var_name = 'cc_loss'
-# dep_var_name = 'tmax'
-# aggregation = 'annual_mean'
-# driver_ind_var_name = 'cc_loss'
-# years = None
-# stat = 'mean'
-# area_slice = RESULTS_BBOX
-# print_summary = False
-# min_count_per_bin = 20
-# plot_resolution_corr = True
-# plot_mwa_results_all(
-#     ind_var_name=ind_var_name,
-#     dep_var_name=dep_var_name,
-#     aggregation=aggregation,
-#     driver_ind_var_name=driver_ind_var_name,
-#     years=years,
-#     stat=stat,
-#     area_slice=area_slice,
-#     print_summary=print_summary,
-#     min_count_per_bin=min_count_per_bin,
-#     plot_resolution_corr=plot_resolution_corr
-# )
-
-
-
 
 def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=None, years=None,
                    area_slice=None):
@@ -872,6 +1074,7 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=
 
 
 
+
 make_all_plots(
     ind_var_name='cc_loss',
     dep_var_name='tmax',
@@ -880,70 +1083,3 @@ make_all_plots(
     years=None,
     area_slice=RESULTS_BBOX
 )
-
-# make_all_plots(
-#     ind_var_name='forest_loss_age',
-#     dep_var_name='tmax',
-#     aggregation='annual_mean',
-#     driver_ind_var_name='forest_loss_age',
-#     years=None,
-#     area_slice=RESULTS_BBOX
-# )
-
-# make_all_plots(
-#     ind_var_name='cc_loss',
-#     dep_var_name='heatwaves_gapfilled',
-#     aggregation='annual_sum',
-#     driver_ind_var_name='cc_loss',
-#     years=None,
-#     area_slice=RESULTS_BBOX
-# )
-
-
-# #%%
-# years = None
-# dep_var_name = 'tmax'
-# ind_var_name = 'cc_loss'
-# aggregation = 'annual_mean'
-# area_slice = RESULTS_BBOX
-# driver_ind_var_name = 'cc_loss'
-# coarsen_factor = 5
-
-# sname, member_dir = resolve_member_dirs(
-#     dep_var_name=dep_var_name,
-#     ind_var_name=ind_var_name,
-#     aggregation=aggregation,
-#     driver_ind_var_name=driver_ind_var_name,
-#     coarsen_factor=coarsen_factor,
-# )
-
-# df, _ = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
-# df['bin_label'] = pd.IntervalIndex.from_arrays(df['bin_left'], df['bin_right'], closed='right')
-# #%%
-# res = {}
-# for cc_bin in range(10, 100, 10):
-#     print(cc_bin)
-#     bdf = df.loc[(df.ind_neighbor >=cc_bin) & (df.ind_neighbor < cc_bin+10)]
-#     binned = (bdf['dep_diff']).groupby(bdf.ind_diff.round(-1)).mean()
-#     # binned.index = binned.index.mid
-#     res[cc_bin] = binned
-
-
-# #%%
-# fig, ax = plt.subplots(figsize=(10, 6))
-# cmap = plt.get_cmap('viridis')
-# norm = plt.Normalize(vmin=min(res.keys()), vmax=max(res.keys()))
-# for cc_bin, binned in res.items():
-#     color = cmap(norm(cc_bin))
-#     binned.plot(ax=ax, marker='o', color=color, label=f'{cc_bin}-{cc_bin+10}')
-
-# ax.legend(title='canopy cover loss in neighbor bin (%)', bbox_to_anchor=(1.01, 1), loc='upper left')
-# ax.set_xlabel(f'canopy cover loss (%)')
-# ax.set_ylabel(f'mean difference in {dep_var_name}')
-
-# #%%
-# cdf = pd.DataFrame(res)
-# fig, ax = plt.subplots(figsize=(10, 6))
-# cdf.div(cdf.columns, axis=1).mean().plot(ax=ax)
-# ax.set_ylabel(f'mean difference in {dep_var_name} per 1% canopy cover loss')
-# ax.set_xlabel('canopy cover loss in center bin (%)')
