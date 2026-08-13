@@ -7,6 +7,7 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow
 import contextily as ctx
 from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX
 import dask.dataframe as dd
@@ -17,10 +18,15 @@ MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results_daily/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
+RESET_CACHES = False
 
 # AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
 
-IND_DIFF_THRESH = {'cc_loss':10}
+IND_DIFF_THRESH = {'cc_loss':10,
+                   'cc':10}
+
+IND_VAR_BEHAVIOUR = {'cc_loss':'centre_minus_neighbour',
+                     'cc':'neighbour_minus_centre'}
 
 top_bins = {'cc_loss': '90-100', 'forest_loss_age': '16-17'}
 
@@ -29,6 +35,7 @@ pretty = {
     'heatwaves': 'heatwaves',
     'forest_loss_age': 'forest loss age',
     'cc_loss': 'canopy cover loss',
+    'cc': 'canopy cover',
     'tmax': 'daily maximum temperature',
 }
 
@@ -36,12 +43,14 @@ units = {
     'heatwaves_gapfilled': 'days/year',
     'heatwaves': 'days/year',
     'cc_loss': '%',
+    'cc': '%',
     'tmax': '°C',
     'forest_loss_age': 'years',
 }
 
 IND_DIFF_BINS  = {
-    'cc_loss':np.arange(10, 110, 10)
+    'cc_loss':np.arange(10, 110, 10),
+    'cc':np.arange(10, 110, 10)
 }
 
 
@@ -74,9 +83,15 @@ def _join_member_partition(ind_path, dep_path, join_keys, ind_cols, dep_cols, ou
 
 
 def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
-    
+
     if aggregation == 'daily':
         raise ValueError('daily aggregation not yet supported')
+
+    if not hasattr(pyarrow, 'lib'):
+        raise RuntimeError(
+            'PyArrow did not initialize correctly; restart the kernel and verify '
+            'the PyArrow installation before reading MWA parquet members.'
+        )
     
     version_dirs = sorted(glob(os.path.join(MWA_DAILY_DIR, sname, 'version=*')))
     if not version_dirs:
@@ -144,8 +159,16 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
         df = ddf.compute(num_workers=64, memory_limit='2GB')
     df = df.dropna(how='any')
     df = df.set_index([time_dim, 'lat', 'lon'])
-    df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
-    df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+
+    behaviour = IND_VAR_BEHAVIOUR[ind_var_name]
+
+    if behaviour == 'centre_minus_neighbour':
+        df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
+        df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+    elif behaviour == 'neighbour_minus_centre':
+        df['ind_diff'] = df['ind_neighbour'] - df['ind_centre']
+        df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+
     # drop row if less than ind_diff threshold
     df = df[df['ind_diff'].abs() >= IND_DIFF_THRESH[ind_var_name]]
 
@@ -153,10 +176,11 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
 
 
 def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
-                                reset_caches=False):
+                reset_caches=None):
     """compute all dfs for all coarsen factors and cache them to parquet
        if the cache already exists then load from cache instead of recomputing"""
 
+    reset_caches = RESET_CACHES if reset_caches is None else reset_caches
 
     time_dim = 'year' if aggregation != 'daily' else 'time'
     cache_root = os.path.join(MWA_DAILY_DIR, 'paired_cache')
@@ -176,12 +200,7 @@ def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
         if os.path.isfile(cache_file):
             print(f'Loading cached paired dataframe for {sname} from {cache_file}')
             df = pd.read_parquet(cache_file)
-            # if {time_dim, 'lat', 'lon'}.issubset(df.columns):
-            #     df = df.set_index([time_dim, 'lat', 'lon'])
-            # if 'ind_diff' not in df.columns:
-            #     df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
-            # if 'dep_diff' not in df.columns:
-            #     df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+
         else:
             print(f'Computing paired dataframe for {sname} and caching to {cache_file}')
             df = load_mwa_results_file_paired(sname=sname, ind_var_name=ind_var_name,
@@ -210,8 +229,8 @@ def resolve_member_dirs(
     dep_var_name,
     ind_var_name,
     aggregation,
-    driver_ind_var_name=None,
     coarsen_factor=None,
+    reset_caches=None,
 ):
     # Compatibility shim: keep old call sites working with the new cached paired data.
     sname = build_stats_sname(dep_var_name, ind_var_name, aggregation, coarsen_factor)
@@ -219,7 +238,7 @@ def resolve_member_dirs(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        reset_caches=False,
+        reset_caches=reset_caches,
     )
     if coarsen_factor not in coarsen_dfs:
         raise KeyError(f'Coarsen factor {coarsen_factor} not available for {sname}')
@@ -308,10 +327,10 @@ def member_dir_to_df(member_source, years=None, area_slice=None):
 #%%
 
 
-dfs = load_and_cache_all_coarsens(dep_var_name='tmax', 
-                                  ind_var_name='cc_loss', 
-                                  aggregation='annual_mean',
-                                  reset_caches=False)
+# dfs = load_and_cache_all_coarsens(dep_var_name='tmax', 
+#                                   ind_var_name='cc_loss', 
+#                                   aggregation='annual_mean',
+#                                   reset_caches=False)
 
 
 
@@ -329,7 +348,6 @@ def plot_binned_results(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
     years=None,
     stat='mean',
     area_slice=None,
@@ -340,7 +358,6 @@ def plot_binned_results(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         coarsen_factor=coarsen_factor,
     )
 
@@ -444,7 +461,6 @@ def plot_map_results(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
     area_slice=None,
     ind_bin='90-100',
     show_box=False
@@ -455,7 +471,6 @@ def plot_map_results(
             dep_var_name=dep_var_name,
             ind_var_name=ind_var_name,
             aggregation=aggregation,
-            driver_ind_var_name=driver_ind_var_name,
             coarsen_factor=coarsen_factor,
         )
 
@@ -509,7 +524,6 @@ def plot_hist_results(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
     ind_bin='90-100',
     bins=np.arange(-5, 5, 0.02),
     area_slice=None,
@@ -520,7 +534,6 @@ def plot_hist_results(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         coarsen_factor=coarsen_factor,
     )
 
@@ -551,7 +564,6 @@ def plot_hexbin_results(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
     years=None,
     area_slice=None,
     normalize_by_ind_diff=True,
@@ -566,7 +578,6 @@ def plot_hexbin_results(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         coarsen_factor=coarsen_factor,
     )
 
@@ -614,7 +625,6 @@ def plot_dep_response_vs_ind_diff(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
     years=None,
     area_slice=None,
     normalize_by_ind_diff=True,
@@ -625,7 +635,6 @@ def plot_dep_response_vs_ind_diff(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         coarsen_factor=coarsen_factor,
     )
 
@@ -692,15 +701,12 @@ def plot_trend_results(
     dep_var_name,
     aggregation,
     coarsen_factor=None,
-    driver_ind_var_name=None,
-
     area_slice=None):
 
     sname, member_dir = resolve_member_dirs(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         coarsen_factor=coarsen_factor,
     )
 
@@ -729,22 +735,19 @@ def load_binned_results(
     dep_var_name,
     ind_var_name,
     aggregation,
-    driver_ind_var_name=None,
     coarsen_factor=None,
     years=None,
     area_slice=None,
     relative=False,
+    reset_caches=None,
 ):
-    if driver_ind_var_name is None:
-        driver_ind_var_name = ind_var_name
-
     base_sname = f'{dep_var_name}_{aggregation}_vs_{ind_var_name}'
 
     paired_dfs = load_and_cache_all_coarsens(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        reset_caches=False,
+        reset_caches=reset_caches,
     )
 
     time_dim = 'year' if aggregation != 'daily' else 'time'
@@ -774,9 +777,9 @@ def load_binned_results(
         if df.empty:
             continue
 
-        binsr = pd.cut(df['ind_diff'], bins)
-        statsdf = (
-            df.groupby(binsr)['dep_diff']
+        binsr = pd.cut(df['ind_diff'], bins, include_lowest=True)
+        summary = (
+            df.groupby(binsr, observed=False)['dep_diff']
             .agg(
                 count='size',
                 sum='sum',
@@ -787,40 +790,43 @@ def load_binned_results(
                 min='min',
                 max='max',
             )
+            .rename_axis('bin_interval')
             .reset_index()
         )
 
-        statsdf['bin_left'] = statsdf['ind_diff'].apply(lambda interval: interval.left)
-        statsdf['bin_right'] = statsdf['ind_diff'].apply(lambda interval: interval.right)
-        statsdf['sumsq'] = (
-            df.groupby(binsr)['dep_diff']
+        summary['bin_left'] = summary['bin_interval'].map(lambda interval: float(interval.left))
+        summary['bin_right'] = summary['bin_interval'].map(lambda interval: float(interval.right))
+        summary['sumsq'] = (
+            df.groupby(binsr, observed=False)['dep_diff']
             .apply(lambda s: np.square(s.to_numpy(dtype=np.float64)).sum())
-            .values
+            .reindex(summary['bin_interval'])
+            .to_numpy()
         )
 
-        variance = statsdf['sumsq'] / statsdf['count'] - np.square(statsdf['mean'])
-        statsdf['std'] = np.sqrt(np.maximum(variance, 0.0))
-        statsdf['se'] = statsdf['std'] / np.sqrt(statsdf['count'])
-        statsdf['ci_lower'] = statsdf['mean'] - 1.96 * statsdf['se']
-        statsdf['ci_upper'] = statsdf['mean'] + 1.96 * statsdf['se']
-        statsdf['yerr_lower'] = statsdf['mean'] - statsdf['ci_lower']
-        statsdf['yerr_upper'] = statsdf['ci_upper'] - statsdf['mean']
-        statsdf['median_yerr_lower'] = statsdf['median'] - statsdf['q25']
-        statsdf['median_yerr_upper'] = statsdf['q75'] - statsdf['median']
+        variance = summary['sumsq'] / summary['count'] - np.square(summary['mean'])
+        summary['std'] = np.sqrt(np.maximum(variance, 0.0))
+        summary['se'] = summary['std'] / np.sqrt(summary['count'])
+        summary['ci_lower'] = summary['mean'] - 1.96 * summary['se']
+        summary['ci_upper'] = summary['mean'] + 1.96 * summary['se']
+        summary['yerr_lower'] = summary['mean'] - summary['ci_lower']
+        summary['yerr_upper'] = summary['ci_upper'] - summary['mean']
+        summary['median_yerr_lower'] = summary['median'] - summary['q25']
+        summary['median_yerr_upper'] = summary['q75'] - summary['median']
 
         bin_means = (
-            df.groupby(binsr)
+            df.groupby(binsr, observed=False)
             .agg(
                 dep_neighbor_mean=('dep_neighbour', 'mean'),
                 dep_center_mean=('dep_centre', 'mean'),
             )
+            .rename_axis('bin_interval')
             .reset_index()
         )
-        statsdf = statsdf.merge(bin_means, on='ind_diff', how='left')
+        statsdf = summary.merge(bin_means, on='bin_interval', how='left')
 
         intervals = pd.IntervalIndex.from_arrays(
-            statsdf['bin_left'],
-            statsdf['bin_right'],
+            statsdf['bin_left'].to_numpy(dtype=float),
+            statsdf['bin_right'].to_numpy(dtype=float),
             closed='right',
         )
         statsdf = statsdf.set_index(intervals).sort_index()
@@ -853,7 +859,6 @@ def plot_mwa_results_all(
     ind_var_name,
     dep_var_name,
     aggregation,
-    driver_ind_var_name=None,
     years=None,
     stat='mean',
     area_slice=None,
@@ -862,15 +867,16 @@ def plot_mwa_results_all(
     plot_resolution_corr=True,
     relative=False,
     print_stats=False,
+    reset_caches=None,
 ):
     sname, dfs = load_binned_results(
         dep_var_name=dep_var_name,
         ind_var_name=ind_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         years=years,
         area_slice=area_slice,
         relative=relative,
+        reset_caches=reset_caches,
     )
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
@@ -984,14 +990,13 @@ def plot_mwa_results_all(
     return fig, ax
 
 
-def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=None, years=None,
-                   area_slice=None):
+def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
+                   area_slice=None, reset_caches=None):
 
     # plot_hist_results(
     #     ind_var_name=ind_var_name,
     #     dep_var_name=dep_var_name,
     #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
     #     area_slice=area_slice,
     #     ind_bin=top_bins[ind_var_name],
     # )
@@ -1001,7 +1006,6 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=
         ind_var_name=ind_var_name,
         dep_var_name=dep_var_name,
         aggregation=aggregation,
-        driver_ind_var_name=driver_ind_var_name,
         years=years,
         stat='mean',
         area_slice=area_slice,
@@ -1009,7 +1013,8 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=
         print_summary=True,
         min_count_per_bin=20,
         relative=False,
-        print_stats=True
+        print_stats=True,
+        reset_caches=reset_caches,
     )
 
 
@@ -1075,11 +1080,19 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, driver_ind_var_name=
 
 
 
+# make_all_plots(
+#     ind_var_name='cc_loss',
+#     dep_var_name='tmax',
+#     aggregation='annual_mean',
+#     driver_ind_var_name='cc_loss',
+#     years=None,
+#     area_slice=RESULTS_BBOX
+# )
+
 make_all_plots(
-    ind_var_name='cc_loss',
+    ind_var_name='cc',
     dep_var_name='tmax',
     aggregation='annual_mean',
-    driver_ind_var_name='cc_loss',
     years=None,
     area_slice=RESULTS_BBOX
 )

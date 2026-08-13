@@ -18,9 +18,31 @@ from dask import delayed
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 
 SPATH_SUFFIX = None
-USE_DASK_DASHBOARD = True
+USE_DASK_DASHBOARD = False
 SEASON_MAP = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5], 'JJA': [6, 7, 8], 'SON': [9, 10, 11]}
 NEIGHBOUR_MAP_FILL_VALUE = np.int8(-128)
+
+
+def _ind_var_behaviour(ind_var_name):
+    if ind_var_name == 'cc':
+        return {
+            'center_mask_mode': 'loss_anytime',
+            'diff_direction': 'neighbour_minus_center',
+        }
+    return {
+        'center_mask_mode': 'none',
+        'diff_direction': 'center_minus_neighbour',
+    }
+
+
+def _build_center_valid_mask(ind_var, ind_var_name):
+    behaviour = _ind_var_behaviour(ind_var_name)
+    if behaviour['center_mask_mode'] == 'loss_anytime':
+        # Canopy cover is monotonic, so first-last difference gives change mask cheaply.
+        loss_any = (ind_var.isel(year=0) - ind_var.isel(year=-1)) > 0
+        return loss_any.broadcast_like(ind_var)
+
+    return xr.ones_like(ind_var, dtype=bool)
 
 def _load_single_ind_var(ind_var_name):
 
@@ -41,8 +63,9 @@ def _load_single_ind_var(ind_var_name):
         ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
         ds = ds.astype(np.float32)
         tc = ds['tree_cover']
-        tc_loss = -(tc - tc[0])
-        ind_var = tc.where(tc_loss > 0)
+        ind_var = tc.loc[{'time': slice('2003', '2020')}]
+        ind_var = ind_var.rename({'time': 'year'})
+        ind_var.name = ind_var_name
         return ind_var
     
     if ind_var_name == 'cc_loss_era5grid':
@@ -94,8 +117,9 @@ def load_ind_dep_data(ind_var_name, dep_var_name):
     return ind_var, dep_var
 
 @njit
-def _mwa_kernel(block, window_radius):
+def _mwa_kernel(block, center_valid_block, window_radius, use_neighbour_minus_center):
     ind = block
+    center_valid = center_valid_block
     wr = window_radius
 
     t_size = ind.shape[0]
@@ -105,6 +129,7 @@ def _mwa_kernel(block, window_radius):
     out = np.full((2, t_size, h_size, w_size), NEIGHBOUR_MAP_FILL_VALUE, dtype=np.int8)
 
     center_ind = ind[:, wr:wr+h_size, wr:wr+w_size]
+    center_is_valid = center_valid[:, wr:wr+h_size, wr:wr+w_size] > 0
 
     max_ind_diff = np.full((t_size, h_size, w_size), np.float32(-np.inf), dtype=np.float32)
     max_ind_diff_ioffset = np.full((t_size, h_size, w_size), NEIGHBOUR_MAP_FILL_VALUE, dtype=np.int8)
@@ -117,22 +142,29 @@ def _mwa_kernel(block, window_radius):
             ri, rj = wr + di, wr + dj
 
             n_ind = ind[:, ri:ri+h_size, rj:rj+w_size]
-            ind_diff = center_ind - n_ind
+            if use_neighbour_minus_center:
+                ind_diff = n_ind - center_ind
+            else:
+                ind_diff = center_ind - n_ind
 
             better = ind_diff > max_ind_diff
             max_ind_diff = np.where(better, ind_diff, max_ind_diff)
             max_ind_diff_ioffset = np.where(better, np.int8(di), max_ind_diff_ioffset)
             max_ind_diff_joffset = np.where(better, np.int8(dj), max_ind_diff_joffset)
 
-    valid = max_ind_diff > 0
+    valid = (max_ind_diff > 0) & center_is_valid
 
     out[0] = np.where(valid, max_ind_diff_ioffset, NEIGHBOUR_MAP_FILL_VALUE)
     out[1] = np.where(valid, max_ind_diff_joffset, NEIGHBOUR_MAP_FILL_VALUE)
 
     return out
 
-def _get_mwa_neighbour_map(ind_var, ind_var_name, window_radius, sname):
-    spath = os.path.join(MWA_DAILY_DIR, f'neighbour_maps/{sname}.zarr')
+def _get_mwa_neighbour_map(ind_var, center_valid_mask, ind_var_name, window_radius, sname):
+    behaviour = _ind_var_behaviour(ind_var_name)
+    diff_dir = behaviour['diff_direction']
+    center_mask_mode = behaviour['center_mask_mode']
+    map_tag = f"{sname}__dir-{diff_dir}__cmask-{center_mask_mode}"
+    spath = os.path.join(MWA_DAILY_DIR, f'neighbour_maps/{map_tag}.zarr')
     if os.path.exists(spath):
         print(f"Neighbour map zarr already exists for {sname}.\nLoading from {spath}.")
         neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
@@ -150,13 +182,20 @@ def _get_mwa_neighbour_map(ind_var, ind_var_name, window_radius, sname):
         )
 
     ind_arr = ind_var.data
+    center_valid_arr = center_valid_mask.astype(np.int8).data
+    use_neighbour_minus_center = diff_dir == 'neighbour_minus_center'
 
     neighbour_maps = da.map_overlap(
         _mwa_kernel,
         ind_arr,
+        center_valid_arr,
         window_radius=window_radius,
-        depth={0: 0, 1: window_radius, 2: window_radius},
-        boundary=np.nan,
+        use_neighbour_minus_center=use_neighbour_minus_center,
+        depth=[
+            {0: 0, 1: window_radius, 2: window_radius},
+            {0: 0, 1: window_radius, 2: window_radius},
+        ],
+        boundary=[np.nan, 0],
         trim=False,
         dtype=np.int8,
         new_axis=0,
@@ -347,7 +386,8 @@ def gather_mwa_results(ind_var, dep_var, neighbour_maps, ind_var_name, dep_var_n
 def moving_window_analysis(ind_var, dep_var, window_radius, ind_var_name, dep_var_name, sname):
     """Moving-window analysis on (time, lat, lon) inputs."""
 
-    neighbour_maps = _get_mwa_neighbour_map(ind_var, ind_var_name, window_radius, sname)['neighbour_maps']
+    center_valid_mask = _build_center_valid_mask(ind_var, ind_var_name)
+    neighbour_maps = _get_mwa_neighbour_map(ind_var, center_valid_mask, ind_var_name, window_radius, sname)['neighbour_maps']
     ind_results_ds, dep_results_ds = gather_mwa_results(
         ind_var=ind_var,
         dep_var=dep_var,
@@ -539,7 +579,8 @@ def _expected_version_count(coarsen_factor):
     return 1 + num_offsets
 
 
-def _write_run_metadata(out_root, sname, coarsen_factor, dep_var_agg, expected_versions):
+def _write_run_metadata(out_root, sname, coarsen_factor, dep_var_agg, expected_versions, ind_var_name):
+    behaviour = _ind_var_behaviour(ind_var_name)
     completed_versions = [
         idx for idx in range(expected_versions)
         if _has_complete_version_members(out_root, idx)
@@ -548,6 +589,8 @@ def _write_run_metadata(out_root, sname, coarsen_factor, dep_var_agg, expected_v
         'sname': sname,
         'coarsen_factor': coarsen_factor,
         'dep_var_agg': dep_var_agg,
+        'ind_var_name': ind_var_name,
+        'ind_var_behavior': behaviour,
         'expected_versions': expected_versions,
         'completed_versions': completed_versions,
         'complete': len(completed_versions) == expected_versions,
@@ -666,6 +709,7 @@ def calc_moving_window(ind_var, dep_var, ind_var_name, dep_var_name,
         coarsen_factor=coarsen_factor,
         dep_var_agg=dep_var_agg,
         expected_versions=expected_versions,
+        ind_var_name=ind_var_name,
     )
 
 
@@ -746,7 +790,9 @@ if __name__ == "__main__":
     
     with local_cluster(n_workers=32, threads_per_worker=1, memory_limit='20GB',
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
-        run_mwa_coarsen_loop(ind_var_name='cc_loss', dep_var_agg='annual_mean',
+        # run_mwa_coarsen_loop(ind_var_name='cc_loss', dep_var_agg='annual_mean',
+        #                      dep_var_name='tmax', client=client)
+        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
                              dep_var_name='tmax', client=client)
         # run_mwa_coarsen_loop(ind_var_name='forest_loss_age', dep_var_agg='annual_mean',
         #                     dep_var_name='tmax', client=client)
