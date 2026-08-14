@@ -35,7 +35,5 @@ HEATWAVE_DAY_THRESH = 3
 
 # binning used in mwa_bin*.py
 IND_VAR_BINS = {
-    'cc_loss': np.arange(10, 110, 10),
-    'cc_loss_era5grid': np.arange(10, 110, 10),
-    'forest_loss_age': np.arange(0, 18, 1),
+    'cc': np.arange(10, 110, 10),
 }
