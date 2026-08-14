@@ -13,6 +13,7 @@ from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX
 import dask.dataframe as dd
 from dask import delayed
 from dask.diagnostics import ProgressBar
+from functools import lru_cache
 
 MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results_daily/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
@@ -22,19 +23,13 @@ RESET_CACHES = False
 
 # AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
 
-IND_DIFF_THRESH = {'cc_loss':10,
-                   'cc':10}
+IND_DIFF_THRESH = 10
 
-IND_VAR_BEHAVIOUR = {'cc_loss':'centre_minus_neighbour',
-                     'cc':'neighbour_minus_centre'}
-
-top_bins = {'cc_loss': '90-100', 'forest_loss_age': '16-17'}
+top_bins = {'cc': '90-100'}
 
 pretty = {
     'heatwaves_gapfilled': 'gap-filled heatwaves',
     'heatwaves': 'heatwaves',
-    'forest_loss_age': 'forest loss age',
-    'cc_loss': 'canopy cover loss',
     'cc': 'canopy cover',
     'tmax': 'daily maximum temperature',
 }
@@ -42,14 +37,11 @@ pretty = {
 units = {
     'heatwaves_gapfilled': 'days/year',
     'heatwaves': 'days/year',
-    'cc_loss': '%',
     'cc': '%',
     'tmax': '°C',
-    'forest_loss_age': 'years',
 }
 
 IND_DIFF_BINS  = {
-    'cc_loss':np.arange(10, 110, 10),
     'cc':np.arange(10, 110, 10)
 }
 
@@ -62,10 +54,13 @@ def build_stats_sname(
     coarsen_factor=None,
 ):
 
-    sname = f'{dep_var_name}_{aggregation}_vs_{ind_var_name}_'
+    if ind_var_name != 'cc':
+        raise ValueError("MWA plotting supports only ind_var_name='cc'.")
+
+    sname = f'{dep_var_name}_{aggregation}_vs_cc'
     if coarsen_factor is not None:
-        sname += f'coarsened{coarsen_factor}_'
-    sname += 'mwa_members_parquet'
+        sname += f'_coarsened{coarsen_factor}'
+    sname += '_mwa_members_parquet'
 
     
     return sname
@@ -160,21 +155,18 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
     df = df.dropna(how='any')
     df = df.set_index([time_dim, 'lat', 'lon'])
 
-    behaviour = IND_VAR_BEHAVIOUR[ind_var_name]
+    if ind_var_name != 'cc':
+        raise ValueError("MWA plotting supports only ind_var_name='cc'.")
 
-    if behaviour == 'centre_minus_neighbour':
-        df['ind_diff'] = df['ind_centre'] - df['ind_neighbour']
-        df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
-    elif behaviour == 'neighbour_minus_centre':
-        df['ind_diff'] = df['ind_neighbour'] - df['ind_centre']
-        df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
+    df['ind_diff'] = df['ind_neighbour'] - df['ind_centre']
+    df['dep_diff'] = df['dep_centre'] - df['dep_neighbour']
 
     # drop row if less than ind_diff threshold
-    df = df[df['ind_diff'].abs() >= IND_DIFF_THRESH[ind_var_name]]
+    df = df[df['ind_diff'] >= IND_DIFF_THRESH]
 
     return df
 
-
+@lru_cache(maxsize=128)
 def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
                 reset_caches=None):
     """compute all dfs for all coarsen factors and cache them to parquet
@@ -245,6 +237,7 @@ def resolve_member_dirs(
     return sname, coarsen_dfs[coarsen_factor]
 
 
+@lru_cache(maxsize=128)
 def member_dir_to_df(member_source, years=None, area_slice=None):
     # Compatibility shim: accepts either a DataFrame (new path) or parquet path (legacy path).
     if isinstance(member_source, pd.DataFrame):
@@ -261,8 +254,8 @@ def member_dir_to_df(member_source, years=None, area_slice=None):
         df['dep_center'] = df['dep_centre']
     if 'ind_neighbor' not in df.columns and 'ind_neighbour' in df.columns:
         df['ind_neighbor'] = df['ind_neighbour']
-    if 'ind_center' not in df.columns and 'ind_centre' in df.columns:
-        df['ind_center'] = df['ind_centre']
+    if 'ind_centre' not in df.columns and 'ind_centre' in df.columns:
+        df['ind_centre'] = df['ind_centre']
 
     time_col = 'year' if 'year' in df.columns else 'time'
     if years is not None and time_col in df.columns:
@@ -278,7 +271,7 @@ def member_dir_to_df(member_source, years=None, area_slice=None):
         ]
 
     if 'bin_left' not in df.columns or 'bin_right' not in df.columns:
-        intervals = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc_loss'])
+        intervals = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc'])
         df['bin_left'] = intervals.map(lambda iv: iv.left if pd.notna(iv) else np.nan)
         df['bin_right'] = intervals.map(lambda iv: iv.right if pd.notna(iv) else np.nan)
         df['bin_label'] = intervals.astype(str)
@@ -347,6 +340,8 @@ def plot_binned_results(
     ind_var_name,
     dep_var_name,
     aggregation,
+    dfs,
+    sname,
     coarsen_factor=None,
     years=None,
     stat='mean',
@@ -354,27 +349,9 @@ def plot_binned_results(
     relative=False,
     print_stats=False,
 ):
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        coarsen_factor=coarsen_factor,
-    )
 
-    df, statsdf = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
-
-    bin_means = (
-        df.groupby(['bin_left', 'bin_right'])
-        .agg(
-            dep_neighbor_mean=('dep_neighbor', 'mean'),
-            dep_center_mean=('dep_center', 'mean'),
-        )
-        .reset_index()
-    )
-    interval_index = statsdf.index
-    statsdf = statsdf.merge(bin_means, on=['bin_left', 'bin_right'], how='left')
-    statsdf.index = interval_index
-
+    statsdf = dfs[coarsen_factor].copy()
+    
     if relative:
         # Convert per-bin dep_diff stats to percent relative to that bin's
         # average dep_neighbor to avoid row-level divide-by-zero blowups.
@@ -460,6 +437,8 @@ def plot_map_results(
     ind_var_name,
     dep_var_name,
     aggregation,
+    paired_dfs,
+    sname,
     coarsen_factor=None,
     area_slice=None,
     ind_bin='90-100',
@@ -467,19 +446,13 @@ def plot_map_results(
 ):
 
 
-    sname, member_dir = resolve_member_dirs(
-            dep_var_name=dep_var_name,
-            ind_var_name=ind_var_name,
-            aggregation=aggregation,
-            coarsen_factor=coarsen_factor,
-        )
-
-    df, _ = member_dir_to_df(member_dir, years=None)
+    df = paired_dfs[coarsen_factor].copy()
     df['lon'] = df['lon'].round(0)
     df['lat'] = df['lat'].round(0)
+    df['bin_left'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
     # select canopy cover loss bin
     interval = pd.Interval(left=int(ind_bin.split('-')[0]), right=int(ind_bin.split('-')[1]), closed='right')
-    df = df[df['bin_label'] == str(interval)]
+    df = df[df['bin_left'] == interval.left]
     # take mean across years
     mdf = df.groupby(['lat', 'lon'])['dep_diff'].mean()
     cdf = df.groupby(['lat', 'lon'])['dep_diff'].count()
@@ -523,6 +496,8 @@ def plot_hist_results(
     ind_var_name,
     dep_var_name,
     aggregation,
+    paired_dfs,
+    sname,
     coarsen_factor=None,
     ind_bin='90-100',
     bins=np.arange(-5, 5, 0.02),
@@ -530,15 +505,10 @@ def plot_hist_results(
 
 ):
 
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        coarsen_factor=coarsen_factor,
-    )
+    df = paired_dfs[coarsen_factor].copy()
+    df['bin_left'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
+    df['bin_right'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.right) if pd.notna(interval) else np.nan)
 
-    df, _ = member_dir_to_df(member_dir, years=None, area_slice=area_slice)
-    
     # convert string to interval
     bin_left, bin_right = map(int, ind_bin.split('-'))
     bdf = df.where(df['bin_left'] == bin_left).where(df['bin_right'] == bin_right).dropna()
@@ -566,6 +536,8 @@ def plot_hexbin_results(
     coarsen_factor=None,
     years=None,
     area_slice=None,
+    paired_dfs=None,
+    sname=None,
     normalize_by_ind_diff=True,
     gridsize=30,
     cmap='viridis',
@@ -574,24 +546,19 @@ def plot_hexbin_results(
     vmin=None,
     vmax=None,
 ):
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        coarsen_factor=coarsen_factor,
-    )
 
-    df, _ = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
+
+    df = paired_dfs[coarsen_factor].copy()
     if normalize_by_ind_diff:
         valid = df['ind_diff'] != 0
         cvals = (df.loc[valid, 'dep_diff'] / df.loc[valid, 'ind_diff']).to_numpy()
-        xvals = df.loc[valid, 'ind_center'].to_numpy()
-        yvals = df.loc[valid, 'ind_neighbor'].to_numpy()
+        xvals = df.loc[valid, 'ind_centre'].to_numpy()
+        yvals = df.loc[valid, 'ind_neighbour'].to_numpy()
 
     else:
         cvals = df['dep_diff'].to_numpy()
-        xvals = df['ind_center'].to_numpy()
-        yvals = df['ind_neighbor'].to_numpy()
+        xvals = df['ind_centre'].to_numpy()
+        yvals = df['ind_neighbour'].to_numpy()
 
 
     fig, ax = plt.subplots(figsize=(9, 8))
@@ -608,7 +575,7 @@ def plot_hexbin_results(
     )
     plt.colorbar(hb, ax=ax, label=f'{pretty[dep_var_name]} difference per 1% {pretty[ind_var_name]}', orientation='vertical')
     ax.set_xlabel(f'{pretty[ind_var_name]} in centre bin [%]', fontsize=12)
-    ax.set_ylabel(f'{pretty["cc_loss"]} in neighbor bin [%]', fontsize=12)
+    ax.set_ylabel(f'{pretty[ind_var_name]} in neighbor bin [%]', fontsize=12)
 
     norm_label = 'normalized' if normalize_by_ind_diff else 'raw'
     ax.set_title(
@@ -624,21 +591,18 @@ def plot_dep_response_vs_ind_diff(
     ind_var_name,
     dep_var_name,
     aggregation,
+    sname,
     coarsen_factor=None,
     years=None,
     area_slice=None,
     normalize_by_ind_diff=True,
+    paired_dfs=None,
     round_digits=0,
     xbin_cutoff=10,
 ):
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        coarsen_factor=coarsen_factor,
-    )
 
-    df, _ = member_dir_to_df(member_dir, years=years, area_slice=area_slice)
+
+    df = paired_dfs[coarsen_factor].copy()
     if normalize_by_ind_diff:
         valid = df['ind_diff'] != 0
         response = df.loc[valid, 'dep_diff'] / df.loc[valid, 'ind_diff']
@@ -673,46 +637,28 @@ def plot_dep_response_vs_ind_diff(
     fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_dep_response_vs_ind_diff.png'), dpi=400, bbox_inches='tight')
     return fig, ax, summary
 
-# ind_var_name = 'cc_loss'
-# dep_var_name = 'tmax'
-# aggregation = 'annual_mean'
-# coarsen_factor = None
-# driver_ind_var_name = 'cc_loss'
-# years = None
-# area_slice = RESULTS_BBOX
-# normalize_by_ind_diff = True
-# round_digits = 0
-# xbin_cutoff = 10
-# plot_dep_response_vs_ind_diff(
-#     ind_var_name=ind_var_name,
-#     dep_var_name=dep_var_name,
-#     aggregation=aggregation,
-#     coarsen_factor=coarsen_factor,
-#     driver_ind_var_name=driver_ind_var_name,
-#     years=years,
-#     area_slice=area_slice,
-#     normalize_by_ind_diff=normalize_by_ind_diff,
-#     round_digits=round_digits,
-#     xbin_cutoff=xbin_cutoff,
-# )
 
 def plot_trend_results(
     ind_var_name,
     dep_var_name,
     aggregation,
+    years,
+    sname,
+    paired_dfs,
     coarsen_factor=None,
     area_slice=None):
 
-    sname, member_dir = resolve_member_dirs(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        coarsen_factor=coarsen_factor,
-    )
 
-    df, _ = member_dir_to_df(member_dir, years=None, area_slice=area_slice)
-    # make interval columns from bin_left and bin_right
-    df['bin_interval'] = pd.IntervalIndex.from_arrays(df['bin_left'], df['bin_right'], closed='right')
+
+    df = paired_dfs[coarsen_factor].copy()
+    # slice by area slice
+    if area_slice is not None:
+        df = df[
+            (df['lon'] >= area_slice['westlimit']) &
+            (df['lon'] <= area_slice['eastlimit']) &
+            (df['lat'] >= area_slice['southlimit']) &
+            (df['lat'] <= area_slice['northlimit'])
+        ]
     
     # group by year and compute the mean of dep_diff
     dep_per_ccloss = df['dep_diff'] / df['ind_diff']
@@ -724,7 +670,7 @@ def plot_trend_results(
     ax.set_ylabel(f'mean {pretty[dep_var_name]} response per % {pretty[ind_var_name]}', fontsize=12)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.set_title(f'{pretty[dep_var_name]} ({aggregation.replace("_", " ")}) vs {pretty[ind_var_name]} \n coarsen_factor: {coarsen_factor}')
-    ax.set_xticks(range(int(trend_df.index.min()), int(trend_df.index.max()) + 1, 3))
+    # ax.set_xticks(range(int(trend_df.index.min()), int(trend_df.index.max()) + 1, 3))
 
     fig.savefig(os.path.join(MWA_FIGDIR, f'{sname}_trend.png'), dpi=400, bbox_inches='tight')
     return fig, ax  
@@ -859,6 +805,8 @@ def plot_mwa_results_all(
     ind_var_name,
     dep_var_name,
     aggregation,
+    sname,
+    dfs,
     years=None,
     stat='mean',
     area_slice=None,
@@ -869,15 +817,6 @@ def plot_mwa_results_all(
     print_stats=False,
     reset_caches=None,
 ):
-    sname, dfs = load_binned_results(
-        dep_var_name=dep_var_name,
-        ind_var_name=ind_var_name,
-        aggregation=aggregation,
-        years=years,
-        area_slice=area_slice,
-        relative=relative,
-        reset_caches=reset_caches,
-    )
 
     cfs = sorted(dfs.keys(), key=lambda value: -1 if value is None else value)
     if not cfs:
@@ -943,7 +882,7 @@ def plot_mwa_results_all(
 
     xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in sorted_bins]
 
-    ax.set_xlabel(f'{pretty[ind_var_name]} bin [{units["cc_loss"]}]', fontsize=12)
+    ax.set_xlabel(f'{pretty[ind_var_name]} bin [{units[ind_var_name]}]', fontsize=12)
     if relative:
         ax.set_ylabel(f'mean relative difference in {pretty[dep_var_name]} [%]', fontsize=12)
     else:
@@ -993,13 +932,32 @@ def plot_mwa_results_all(
 def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
                    area_slice=None, reset_caches=None):
 
-    # plot_hist_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     area_slice=area_slice,
-    #     ind_bin=top_bins[ind_var_name],
-    # )
+    paired_dfs = load_and_cache_all_coarsens(
+        dep_var_name=dep_var_name,
+        ind_var_name=ind_var_name,
+        aggregation=aggregation,
+        reset_caches=reset_caches,
+    )
+
+    sname, dfs = load_binned_results(
+            dep_var_name=dep_var_name,
+            ind_var_name=ind_var_name,
+            aggregation=aggregation,
+            years=years,
+            area_slice=area_slice,
+            reset_caches=reset_caches,
+        )
+
+    plot_hist_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        sname=sname,
+        paired_dfs=paired_dfs,
+        coarsen_factor=None,
+        aggregation=aggregation,
+        area_slice=area_slice,
+        ind_bin=top_bins[ind_var_name],
+    )
 
 
     plot_mwa_results_all(
@@ -1007,6 +965,8 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
         dep_var_name=dep_var_name,
         aggregation=aggregation,
         years=years,
+        sname=sname,
+        dfs=dfs,
         stat='mean',
         area_slice=area_slice,
         plot_resolution_corr=False,
@@ -1018,81 +978,89 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
     )
 
 
-    # plot_binned_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
-    #     years=years,
-    #     stat='mean',
-    #     area_slice=area_slice,
-    #     relative=False,
-    #     print_stats=True
-    # )
+    plot_binned_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        stat='mean',
+        dfs=dfs,
+        sname=sname,
+        area_slice=area_slice,
+        relative=False,
+        print_stats=True
+    )
 
-    # plot_dep_response_vs_ind_diff(
+    plot_dep_response_vs_ind_diff(
+        paired_dfs=paired_dfs,
+        sname=sname,
+        coarsen_factor=None,
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        area_slice=area_slice,
+        normalize_by_ind_diff=True,
+        round_digits=0,
 
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
-    #     years=years,
-    #     area_slice=area_slice,
-    #     normalize_by_ind_diff=True,
-    #     round_digits=0,
+    )
 
-    # )
+    plot_map_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        ind_bin=top_bins[ind_var_name],
+        show_box=True,
+        area_slice=area_slice,
+    )
 
-    # plot_map_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
-    #     ind_bin=top_bins[ind_var_name],
-    #     show_box=True,
-    #     area_slice=area_slice
-    # )
+    plot_trend_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        area_slice=area_slice,
+        years=years,
+        coarsen_factor=None
+    )
 
-    # plot_trend_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
-    #     area_slice=area_slice,
-    # )
+    plot_hexbin_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        sname=sname,
+        paired_dfs=paired_dfs,
+        coarsen_factor=None,
+        years=years,
+        area_slice=area_slice,
+        normalize_by_ind_diff=True,
+        gridsize=30,
+        cmap='viridis',
+        reduce_C_function=np.mean,
+        mincnt=1000,
+        vmin=None,
+        vmax=None,
+    )   
 
-    # plot_hexbin_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     driver_ind_var_name=driver_ind_var_name,
-    #     years=years,
-    #     area_slice=area_slice,
-    #     normalize_by_ind_diff=True,
-    #     gridsize=30,
-    #     cmap='viridis',
-    #     reduce_C_function=np.mean,
-    #     mincnt=1000,
-    #     vmin=None,
-    #     vmax=None,
-    # )   
 
 
 
 
 # make_all_plots(
-#     ind_var_name='cc_loss',
+#     ind_var_name='cc',
 #     dep_var_name='tmax',
 #     aggregation='annual_mean',
-#     driver_ind_var_name='cc_loss',
 #     years=None,
 #     area_slice=RESULTS_BBOX
 # )
 
 make_all_plots(
     ind_var_name='cc',
-    dep_var_name='tmax',
-    aggregation='annual_mean',
+    dep_var_name='heatwaves_gapfilled',
+    aggregation='annual_sum',
     years=None,
     area_slice=RESULTS_BBOX
 )

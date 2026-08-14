@@ -26,13 +26,14 @@ import contextily as ctx
 ind_var_name = 'cc'
 dep_var_name = 'tmax'
 
-ind, dep = load_ind_dep_data(ind_var_name=ind_var_name, dep_var_name=dep_var_name)
+ind, cc_loss, dep = load_ind_dep_data(ind_var_name=ind_var_name, dep_var_name=dep_var_name,
+                             include_cc_loss=True)
 dep = aggregate_dependent_variable(dep, 'annual_mean')
-dss = _generate_coarsened_versions(ind, dep, coarsen_factor=25)
+dss = _generate_coarsened_versions(ind, cc_loss, dep, coarsen_factor=10)
 #%%
-year = 2015; lat = 2.92; lon = -75.33
+year = 2020; lat = -11.305; lon = -56.305
 
-for ind_da, dep_da in dss:
+for ind_da, cc_loss_da, dep_da in dss:
     if (lat in ind_da.lat.round(2)) and (lon in ind_da.lon.round(2)):
         print('found version with coords')
         break
