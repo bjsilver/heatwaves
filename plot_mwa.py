@@ -21,6 +21,13 @@ MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 RESET_CACHES = False
 
+# 2. Grab the CartoDB provider template
+provider = ctx.providers.CartoDB.Positron
+
+# 3. Manually inject your CARTO API key into the URL string
+my_api_key = "cb1_2q9j_1_b5df218aa14cb6ba27b06227"
+provider["url"] = provider["url"] + f"?key={my_api_key}"
+
 # AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
 
 IND_DIFF_THRESH = 10
@@ -32,6 +39,7 @@ pretty = {
     'heatwaves': 'heatwaves',
     'cc': 'canopy cover',
     'tmax': 'daily maximum temperature',
+    'tmax_era5': 'daily maximum temperature (ERA5)',
 }
 
 units = {
@@ -39,12 +47,8 @@ units = {
     'heatwaves': 'days/year',
     'cc': '%',
     'tmax': '°C',
+    'tmax_era5': '°C',
 }
-
-IND_DIFF_BINS  = {
-    'cc':np.arange(10, 110, 10)
-}
-
 
 
 def build_stats_sname(
@@ -211,7 +215,8 @@ def bin_df(dfs):
     for coarsen_factor in COARSEN_FACTORS:
         df = dfs[coarsen_factor].set_index(['year', 'lat', 'lon']).sort_index()
         # calculate the mean dep_value for each bin of ind_diff
-        binsr = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc_loss'])
+        # Use the IND_VAR_BINS to define the bins
+        binsr = pd.cut(df['ind_diff'], IND_VAR_BINS['cc_loss'])
         binned = df.groupby(binsr)['dep_diff'].agg(['mean', 'count', 'std']).reset_index()
         bdfs[coarsen_factor] = binned
     return bdfs
@@ -271,7 +276,7 @@ def member_dir_to_df(member_source, years=None, area_slice=None):
         ]
 
     if 'bin_left' not in df.columns or 'bin_right' not in df.columns:
-        intervals = pd.cut(df['ind_diff'], IND_DIFF_BINS['cc'])
+        intervals = pd.cut(df['ind_diff'], IND_VAR_BINS['cc'])
         df['bin_left'] = intervals.map(lambda iv: iv.left if pd.notna(iv) else np.nan)
         df['bin_right'] = intervals.map(lambda iv: iv.right if pd.notna(iv) else np.nan)
         df['bin_label'] = intervals.astype(str)
@@ -317,7 +322,6 @@ def member_dir_to_df(member_source, years=None, area_slice=None):
 
 
 
-#%%
 
 
 # dfs = load_and_cache_all_coarsens(dep_var_name='tmax', 
@@ -351,7 +355,8 @@ def plot_binned_results(
 ):
 
     statsdf = dfs[coarsen_factor].copy()
-    
+    statsdf = statsdf.loc[~(statsdf['count']<1)]
+    breakpoint()
     if relative:
         # Convert per-bin dep_diff stats to percent relative to that bin's
         # average dep_neighbor to avoid row-level divide-by-zero blowups.
@@ -378,6 +383,8 @@ def plot_binned_results(
         out = pd.DataFrame({
             'bin': [f'{int(interval.left)}-{int(interval.right)}' for interval in statsdf.index],
             'y': statsdf[stat].values,
+            'y_ci95_lower': statsdf['ci_lower'].values,
+            'y_ci95_upper': statsdf['ci_upper'].values,
             'std': statsdf['std'].values,
             'count': statsdf['count'].values,
             'dep_neighbor_mean': statsdf['dep_neighbor_mean'].values,
@@ -386,34 +393,40 @@ def plot_binned_results(
         print(out.to_string(index=False))
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    plot_kwargs = {'ax': ax, 'color': 'steelblue'}
+
+    plot_kwargs = {'ax': ax, 'color': 'black', 'marker': 'o',
+                'capsize': 0}
     if stat == 'mean':
         plot_kwargs['yerr'] = [statsdf['yerr_lower'], statsdf['yerr_upper']]
-        plot_kwargs['capsize'] = 4
     elif stat == 'median':
         plot_kwargs['yerr'] = [statsdf['median_yerr_lower'], statsdf['median_yerr_upper']]
-        plot_kwargs['capsize'] = 4
-    statsdf[stat].plot.bar(**plot_kwargs)
+
+    statsdf[stat].plot(**plot_kwargs)
+
 
     xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in statsdf.index]
 
     if relative:
         ylabel = f'mean relative difference in {pretty[dep_var_name]} [%]'
     else:
-        ylabel = f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]'
+        ylabel = f'{pretty[dep_var_name]} response [{units[dep_var_name]}]'
 
     ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_xticklabels(xticklabels, rotation=0)
+    ax.set_xticklabels(['']+xticklabels+[''], rotation=0)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
+    yllim, yuplim = ax.get_ylim()
+    ax.set_ylim(yllim, yuplim * 1.05)
 
-    bars = ax.patches
+    # add count annotations above markers
+    markers = ax.get_lines()[0]
     _, y_upper = ax.get_ylim()
-    for bar, count in zip(bars, statsdf['count']):
+    for i, (x, y) in enumerate(zip(markers.get_xdata(), markers.get_ydata())):
+        count = statsdf['count'].iloc[i]
         if not np.isnan(count):
             count_text = format_count(count)
             ax.text(
-                bar.get_x() + bar.get_width() / 2,
+                x,
                 y_upper * 0.95,
                 count_text,
                 ha='center',
@@ -430,6 +443,7 @@ def plot_binned_results(
     png_path = f'{sname}{suffix}{rel_suffix}.png'
     fig.savefig(os.path.join(MWA_FIGDIR, png_path), dpi=400, bbox_inches='tight')
     print(f'Saved figure to {os.path.join(MWA_FIGDIR, png_path)}')
+
 
     return fig, ax
 
@@ -449,7 +463,7 @@ def plot_map_results(
     df = paired_dfs[coarsen_factor].copy()
     df['lon'] = df['lon'].round(0)
     df['lat'] = df['lat'].round(0)
-    df['bin_left'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
+    df['bin_left'] = pd.cut(df['ind_diff'], IND_VAR_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
     # select canopy cover loss bin
     interval = pd.Interval(left=int(ind_bin.split('-')[0]), right=int(ind_bin.split('-')[1]), closed='right')
     df = df[df['bin_left'] == interval.left]
@@ -462,6 +476,8 @@ def plot_map_results(
     lim = max(abs(llim), abs(ulim))
     norm = plt.Normalize(vmin=-lim, vmax=lim)
     size_norm = plt.Normalize(vmin=cdf.min(), vmax=cdf.max())
+    breakpoint()
+
     fig = plt.figure(figsize=(12, 6))
     ax = fig.add_subplot(projection=ccrs.PlateCarree())
 
@@ -476,7 +492,8 @@ def plot_map_results(
     alpha=1,
     )
     ax.coastlines()
-    ctx.add_basemap(ax, crs=ccrs.PlateCarree(), source=ctx.providers.CartoDB.Voyager, alpha=0.5)
+    ctx.add_basemap(ax, crs=ccrs.PlateCarree(), 
+                    source=provider, alpha=0.5)
     # add colorbar
     cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical',
                         shrink=0.5 )
@@ -506,8 +523,8 @@ def plot_hist_results(
 ):
 
     df = paired_dfs[coarsen_factor].copy()
-    df['bin_left'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
-    df['bin_right'] = pd.cut(df['ind_diff'], IND_DIFF_BINS[ind_var_name]).map(lambda interval: float(interval.right) if pd.notna(interval) else np.nan)
+    df['bin_left'] = pd.cut(df['ind_diff'], IND_VAR_BINS[ind_var_name]).map(lambda interval: float(interval.left) if pd.notna(interval) else np.nan)
+    df['bin_right'] = pd.cut(df['ind_diff'], IND_VAR_BINS[ind_var_name]).map(lambda interval: float(interval.right) if pd.notna(interval) else np.nan)
 
     # convert string to interval
     bin_left, bin_right = map(int, ind_bin.split('-'))
@@ -515,7 +532,7 @@ def plot_hist_results(
 
     fig, ax = plt.subplots(figsize=(10, 6))
     bdf['dep_diff'].plot.hist(ax=ax, color='steelblue', bins=bins, label=f'canopy cover loss bin: {ind_bin}')
-    ax.set_xlim(bdf['dep_diff'].dropna().quantile(.001), bdf['dep_diff'].dropna().quantile(.999))
+    ax.set_ylim(bdf['dep_diff'].dropna().quantile(.001), bdf['dep_diff'].dropna().quantile(.999))
     # plot the median
     median = bdf['dep_diff'].median()
     ax.axvline(median, color='red', linestyle='--', label=f'Median: {median:.2f}')
@@ -697,7 +714,7 @@ def load_binned_results(
     )
 
     time_dim = 'year' if aggregation != 'daily' else 'time'
-    bins = IND_DIFF_BINS[ind_var_name]
+    bins = IND_VAR_BINS[ind_var_name]
 
     dfs = {}
     for cf, df in paired_dfs.items():
@@ -723,7 +740,7 @@ def load_binned_results(
         if df.empty:
             continue
 
-        binsr = pd.cut(df['ind_diff'], bins, include_lowest=True)
+        binsr = pd.cut(df['ind_diff'], bins, include_lowest=False)
         summary = (
             df.groupby(binsr, observed=False)['dep_diff']
             .agg(
@@ -948,34 +965,23 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
             reset_caches=reset_caches,
         )
 
-    plot_hist_results(
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        sname=sname,
-        paired_dfs=paired_dfs,
-        coarsen_factor=None,
-        aggregation=aggregation,
-        area_slice=area_slice,
-        ind_bin=top_bins[ind_var_name],
-    )
 
-
-    plot_mwa_results_all(
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        aggregation=aggregation,
-        years=years,
-        sname=sname,
-        dfs=dfs,
-        stat='mean',
-        area_slice=area_slice,
-        plot_resolution_corr=False,
-        print_summary=True,
-        min_count_per_bin=20,
-        relative=False,
-        print_stats=True,
-        reset_caches=reset_caches,
-    )
+    # plot_mwa_results_all(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     years=years,
+    #     sname=sname,
+    #     dfs=dfs,
+    #     stat='mean',
+    #     area_slice=area_slice,
+    #     plot_resolution_corr=False,
+    #     print_summary=True,
+    #     min_count_per_bin=20,
+    #     relative=False,
+    #     print_stats=True,
+    #     reset_caches=reset_caches,
+    # )
 
 
     plot_binned_results(
@@ -987,74 +993,75 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
         dfs=dfs,
         sname=sname,
         area_slice=area_slice,
-        relative=False,
-        print_stats=True
-    )
-
-    plot_dep_response_vs_ind_diff(
-        paired_dfs=paired_dfs,
-        sname=sname,
-        coarsen_factor=None,
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        aggregation=aggregation,
-        years=years,
-        area_slice=area_slice,
-        normalize_by_ind_diff=True,
-        round_digits=0,
-
-    )
-
-    plot_map_results(
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        paired_dfs=paired_dfs,
-        sname=sname,
-        aggregation=aggregation,
-        ind_bin=top_bins[ind_var_name],
-        show_box=True,
-        area_slice=area_slice,
-    )
-
-    plot_trend_results(
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        paired_dfs=paired_dfs,
-        sname=sname,
-        aggregation=aggregation,
-        area_slice=area_slice,
-        years=years,
+        relative=True,
+        print_stats=True,
         coarsen_factor=None
     )
 
-    plot_hexbin_results(
-        ind_var_name=ind_var_name,
-        dep_var_name=dep_var_name,
-        aggregation=aggregation,
-        sname=sname,
-        paired_dfs=paired_dfs,
-        coarsen_factor=None,
-        years=years,
-        area_slice=area_slice,
-        normalize_by_ind_diff=True,
-        gridsize=30,
-        cmap='viridis',
-        reduce_C_function=np.mean,
-        mincnt=1000,
-        vmin=None,
-        vmax=None,
-    )   
+    # plot_dep_response_vs_ind_diff(
+    #     paired_dfs=paired_dfs,
+    #     sname=sname,
+    #     coarsen_factor=None,
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     years=years,
+    #     area_slice=area_slice,
+    #     normalize_by_ind_diff=True,
+    #     round_digits=0,
+
+    # )
+
+    # plot_map_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     paired_dfs=paired_dfs,
+    #     sname=sname,
+    #     aggregation=aggregation,
+    #     ind_bin=top_bins[ind_var_name],
+    #     show_box=False,
+    #     area_slice=area_slice,
+        
+    # )
+
+    # plot_trend_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     paired_dfs=paired_dfs,
+    #     sname=sname,
+    #     aggregation=aggregation,
+    #     area_slice=area_slice,
+    #     years=years,
+    #     coarsen_factor=None
+    # )
+
+    # plot_hexbin_results(
+    #     ind_var_name=ind_var_name,
+    #     dep_var_name=dep_var_name,
+    #     aggregation=aggregation,
+    #     sname=sname,
+    #     paired_dfs=paired_dfs,
+    #     coarsen_factor=None,
+    #     years=years,
+    #     area_slice=area_slice,
+    #     normalize_by_ind_diff=True,
+    #     gridsize=30,
+    #     cmap='viridis',
+    #     reduce_C_function=np.mean,
+    #     mincnt=1000,
+    #     vmin=None,
+    #     vmax=None,
+    # )   
 
 
-
-
+#%%
 
 # make_all_plots(
 #     ind_var_name='cc',
 #     dep_var_name='tmax',
 #     aggregation='annual_mean',
 #     years=None,
-#     area_slice=RESULTS_BBOX
+#     area_slice=None
 # )
 
 make_all_plots(
@@ -1062,5 +1069,70 @@ make_all_plots(
     dep_var_name='heatwaves_gapfilled',
     aggregation='annual_sum',
     years=None,
-    area_slice=RESULTS_BBOX
+    area_slice=None
 )
+
+#%%
+# make_all_plots(
+#     ind_var_name='cc',
+#     dep_var_name='tmax_era5',
+#     aggregation='annual_mean',
+#     years=None,
+#     area_slice=None
+# )
+
+
+#%%
+dep_var_name = 'tmax'
+
+paired_dfs = load_and_cache_all_coarsens(
+    dep_var_name='tmax',
+    ind_var_name='cc',
+    aggregation='annual_mean',
+    reset_caches=False,
+)
+
+pretty_legend = {'ind_centre': 'centre canopy cover',
+          'ind_neighbour': 'neighbour canopy cover',
+          'dep_diff': f'{pretty[dep_var_name]} difference'}
+
+df = paired_dfs[10]
+df['id'] = df['lat'].round(3).astype(str) + '_' +df['lon'].round(3).astype(str)
+loss_thresh=70
+dfl = df.loc[(df['ind_diff'] > loss_thresh)]
+df_high_start = df.loc[(df['year']=='2003') & (df['ind_diff'] < 30)]
+valid = [llid for llid in dfl['id'].values if llid in df_high_start['id'].values]
+df_loss = df.where(df['id'].isin(valid)).dropna(how='all')
+#%%
+fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+ngroup = df_loss[['ind_centre', 'ind_neighbour']].groupby(df_loss.year)
+ngroup.median().plot(ax=axes[0], color=['goldenrod', 'forestgreen'])
+axes[0].fill_between(ngroup.median().index,
+                        ngroup.quantile(0.75)['ind_centre'],
+                            ngroup.quantile(0.25)['ind_centre'],
+                            color='goldenrod', alpha=0.2)
+axes[0].fill_between(ngroup.median().index,
+                        ngroup.quantile(0.75)['ind_neighbour'],
+                            ngroup.quantile(0.25)['ind_neighbour'],
+                            color='forestgreen', alpha=0.2)
+bgroup=df_loss[['dep_diff']].groupby(df_loss.year)
+bgroup.median().plot(ax=axes[1], color='firebrick')
+axes[1].fill_between(bgroup.median().index,
+                        bgroup.quantile(0.75)['dep_diff'],
+                            bgroup.quantile(0.25)['dep_diff'],
+                            color='firebrick', alpha=0.2)
+
+                                                        
+# add text of n rows in df_loss
+n_rows = len(df_loss)
+axes[0].text(0.02, 0.95, f'n={n_rows}', transform=axes[0].transAxes, fontsize=12, 
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.75))
+axes[0].set_ylabel('mean canopy cover [%]', fontsize=12)
+axes[1].set_ylabel(f'mean {pretty[dep_var_name]} difference [{units[dep_var_name]}]', fontsize=12)
+axes[1].set_xlabel('year', fontsize=12)
+axes[0].legend(['centre canopy cover', 'neighbour canopy cover'], fontsize=10)
+axes[1].legend([f'{pretty[dep_var_name]} difference'], fontsize=10)
+plt.tight_layout()
+for ax in axes:
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+fig.savefig(os.path.join(MWA_FIGDIR, f'{dep_var_name}_cc_loss_time_series.png'), dpi=400, bbox_inches='tight')

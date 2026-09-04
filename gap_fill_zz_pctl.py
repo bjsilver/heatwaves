@@ -37,7 +37,7 @@ def load_data(area_slicer=None):
     else:
         mask = pct.notnull().astype('int8')
 
-    ds = xr.open_zarr(HANSEN_PATH)
+    ds = xr.open_zarr(HANSEN_PATH, consolidated=False)
     tc = ds['tree_cover']
     loss = -(tc - tc[0])
     loss = loss.chunk({'time': -1})
@@ -288,35 +288,7 @@ if __name__ == '__main__':
 
 #%%
 # plot the process
-def plot_gapfill_example():
-    westlimit=-56.5; southlimit =-5; eastlimit=-54.5; northlimit=-3
-    slicer = dict(lat=slice(southlimit, northlimit), lon=slice(westlimit, eastlimit))
 
-    pct, mask, loss = load_data()
-    pct = pct / 10.0
-    ok = loss.max('time') < LOSS_THRESHOLD
-    pct_ok = pct.where(ok)
-    out_ds = xr.open_zarr(OUT_PATH, consolidated=False) / 10.0
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
-    # plot the loss
-    axes[0, 0].set_title('Max Loss < 10%')
-    loss.loc[slicer].max('time').plot.imshow(ax=axes[0, 0], cmap='Reds', vmin=0, vmax=100,
-                                            cbar_kwargs={'label': 'Loss (%)', 'orientation': 'horizontal',
-                                                        'shrink':.5, 'pad':0.05})
-    pct.loc[slicer].mean('doy').plot.imshow(ax=axes[0, 1], cmap='magma', vmin=34, vmax=36,
-                                        cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-                                                        'shrink':.5, 'pad':0.05})
-    pct.loc[slicer].where(ok).mean('doy').plot.imshow(ax=axes[1, 0], cmap='magma', vmin=34, vmax=36,
-                                        cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-                                                        'shrink':.5, 'pad':0.05})
-    (xr.where(mask, np.nan, 1)).loc[slicer].plot.imshow(ax=axes[1,0], cmap='viridis', alpha=0.5, add_colorbar=False)
-
-    out_ds['Ta_TMAX_p95'].loc[slicer].mean('doy').plot.imshow(ax=axes[1, 1], cmap='magma', vmin=34, vmax=36,
-                                        cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-                                                        'shrink':.5, 'pad':0.05})
-
-    plt.tight_layout()
 
     
 def interp_tests():
@@ -420,8 +392,41 @@ def interp_tests():
         'loss_threshold': 10}
     ], pct_lims=(35, 36.3), diff_lims=(-0.4, 0.4))
 
-#plot_gapfill_example()
 
 #%%%
 
+
+# def plot_gapfill_example():
+WLAT = -65
+slicer = {'lat': slice(-10.5, -9.5), 'lon': slice(WLAT, WLAT+1)}
+
+pct, mask, loss = load_data()
+pct = pct / 10.0
+ok = loss.max('time') < LOSS_THRESHOLD
+pct_ok = pct.where(ok)
+out_ds = xr.open_zarr(OUT_PATH, consolidated=False) / 10.0
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+# plot the loss
+axes[0, 0].set_title('Max Loss < 10%')
+loss.loc[slicer].max('time').plot.imshow(ax=axes[0, 0], cmap='Reds', vmin=0, vmax=100,
+                                        cbar_kwargs={'label': 'Loss (%)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+pct.loc[slicer].mean('doy').plot.imshow(ax=axes[0, 1], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+pct.loc[slicer].where(ok).mean('doy').plot.imshow(ax=axes[1, 0], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+(xr.where(mask, np.nan, 1)).loc[slicer].plot.imshow(ax=axes[1,0], cmap='viridis', alpha=0.5, add_colorbar=False)
+
+out_ds['Ta_TMAX_p95'].loc[slicer].mean('doy').plot.imshow(ax=axes[1, 1], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+
+plt.tight_layout()
+
+# plot_gapfill_example()
+
+#%%
 

@@ -8,7 +8,7 @@ from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR
 from dask.distributed import Client, LocalCluster
 import warnings
 from contextlib import contextmanager
-import cartopy.crs as ccrs
+# import cartopy.crs as ccrs
 
 def lon_to_180(ds):
     ds = ds.copy()

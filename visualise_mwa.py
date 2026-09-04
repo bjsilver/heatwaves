@@ -31,37 +31,40 @@ ind, cc_loss, dep = load_ind_dep_data(ind_var_name=ind_var_name, dep_var_name=de
 dep = aggregate_dependent_variable(dep, 'annual_mean')
 dss = _generate_coarsened_versions(ind, cc_loss, dep, coarsen_factor=10)
 #%%
-year = 2020; lat = -11.305; lon = -56.305
 
-for ind_da, cc_loss_da, dep_da in dss:
-    if (lat in ind_da.lat.round(2)) and (lon in ind_da.lon.round(2)):
-        print('found version with coords')
-        break
-lat_res = np.unique(np.diff(ind_da.lat).round(2))[0]
-lon_res = np.unique(np.diff(ind_da.lon).round(2))[0]
+def get_data(dss, year, lat, lon):
+    for ind_da, cc_loss_da, dep_da in dss:
+        if (lat in ind_da.lat.round(2)) and (lon in ind_da.lon.round(2)):
+            print('found version with coords')
+            break
+    lat_res = np.unique(np.diff(ind_da.lat).round(2))[0]
+    lon_res = np.unique(np.diff(ind_da.lon).round(2))[0]
 
-ind_slice = ind_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
-                        'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res),
-                        'year':year}]
-dep_slice = dep_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
-                        'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res),
-                        'year':year}]
+    ind_slice = ind_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
+                            'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res),
+                            'year':year}]
+    dep_slice = dep_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
+                            'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res),
+                            'year':year}]
 
-# identify neighbour cell with max ind diff
-centre = ind_slice.sel(lat=lat, lon=lon, method='nearest').compute().item()
-max_diff = -np.inf
-for i in range(-1, 2):
-    for j in range(-1, 2):
-        if i==0 and j==0:
-            continue
-        n_lat = lat+(lat_res*i)
-        n_lon = lon+(lon_res*j)
-        neighbour = ind_slice.sel(lat=n_lat, lon=n_lon, method='nearest').compute().item()
-        diff = neighbour - centre
-        if diff > max_diff:
-            max_diff = diff
-            max_neighbour_lat = n_lat
-            max_neighbour_lon = n_lon
+    # identify neighbour cell with max ind diff
+    centre = ind_slice.sel(lat=lat, lon=lon, method='nearest').compute().item()
+    max_diff = -np.inf
+    for i in range(-1, 2):
+        for j in range(-1, 2):
+            if i==0 and j==0:
+                continue
+            n_lat = lat+(lat_res*i)
+            n_lon = lon+(lon_res*j)
+            neighbour = ind_slice.sel(lat=n_lat, lon=n_lon, method='nearest').compute().item()
+            diff = neighbour - centre
+            if diff > max_diff:
+                max_diff = diff
+                max_neighbour_lat = n_lat
+                max_neighbour_lon = n_lon
+
+    return ind_slice, dep_slice, lat_res, lon_res, max_neighbour_lat, max_neighbour_lon
+ind_slice, dep_slice, lat_res, lon_res, max_neighbour_lat, max_neighbour_lon = get_data(dss, year=2015, lat=-0.63, lon=-78.13)
 #%%
 
 def format_ax(ax, max_neighbour_lat, max_neighbour_lon, lat, lon):
@@ -121,3 +124,34 @@ gl.xlocator = mticker.FixedLocator(dep_slice.lon.values-lon_res/2)
 gl.ylocator = mticker.FixedLocator(dep_slice.lat.values-lat_res/2)
 
 
+#%%
+for ind_da, cc_loss_da, dep_da in dss:
+    if (lat in ind_da.lat.round(2)) and (lon in ind_da.lon.round(2)):
+        print('found version with coords')
+        break
+    lat_res = np.unique(np.diff(ind_da.lat).round(2))[0]
+    lon_res = np.unique(np.diff(ind_da.lon).round(2))[0]
+
+    ind_slice = ind_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
+                            'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res)}]
+    dep_slice = dep_da.loc[{'lat':slice(lat-lat_res*2, lat+lat_res*2+lat_res), 
+                            'lon':slice(lon-lon_res*2, lon+lon_res*2+lon_res)}]
+tseries = xr.Dataset({
+    'ind_neighbour': ind_slice.sel(lat=max_neighbour_lat, lon=max_neighbour_lon, method='nearest').drop_vars(['lat', 'lon']),
+    'ind_centre': ind_slice.sel(lat=lat, lon=lon, method='nearest').drop_vars(['lat', 'lon']),
+    'dep_neighbour': dep_slice.sel(lat=max_neighbour_lat, lon=max_neighbour_lon, method='nearest').drop_vars(['lat', 'lon']),
+    'dep_centre': dep_slice.sel(lat=lat, lon=lon, method='nearest').drop_vars(['lat', 'lon'])},
+).to_pandas()
+
+#%%
+fig, ax = plt.subplots(figsize=(12, 6), layout='constrained')
+twax = ax.twinx()
+tseries['ind_centre'].plot(ax=ax, color='green', label='ind_centre')
+tseries['ind_neighbour'].plot(ax=ax, color='lightgreen', label='ind_neighbour')
+tseries['dep_centre'].plot(ax=twax, color='red', label='dep_centre')
+tseries['dep_neighbour'].plot(ax=twax, color='orange', label='dep_neighbour')
+ax.set_ylabel(f'{ind_var_name} (%)')
+twax.set_ylabel(f'{dep_var_name} (°C)')
+
+ax.legend()
+twax.legend(loc='upper left')

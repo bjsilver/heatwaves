@@ -3,7 +3,7 @@ import xarray as xr
 import numpy as np
 import os
 import dask.array as da
-from constants import HANSEN_DIR, MWA_DAILY_DIR, STORAGE_DIR
+from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR
 import gc
 import json
 import shutil
@@ -24,8 +24,12 @@ CC_LOSS_EXPLAINED_FRACTION = 0.90
 MWA_ALGORITHM_TAG = f'cc-loss-explained-{int(CC_LOSS_EXPLAINED_FRACTION * 100):02d}'
 
 
-def _load_canopy_cover_and_loss():
-    ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'))
+def _load_canopy_cover_and_loss(era=False):
+    if era:
+        ds = xr.open_zarr(HANSEN_DIR+'hansen_regridded.zarr')
+    else:
+        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'), 
+                        consolidated=False)
     tree_cover = ds['tree_cover'].astype(np.float32)
     cc = tree_cover.loc[{'time': slice('2003', '2020')}].rename({'time': 'year'})
     cc_loss = (tree_cover.isel(time=0) - tree_cover).loc[{'time': slice('2003', '2020')}]
@@ -37,8 +41,7 @@ def _load_canopy_cover_and_loss():
 
 
 def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
-    if ind_var_name != 'cc':
-        raise ValueError("MWA supports only ind_var_name='cc'.")
+
 
     if dep_var_name == 'tmax':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
@@ -63,9 +66,14 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
 
-    ind_var, cc_loss = _load_canopy_cover_and_loss()
+    if ind_var_name == 'cc':
+        ind_var, cc_loss = _load_canopy_cover_and_loss()
+
+    elif ind_var_name == 'cc_era5':
+        ind_var, cc_loss = _load_canopy_cover_and_loss(era=True)
     ind_var = ind_var.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
     cc_loss = cc_loss.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
+    
 
     if include_cc_loss:
         return ind_var, cc_loss, dep_var
@@ -121,7 +129,7 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
 
 def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
     map_tag = sname
-    spath = os.path.join(MWA_DAILY_DIR, f'neighbour_maps/{map_tag}.zarr')
+    spath = os.path.join(MWA_DIR, f'neighbour_maps/{map_tag}.zarr')
     if os.path.exists(spath):
         print(f"Neighbour map zarr already exists for {sname}.\nLoading from {spath}.")
         neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
@@ -176,7 +184,8 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
         }
     }
 
-    neighbour_maps_ds.to_zarr(spath, mode='w', consolidated=False, encoding=encoding)
+    neighbour_maps_ds.to_zarr(spath, mode='w', consolidated=False, encoding=encoding,
+                              zarr_format=2)
     neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
     return neighbour_maps_ds
 
@@ -596,8 +605,8 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
     else:
         dss = [(ind_var, cc_loss, dep_var)]
 
-    os.makedirs(MWA_DAILY_DIR, exist_ok=True)
-    out_root = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_members_parquet')
+    os.makedirs(MWA_DIR, exist_ok=True)
+    out_root = os.path.join(MWA_DIR, f'{sname}_mwa_members_parquet')
     os.makedirs(out_root, exist_ok=True)
     expected_versions = len(dss)
     reuse_existing_members = _run_metadata_matches_current_algorithm(out_root)
@@ -667,7 +676,7 @@ def aggregate_dependent_variable(dep_var, aggregation):
 
 def _check_member_parquets_exist(sname, coarsen_factor=None):
     """Check whether expected per-version ind/dep parquet outputs exist."""
-    out_root = os.path.join(MWA_DAILY_DIR, f'{sname}_mwa_members_parquet')
+    out_root = os.path.join(MWA_DIR, f'{sname}_mwa_members_parquet')
     if not _run_metadata_matches_current_algorithm(out_root):
         return False
     expected_versions = _expected_version_count(coarsen_factor)
@@ -725,7 +734,8 @@ if __name__ == "__main__":
     with local_cluster(n_workers=32, threads_per_worker=1, memory_limit='20GB',
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
 
-        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
-        #                      dep_var_name='tmax', client=client)
+        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+                             dep_var_name='tmax', client=client)
+
         run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
                                      dep_var_name='heatwaves_gapfilled', client=client)

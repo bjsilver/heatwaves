@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 import numpy as np
 import xarray as xr
-from ufuncs import load_heat
 from constants import STORAGE_DIR
 import xesmf as xe
 
@@ -119,12 +118,14 @@ da1 = open_globe_tile(Path(STORAGE_DIR) / "../elevation/f10g")
 da2 = open_globe_tile(Path(STORAGE_DIR) / "../elevation/j10g")
 da = xr.concat([da2, da1], dim="lat")
 
-template = load_heat('heatwaves')
+# open zarr template
+template = xr.open_zarr(STORAGE_DIR+'heatdays/heatwaves_annual_sum_zz_2003-2020_gapfilled.zarr')
+template = template.isel(year=0)
 
 # slice da by template limits
 da = da.sel(lat=slice(template.lat.min(), template.lat.max()),
              lon=slice(template.lon.min(), template.lon.max()))
-
+#%%
 # create and save regridder weights
 regridder = xe.Regridder(da, template, "bilinear", reuse_weights=False)
 regridder.to_netcdf(STORAGE_DIR+"../elevation/elevation_regrid_weights.nc")
@@ -136,7 +137,7 @@ if os.path.exists(STORAGE_DIR+"../elevation/elevation_regrid_weights.nc"):
 da_regridded = regridder(da)
 da_regridded.name = "elevation"
 da_regridded.attrs["source"] = "NOAA GLOBE (regridded to match heatwave template)"
-da_regridded.to_netcdf(Path(STORAGE_DIR) / "elevation_regridded.nc")
+da_regridded.to_netcdf(STORAGE_DIR+"../elevation/elevation_regridded.nc")
 
 
 #%%
