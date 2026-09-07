@@ -9,26 +9,21 @@ import numpy as np
 import pandas as pd
 import pyarrow
 import contextily as ctx
-from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX
+from constants import FIGDIR, STORAGE_DIR, IND_VAR_BINS, RESULTS_BBOX, MWA_DIR
 import dask.dataframe as dd
 from dask import delayed
 from dask.diagnostics import ProgressBar
 from functools import lru_cache
+import os
+import xyzservices.providers as xyz
 
-MWA_DAILY_DIR = STORAGE_DIR + 'mwa_results_daily/'
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
 COARSEN_FACTORS = [None, 2, 5, 10, 25]
 RESET_CACHES = False
 
-# 2. Grab the CartoDB provider template
-provider = ctx.providers.CartoDB.Positron
-
-# 3. Manually inject your CARTO API key into the URL string
-my_api_key = "cb1_2q9j_1_b5df218aa14cb6ba27b06227"
-provider["url"] = provider["url"] + f"?key={my_api_key}"
-
-# AMAZON_SLICE = dict(westlimit=-65.7, southlimit=-18.48, eastlimit=-48.86, northlimit=-4.56)
+CARTO_POSITRON  = xyz.CartoDB.Positron.copy()
+CARTO_POSITRON["url"] += f"?key={os.environ['CARTO_API_KEY']}"
 
 IND_DIFF_THRESH = 10
 
@@ -40,6 +35,8 @@ pretty = {
     'cc': 'canopy cover',
     'tmax': 'daily maximum temperature',
     'tmax_era5': 'daily maximum temperature (ERA5)',
+    'absthresh_heatwaves': 'absolute threshold heatwaves',
+    'warmest_days': 'temperature of warmest days'
 }
 
 units = {
@@ -48,6 +45,8 @@ units = {
     'cc': '%',
     'tmax': '°C',
     'tmax_era5': '°C',
+    'absthresh_heatwaves': 'days/year',
+    'warmest_days': '°C',
 }
 
 
@@ -61,7 +60,10 @@ def build_stats_sname(
     if ind_var_name != 'cc':
         raise ValueError("MWA plotting supports only ind_var_name='cc'.")
 
-    sname = f'{dep_var_name}_{aggregation}_vs_cc'
+    if aggregation is not None:
+        sname = f'{dep_var_name}_{aggregation}_vs_cc'
+    else:
+        sname = f'{dep_var_name}_vs_cc'
     if coarsen_factor is not None:
         sname += f'_coarsened{coarsen_factor}'
     sname += '_mwa_members_parquet'
@@ -92,7 +94,7 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
             'the PyArrow installation before reading MWA parquet members.'
         )
     
-    version_dirs = sorted(glob(os.path.join(MWA_DAILY_DIR, sname, 'version=*')))
+    version_dirs = sorted(glob(os.path.join(MWA_DIR, sname, 'version=*')))
     if not version_dirs:
         raise FileNotFoundError(f'No version directories found for {sname}')
 
@@ -101,16 +103,17 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
         join_keys = ['year', 'lat', 'lon']
         output_cols = [
             'time', 'year', 'lat', 'lon',
-            'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour'
+            'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour',
+            'ind_neighbour_mean'
         ]
-        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour']
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
         dep_cols = ['lat', 'lon', 'time', 'dep_centre', 'dep_neighbour']
         derive_year_from_time = True
     else:
         time_dim = 'year'
         join_keys = ['year', 'lat', 'lon']
-        output_cols = ['year', 'lat', 'lon', 'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour']
-        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour']
+        output_cols = ['year', 'lat', 'lon', 'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
         dep_cols = ['lat', 'lon', 'year', 'dep_centre', 'dep_neighbour']
         derive_year_from_time = False
 
@@ -148,6 +151,7 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
         'dep_neighbour': 'float32',
         'ind_centre': 'float32',
         'ind_neighbour': 'float32',
+        'ind_neighbour_mean': 'float32',
     }
     if aggregation == 'daily':
         meta_dict['year'] = 'str'
@@ -179,7 +183,7 @@ def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
     reset_caches = RESET_CACHES if reset_caches is None else reset_caches
 
     time_dim = 'year' if aggregation != 'daily' else 'time'
-    cache_root = os.path.join(MWA_DAILY_DIR, 'paired_cache')
+    cache_root = os.path.join(MWA_DIR, 'paired_cache')
     os.makedirs(cache_root, exist_ok=True)
 
     coarsen_dfs = {}
@@ -356,7 +360,6 @@ def plot_binned_results(
 
     statsdf = dfs[coarsen_factor].copy()
     statsdf = statsdf.loc[~(statsdf['count']<1)]
-    breakpoint()
     if relative:
         # Convert per-bin dep_diff stats to percent relative to that bin's
         # average dep_neighbor to avoid row-level divide-by-zero blowups.
@@ -459,7 +462,7 @@ def plot_map_results(
     show_box=False
 ):
 
-
+    breakpoint()
     df = paired_dfs[coarsen_factor].copy()
     df['lon'] = df['lon'].round(0)
     df['lat'] = df['lat'].round(0)
@@ -476,7 +479,6 @@ def plot_map_results(
     lim = max(abs(llim), abs(ulim))
     norm = plt.Normalize(vmin=-lim, vmax=lim)
     size_norm = plt.Normalize(vmin=cdf.min(), vmax=cdf.max())
-    breakpoint()
 
     fig = plt.figure(figsize=(12, 6))
     ax = fig.add_subplot(projection=ccrs.PlateCarree())
@@ -493,7 +495,7 @@ def plot_map_results(
     )
     ax.coastlines()
     ctx.add_basemap(ax, crs=ccrs.PlateCarree(), 
-                    source=provider, alpha=0.5)
+                    source=CARTO_POSITRON, alpha=0.5)
     # add colorbar
     cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical',
                         shrink=0.5 )
@@ -965,23 +967,24 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
             reset_caches=reset_caches,
         )
 
+    plot_mwa_results_all(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        sname=sname,
+        dfs=dfs,
+        stat='mean',
+        area_slice=area_slice,
+        plot_resolution_corr=False,
+        print_summary=True,
+        min_count_per_bin=20,
+        relative=False,
+        print_stats=True,
+        reset_caches=reset_caches,
+    )
 
-    # plot_mwa_results_all(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     years=years,
-    #     sname=sname,
-    #     dfs=dfs,
-    #     stat='mean',
-    #     area_slice=area_slice,
-    #     plot_resolution_corr=False,
-    #     print_summary=True,
-    #     min_count_per_bin=20,
-    #     relative=False,
-    #     print_stats=True,
-    #     reset_caches=reset_caches,
-    # )
+
 
 
     plot_binned_results(
@@ -993,93 +996,106 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
         dfs=dfs,
         sname=sname,
         area_slice=area_slice,
-        relative=True,
+        relative=False,
         print_stats=True,
         coarsen_factor=None
     )
 
-    # plot_dep_response_vs_ind_diff(
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     coarsen_factor=None,
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     years=years,
-    #     area_slice=area_slice,
-    #     normalize_by_ind_diff=True,
-    #     round_digits=0,
 
-    # )
+    plot_dep_response_vs_ind_diff(
+        paired_dfs=paired_dfs,
+        sname=sname,
+        coarsen_factor=None,
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        area_slice=area_slice,
+        normalize_by_ind_diff=True,
+        round_digits=0,
 
-    # plot_map_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     aggregation=aggregation,
-    #     ind_bin=top_bins[ind_var_name],
-    #     show_box=False,
-    #     area_slice=area_slice,
+    )
+
+    plot_map_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        ind_bin=top_bins[ind_var_name],
+        show_box=False,
+        area_slice=area_slice,
         
-    # )
+    )
 
-    # plot_trend_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     aggregation=aggregation,
-    #     area_slice=area_slice,
-    #     years=years,
-    #     coarsen_factor=None
-    # )
-
-    # plot_hexbin_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     sname=sname,
-    #     paired_dfs=paired_dfs,
-    #     coarsen_factor=None,
-    #     years=years,
-    #     area_slice=area_slice,
-    #     normalize_by_ind_diff=True,
-    #     gridsize=30,
-    #     cmap='viridis',
-    #     reduce_C_function=np.mean,
-    #     mincnt=1000,
-    #     vmin=None,
-    #     vmax=None,
-    # )   
+    plot_trend_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        area_slice=area_slice,
+        years=years,
+        coarsen_factor=None
+    )
 
 
-#%%
+    plot_hexbin_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        sname=sname,
+        paired_dfs=paired_dfs,
+        coarsen_factor=None,
+        years=years,
+        area_slice=area_slice,
+        normalize_by_ind_diff=True,
+        gridsize=30,
+        cmap='viridis',
+        reduce_C_function=np.mean,
+        mincnt=1000,
+        vmin=None,
+        vmax=None,
+    )   
+
+
 
 # make_all_plots(
 #     ind_var_name='cc',
 #     dep_var_name='tmax',
 #     aggregation='annual_mean',
 #     years=None,
-#     area_slice=None
+#     reset_caches=False,
+#     area_slice=RESULTS_BBOX
 # )
 
-make_all_plots(
-    ind_var_name='cc',
-    dep_var_name='heatwaves_gapfilled',
-    aggregation='annual_sum',
-    years=None,
-    area_slice=None
-)
-
-#%%
 # make_all_plots(
 #     ind_var_name='cc',
-#     dep_var_name='tmax_era5',
-#     aggregation='annual_mean',
+#     dep_var_name='heatwaves_gapfilled',
+#     aggregation='annual_sum',
 #     years=None,
+#     reset_caches=False,
+#     area_slice=RESULTS_BBOX
+# )
+
+# make_all_plots(
+#     ind_var_name='cc',
+#     dep_var_name='absthresh_heatwaves',
+#     aggregation='annual_sum',
+#     years=None,
+#     reset_caches=False,
 #     area_slice=None
 # )
+
+#%%
+make_all_plots(
+    ind_var_name='cc',
+    dep_var_name='warmest_days',
+    aggregation='annual_mean',
+    years=None,
+    reset_caches=False,
+    area_slice=None
+)
 
 
 #%%

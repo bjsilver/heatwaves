@@ -46,25 +46,23 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
     if dep_var_name == 'tmax':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
         dep_var = dep_var.astype(np.float32).where(dep_var != -9999.0) / 10.0  # convert to °C
-        dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020.zarr'))['heatwave_days']
-        dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves_smoothed':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020_smooth.zarr'))['heatwave_days']
-        dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves_gapfilled':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020_gapfilled.zarr'))['heatwave_days']
-        dep_var.name = dep_var_name
     elif dep_var_name == 'heatwaves_era5-p95':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_era5_2003-2020.zarr'))['heatwave_days']
-        dep_var.name = dep_var_name
-
+    elif dep_var_name == 'absthresh_heatwaves':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heat_metrics', 'heat_metrics.zarr'))['absthresh_heatwaves']
+    elif dep_var_name == 'warmest_days':
+        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heat_metrics', 'heat_metrics.zarr'))['warmest_days']
     elif dep_var_name == 'tmax_era5':
         dep_var = load_era5_t2m()
-        dep_var.name = dep_var_name
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
+    dep_var.name = dep_var_name
 
     if ind_var_name == 'cc':
         ind_var, cc_loss = _load_canopy_cover_and_loss()
@@ -89,7 +87,7 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
     h_size = cc.shape[1] - 2 * wr
     w_size = cc.shape[2] - 2 * wr
 
-    out = np.full((4, t_size, h_size, w_size), np.nan, dtype=np.float32)
+    out = np.full((5, t_size, h_size, w_size), np.nan, dtype=np.float32)
 
     center_cc = cc[:, wr:wr+h_size, wr:wr+w_size]
     center_cc_loss = cc_loss[:, wr:wr+h_size, wr:wr+w_size]
@@ -98,6 +96,9 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
     selected_neighbour_cc = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
     max_ind_diff_ioffset = np.full((t_size, h_size, w_size), NEIGHBOUR_MAP_FILL_VALUE, dtype=np.int8)
     max_ind_diff_joffset = np.full((t_size, h_size, w_size), NEIGHBOUR_MAP_FILL_VALUE, dtype=np.int8)
+
+    neighbour_cc_sum = np.zeros((t_size, h_size, w_size), dtype=np.float32)
+    neighbour_cc_count = np.zeros((t_size, h_size, w_size), dtype=np.int16)
 
     for di in range(-wr, wr + 1):
         for dj in range(-wr, wr + 1):
@@ -108,11 +109,16 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
             neighbour_cc = cc[:, ri:ri+h_size, rj:rj+w_size]
             cc_diff = neighbour_cc - center_cc
 
+            finite_neighbour = np.isfinite(neighbour_cc)
+            neighbour_cc_sum += np.where(finite_neighbour, neighbour_cc, 0.0)
+            neighbour_cc_count += finite_neighbour
+
             better = cc_diff > max_ind_diff
             max_ind_diff = np.where(better, cc_diff, max_ind_diff)
             selected_neighbour_cc = np.where(better, neighbour_cc, selected_neighbour_cc)
             max_ind_diff_ioffset = np.where(better, np.int8(di), max_ind_diff_ioffset)
             max_ind_diff_joffset = np.where(better, np.int8(dj), max_ind_diff_joffset)
+
 
     valid = (
         (max_ind_diff > 0)
@@ -120,11 +126,17 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
         & (center_cc_loss >= loss_explained_fraction * max_ind_diff)
     )
 
+    mean_neighbour_cc = np.where(
+    neighbour_cc_count > 0,
+    neighbour_cc_sum / neighbour_cc_count,
+    np.nan
+)
+
     out[0] = np.where(valid, max_ind_diff_ioffset, NEIGHBOUR_MAP_FILL_VALUE)
     out[1] = np.where(valid, max_ind_diff_joffset, NEIGHBOUR_MAP_FILL_VALUE)
     out[2] = np.where(valid, center_cc, np.nan)
     out[3] = np.where(valid, selected_neighbour_cc, np.nan)
-
+    out[4] = np.where(valid, mean_neighbour_cc, np.nan)
     return out
 
 def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
@@ -138,9 +150,17 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
         lats_match = np.array_equal(neighbour_maps_ds['lat'].values, cc['lat'].values)
         lons_match = np.array_equal(neighbour_maps_ds['lon'].values, cc['lon'].values)
 
-        if years_match and lats_match and lons_match and 'selection' in neighbour_maps_ds:
-            return neighbour_maps_ds
+        fields_match = (
+        'selection' in neighbour_maps_ds
+        and np.array_equal(
+            neighbour_maps_ds['selection_field'].values,
+            ['i_offset', 'j_offset', 'center_cc', 'neighbour_cc', 'mean_neighbour_cc'],
+        )
+    )
 
+    if years_match and lats_match and lons_match and fields_match:
+        return neighbour_maps_ds
+    else:
         print(
             "Existing neighbour map grid does not match current input grid. "
             "Recomputing and overwriting existing neighbour map store."
@@ -163,14 +183,14 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
         trim=False,
         dtype=np.float32,
         new_axis=0,
-        chunks=((4,),) + cc_arr.chunks
+        chunks=((5,),) + cc_arr.chunks
     )
     neighbour_maps_ds = xr.Dataset(
         {
             'selection': (('selection_field', 'year', 'lat', 'lon'), neighbour_maps),
         },
         coords={
-            'selection_field': ['i_offset', 'j_offset', 'center_cc', 'neighbour_cc'],
+            'selection_field': ['i_offset', 'j_offset', 'center_cc', 'neighbour_cc', 'mean_neighbour_cc'],
             'year': cc['year'],
             'lat': cc['lat'],
             'lon': cc['lon'],
@@ -298,12 +318,11 @@ def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_nam
         .assign_coords(offset=['i', 'j'])
         .astype(np.int8)
     )
-    ind_results = (
-        selection.sel(selection_field=['center_cc', 'neighbour_cc'])
-        .rename({'selection_field': 'position'})
-        .assign_coords(position=['center', 'neighbour'])
-    )
-    ind_results_ds = xr.Dataset({'ind_results': ind_results})
+    ind_results_ds = xr.Dataset({
+    'ind_centre': selection.sel(selection_field='center_cc').drop_vars('selection_field'),
+    'ind_neighbour': selection.sel(selection_field='neighbour_cc').drop_vars('selection_field'),
+    'ind_neighbour_mean': selection.sel(selection_field='mean_neighbour_cc').drop_vars('selection_field'),
+})
     dep_results_ds = gather_mwa_results(
         dep_var=dep_var,
         neighbour_maps=neighbour_maps,
@@ -332,17 +351,21 @@ def _chunk_offsets(chunks):
 def _write_chunk_parquet(
     centre_chunk,
     neighbour_chunk,
+    mean_neighbour_chunk,
     time_vals,
     lat_vals,
     lon_vals,
     time_col,
     centre_col,
     neighbour_col,
+    mean_neighbour_col,
     out_path,
     compression,
 ):
     centre_chunk = np.asarray(centre_chunk, dtype=np.float32)
     neighbour_chunk = np.asarray(neighbour_chunk, dtype=np.float32)
+    if mean_neighbour_chunk is not None:
+        mean_neighbour_chunk = np.asarray(mean_neighbour_chunk, dtype=np.float32)
 
     t_size = centre_chunk.shape[0]
     y_size = centre_chunk.shape[1]
@@ -353,15 +376,21 @@ def _write_chunk_parquet(
     lat_rep = np.tile(np.repeat(np.asarray(lat_vals), x_size), t_size)
     lon_rep = np.tile(np.asarray(lon_vals), t_size * y_size)
 
-    df = pd.DataFrame(
-        {
-            time_col: time_rep,
-            'lat': lat_rep,
-            'lon': lon_rep,
-            centre_col: centre_chunk.ravel(),
-            neighbour_col: neighbour_chunk.ravel(),
-        }
-    )
+    data = {
+        time_col: time_rep,
+        'lat': lat_rep,
+        'lon': lon_rep,
+        centre_col: centre_chunk.ravel(),
+        neighbour_col: neighbour_chunk.ravel(),
+    }
+    if mean_neighbour_chunk is not None:
+        if mean_neighbour_col is None:
+            raise ValueError(
+                'mean_neighbour_col is required when mean_neighbour_chunk is provided.'
+            )
+        data[mean_neighbour_col] = mean_neighbour_chunk.ravel()
+
+    df = pd.DataFrame(data)
     df = df.dropna(subset=[centre_col])
     if df.empty:
         return None
@@ -380,10 +409,14 @@ def _build_chunk_write_tasks(
     neighbour_col,
     out_dir,
     compression,
+    mean_neighbour_arr=None,
+    mean_neighbour_col=None
 ):
     centre_delayed = centre_arr.to_delayed()
     neighbour_delayed = neighbour_arr.to_delayed()
-
+    mean_neighbour_delayed = None
+    if mean_neighbour_arr is not None:
+        mean_neighbour_delayed = mean_neighbour_arr.to_delayed()
     time_chunks, lat_chunks, lon_chunks = centre_arr.chunks
     time_offsets = _chunk_offsets(time_chunks)
     lat_offsets = _chunk_offsets(lat_chunks)
@@ -400,12 +433,14 @@ def _build_chunk_write_tasks(
             delayed(_write_chunk_parquet)(
                 centre_delayed[ti, yi, xi],
                 neighbour_delayed[ti, yi, xi],
+                mean_neighbour_delayed[ti, yi, xi] if mean_neighbour_delayed is not None else None,
                 time_vals[t0:t1],
                 lat_vals[y0:y1],
                 lon_vals[x0:x1],
                 time_col,
                 centre_col,
                 neighbour_col,
+                mean_neighbour_col,
                 out_path,
                 compression,
             )
@@ -429,19 +464,22 @@ def _write_member_parquet(ind_results, dep_results, out_root, version_idx, clien
     # if client is None:
     #     raise ValueError('A Dask client must be provided to _write_member_parquet.')
 
-    ind_centre = ind_results.sel(position='center').reset_coords('position', drop=True).astype(np.float32).data
-    ind_neighbour = ind_results.sel(position='neighbour').reset_coords('position', drop=True).astype(np.float32).data
+    ind_centre = ind_results['ind_centre'].astype(np.float32).data
+    ind_neighbour = ind_results['ind_neighbour'].astype(np.float32).data
+    ind_neighbour_mean = ind_results['ind_neighbour_mean'].astype(np.float32).data
     ind_tasks = _build_chunk_write_tasks(
-        centre_arr=ind_centre,
-        neighbour_arr=ind_neighbour,
-        time_vals=ind_results['year'].values,
-        lat_vals=ind_results['lat'].values,
-        lon_vals=ind_results['lon'].values,
-        time_col='year',
-        centre_col='ind_centre',
-        neighbour_col='ind_neighbour',
-        out_dir=ind_out,
-        compression=compression,
+    centre_arr=ind_centre,
+    neighbour_arr=ind_neighbour,
+    mean_neighbour_arr=ind_neighbour_mean,
+    time_vals=ind_results['year'].values,
+    lat_vals=ind_results['lat'].values,
+    lon_vals=ind_results['lon'].values,
+    time_col='year',
+    centre_col='ind_centre',
+    neighbour_col='ind_neighbour',
+    mean_neighbour_col='ind_neighbour_mean',
+    out_dir=ind_out,
+    compression=compression,
     )
 
     dep_time_dim = 'year' if 'year' in dep_results.dims else 'time'
@@ -637,7 +675,7 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
             sname=map_sname
         )
 
-        ind_results = ind_results_ds['ind_results']
+        ind_results = ind_results_ds
         dep_results = dep_results_ds['dep_results']
         _write_member_parquet(ind_results, dep_results, out_root, version_idx, client=client)
 
@@ -737,5 +775,16 @@ if __name__ == "__main__":
         run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
                              dep_var_name='tmax', client=client)
 
-        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
-                                     dep_var_name='heatwaves_gapfilled', client=client)
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
+        #                              dep_var_name='heatwaves_gapfilled', client=client)
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', 
+        #                      dep_var_name='absthresh_heatwaves',
+        #                      dep_var_agg='annual_sum',
+        #                      client=client)
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', 
+        #                      dep_var_name='warmest_days',
+        #                      dep_var_agg='annual_mean',
+        #                      client=client)
+        
