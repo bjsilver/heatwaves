@@ -1088,67 +1088,79 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
 # )
 
 #%%
-make_all_plots(
-    ind_var_name='cc',
-    dep_var_name='warmest_days',
-    aggregation='annual_mean',
-    years=None,
-    reset_caches=False,
-    area_slice=None
-)
+# make_all_plots(
+#     ind_var_name='cc',
+#     dep_var_name='warmest_days',
+#     aggregation='annual_mean',
+#     years=None,
+#     reset_caches=False,
+#     area_slice=None
+# )
 
 
 #%%
+
+ind_var_name = 'cc'
 dep_var_name = 'tmax'
+aggregation = 'annual_mean'
+years = None
+aggregation = 'annual_mean'
+reset_caches = False
+area_slice = RESULTS_BBOX
 
 paired_dfs = load_and_cache_all_coarsens(
-    dep_var_name='tmax',
-    ind_var_name='cc',
-    aggregation='annual_mean',
-    reset_caches=False,
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,
+    reset_caches=reset_caches,
 )
 
-pretty_legend = {'ind_centre': 'centre canopy cover',
-          'ind_neighbour': 'neighbour canopy cover',
-          'dep_diff': f'{pretty[dep_var_name]} difference'}
 
-df = paired_dfs[10]
-df['id'] = df['lat'].round(3).astype(str) + '_' +df['lon'].round(3).astype(str)
-loss_thresh=70
-dfl = df.loc[(df['ind_diff'] > loss_thresh)]
-df_high_start = df.loc[(df['year']=='2003') & (df['ind_diff'] < 30)]
-valid = [llid for llid in dfl['id'].values if llid in df_high_start['id'].values]
-df_loss = df.where(df['id'].isin(valid)).dropna(how='all')
 #%%
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-ngroup = df_loss[['ind_centre', 'ind_neighbour']].groupby(df_loss.year)
-ngroup.median().plot(ax=axes[0], color=['goldenrod', 'forestgreen'])
-axes[0].fill_between(ngroup.median().index,
-                        ngroup.quantile(0.75)['ind_centre'],
-                            ngroup.quantile(0.25)['ind_centre'],
-                            color='goldenrod', alpha=0.2)
-axes[0].fill_between(ngroup.median().index,
-                        ngroup.quantile(0.75)['ind_neighbour'],
-                            ngroup.quantile(0.25)['ind_neighbour'],
-                            color='forestgreen', alpha=0.2)
-bgroup=df_loss[['dep_diff']].groupby(df_loss.year)
-bgroup.median().plot(ax=axes[1], color='firebrick')
-axes[1].fill_between(bgroup.median().index,
-                        bgroup.quantile(0.75)['dep_diff'],
-                            bgroup.quantile(0.25)['dep_diff'],
-                            color='firebrick', alpha=0.2)
+coarsen_factor = 25
 
-                                                        
-# add text of n rows in df_loss
-n_rows = len(df_loss)
-axes[0].text(0.02, 0.95, f'n={n_rows}', transform=axes[0].transAxes, fontsize=12, 
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.75))
-axes[0].set_ylabel('mean canopy cover [%]', fontsize=12)
-axes[1].set_ylabel(f'mean {pretty[dep_var_name]} difference [{units[dep_var_name]}]', fontsize=12)
-axes[1].set_xlabel('year', fontsize=12)
-axes[0].legend(['centre canopy cover', 'neighbour canopy cover'], fontsize=10)
-axes[1].legend([f'{pretty[dep_var_name]} difference'], fontsize=10)
-plt.tight_layout()
-for ax in axes:
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-fig.savefig(os.path.join(MWA_FIGDIR, f'{dep_var_name}_cc_loss_time_series.png'), dpi=400, bbox_inches='tight')
+df = paired_dfs[coarsen_factor].copy().astype(float)
+
+idx = pd.IndexSlice
+fig, ax = plt.subplots(figsize=(10, 6))
+bins = np.arange(0, 110, 10)
+ind_diff_bindex = pd.cut(df['ind_diff'], bins)
+mean_ind_cc_bindex = pd.cut(df['ind_neighbour_mean'], bins)
+
+cmap = plt.get_cmap('summer_r')
+norm = plt.Normalize(0, 100)
+
+mean_df = df.groupby(ind_diff_bindex)['dep_diff'].mean()
+mean_df_count = df.groupby(ind_diff_bindex)['dep_diff'].count()
+bin_df = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).mean()
+bin_df_count = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).count()
+
+mean_df = mean_df.loc[mean_df_count > 10]
+mean_df.plot(ax=ax, color='black', marker='o', zorder=1)
+
+bindex = bin_df.index.get_level_values(0).unique()
+for ind_neighbour_mean_bin in bindex:
+    sr = bin_df.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff']
+    sr = sr.where(bin_df_count.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff'] > 10)
+    sr.plot(ax=ax, color=cmap(norm(ind_neighbour_mean_bin.mid)), 
+            marker='o', zorder=0, markersize=4, lw=1)
+
+ax.set_xticks(range(len(mean_df.index)))
+xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in mean_df.index]
+ax.set_xticklabels(xticklabels, rotation=0)
+ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
+ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
+ax.grid(axis='y', linestyle='--', alpha= 0.7)
+
+# add coarsen factor text
+if coarsen_factor is not None:
+    ax.text(0.05, 0.97, f'coarsen_factor: {coarsen_factor}', transform=ax.transAxes,
+            ha='left', va='top', fontsize=10, fontweight='bold')
+
+# add a color legend
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.5)
+cbar.set_label(f'mean {pretty[ind_var_name]} in neighbor [%]', fontsize=10)
+
+#%%
