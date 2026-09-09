@@ -27,6 +27,8 @@ MWA_SCHEMA_VERSION = 2
 # minimum fraction of non-NaN pixels a coarsen block must have to produce a valid coarsened value
 COARSEN_MIN_VALID_FRACTION = 0.90
 
+TEMP_HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/regular_regridded_grid/'
+
 
 def _coarsen_mean_min_valid(data_array, coarsen_factor, min_valid_fraction=COARSEN_MIN_VALID_FRACTION):
     """Coarsen by mean, masking out blocks with too few non-NaN pixels.
@@ -48,9 +50,9 @@ def _coarsen_mean_min_valid(data_array, coarsen_factor, min_valid_fraction=COARS
 
 def _load_canopy_cover_and_loss(era=False):
     if era:
-        ds = xr.open_zarr(HANSEN_DIR+'hansen_regridded.zarr')
+        ds = xr.open_zarr(HANSEN_DIR+'regular_regridded_grid/hansen_regridded.zarr')
     else:
-        ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'), 
+        ds = xr.open_zarr(os.path.join(TEMP_HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'), 
                         consolidated=False)
     tree_cover = ds['tree_cover'].astype(np.float32)
     cc = tree_cover.loc[{'time': slice('2003', '2020')}].rename({'time': 'year'})
