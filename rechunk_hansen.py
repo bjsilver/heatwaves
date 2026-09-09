@@ -1,10 +1,9 @@
 #%%
 import rioxarray as rxr
 import xarray as xr
-from constants import HANSEN_DIR
+from constants import HANSEN_DIR, LON_CHUNK_SIZE, LAT_CHUNK_SIZE
 from dask.distributed import Client, LocalCluster
-import os
-import shutil
+
 import dask
 from ufuncs import add_metadata_to_zarr
 import regionmask
@@ -17,7 +16,17 @@ def open_hansen():
     da2 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000004864-0000000000.tif',
                             chunks='auto').squeeze()
 
-    da = xr.concat([da1, da2], dim='y')
+    da_1 = xr.concat([da1, da2], dim='y')
+
+    da1 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000000000-0000004864.tif',
+                            chunks='auto').squeeze()
+    da2 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000004864-0000004864.tif',
+                            chunks='auto').squeeze()
+
+    da_2 = xr.concat([da1, da2], dim='y')
+
+    da = xr.concat([da_1, da_2], dim='x')
+
 
     da.name = 'tree_cover'
     da.attrs['units'] = '%'
@@ -26,7 +35,6 @@ def open_hansen():
     da = da.rename({'band': 'time'})
     da = da.assign_coords(time=list(range(2000, 2025)))
     da = da.sortby('lat', ascending=True)
-    da = da[:, :-1, :-1]
     return da
 
 
@@ -35,6 +43,25 @@ def mask_non_land(da):
     land_mask = regionmask.defined_regions.natural_earth_v5_1_2.land_10.mask(da[0].lon, da[0].lat)
     da = da.where(~land_mask.isnull())
     return da
+
+#%%
+
+def rechunk_hansen(da):
+    n_lon_chunks = len(da.lon) // LON_CHUNK_SIZE
+    n_lat_chunks = len(da.lat) // LAT_CHUNK_SIZE
+
+    print(f'{len(da.lon) - n_lon_chunks*LON_CHUNK_SIZE} pixels will be dropped from the lon dimension to make it divisible by {LON_CHUNK_SIZE}')
+    print(f'{len(da.lat) - n_lat_chunks*LAT_CHUNK_SIZE} pixels will be dropped from the lat dimension to make it divisible by {LAT_CHUNK_SIZE}')
+
+    da = da.isel(lon=slice(0, n_lon_chunks * LON_CHUNK_SIZE), 
+                lat=slice(0, n_lat_chunks * LAT_CHUNK_SIZE))
+
+    with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
+        rechunked = da.chunk({'time': 1, 
+                                'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+
+    return rechunked
+
 
 #%%
 
@@ -54,22 +81,15 @@ if __name__ == '__main__':
     hansen.encoding = {}
 
     # da = hansen.chunk().data
-    with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
-        rechunked = hansen.chunk({'time': 1, 'lat': 250, 'lon': 250})
+    
 
     with LocalCluster(n_workers=4, threads_per_worker=8, memory_limit='128GB') as cluster:
             with Client(cluster) as client:
                 print(f"Dask Dashboard available at: {client.dashboard_link}")
-                rechunked.to_zarr(TARGET_STORE, mode='w')
+                rechunked = rechunk_hansen(hansen)
+                rechunked = xr.Dataset({'tree_cover': rechunked})
+                rechunked.to_zarr(TARGET_STORE, mode='w', consolidated=True)
 
-        
-    add_metadata_to_zarr(
-        TARGET_STORE,
-        var_name="tree_cover",
-        dims=("time", "lat", "lon"),
-        consolidate=True,
-        orig_ds=hansen,
-    )
 
-    ds = xr.open_zarr(TARGET_STORE, consolidated=False)
+    ds = xr.open_zarr(TARGET_STORE, consolidated=True)
     print(ds)

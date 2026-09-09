@@ -4,7 +4,7 @@ import numpy as np
 MODIS_PATH = '/uolstore/Research/b/b0122/earjba/MODIS_LST/modis_v6.1/processed_from_callum/'
 ERA5_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/'
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
-HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
+HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/zz_original_grid/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 MWA_DIR = STORAGE_DIR+ 'mwa_results/'
 
@@ -21,8 +21,8 @@ ZZ_RECHUNKED_PATH = STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr
 PERCENTILE_KEYS = ['zz_2003-2020', 'zz_2003-2020_smooth', 'zz_2003-2020_gapfilled', 'era5_2003-2020']
 
 # chunk sizes
-LAT_CHUNK_SIZE = 250
-LON_CHUNK_SIZE = 250
+LAT_CHUNK_SIZE = 256
+LON_CHUNK_SIZE = 256
 
 # areas
 # AMAZON_BBOX = {'latitude':slice(-30, 20), 'longitude':slice(-82, -34.5)}
