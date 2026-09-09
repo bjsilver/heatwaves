@@ -8,6 +8,9 @@ HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 MWA_DIR = STORAGE_DIR+ 'mwa_results/'
 
+AREA_BBOX = {'westlimit':-82, 'eastlimit':-34.5, 'southlimit':-30, 'northlimit':20}
+
+
 FIGDIR = '/uolstore/Research/b/b0256/Users/earbsi/figs/heatwaves/'
 
 # paths to specific files

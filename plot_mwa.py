@@ -948,6 +948,62 @@ def plot_mwa_results_all(
     return fig, ax
 
 
+def plot_mean_cc_response(dep_var_name, ind_var_name, aggregation, 
+                          coarsen_factor=None, reset_caches=None):
+
+    paired_dfs = load_and_cache_all_coarsens(
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,
+    reset_caches=reset_caches,
+)
+
+    df = paired_dfs[coarsen_factor].copy().astype(float)
+
+    idx = pd.IndexSlice
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bins = np.arange(0, 110, 10)
+    ind_diff_bindex = pd.cut(df['ind_diff'], bins)
+    mean_ind_cc_bindex = pd.cut(df['ind_neighbour_mean'], bins)
+
+    cmap = plt.get_cmap('summer_r')
+    norm = plt.Normalize(0, 100)
+
+    mean_df = df.groupby(ind_diff_bindex)['dep_diff'].mean()
+    mean_df_count = df.groupby(ind_diff_bindex)['dep_diff'].count()
+    bin_df = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).mean()
+    bin_df_count = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).count()
+
+    mean_df = mean_df.loc[mean_df_count > 10]
+    mean_df.plot(ax=ax, color='black', marker='o', zorder=1)
+
+    bindex = bin_df.index.get_level_values(0).unique()
+    for ind_neighbour_mean_bin in bindex:
+        sr = bin_df.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff']
+        sr = sr.where(bin_df_count.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff'] > 10)
+        sr.plot(ax=ax, color=cmap(norm(ind_neighbour_mean_bin.mid)), 
+                marker='o', zorder=0, markersize=4, lw=1)
+
+    ax.set_xticks(range(len(mean_df.index)))
+    xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in mean_df.index]
+    ax.set_xticklabels(xticklabels, rotation=0)
+    ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
+    ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
+    ax.grid(axis='y', linestyle='--', alpha= 0.7)
+
+    # add coarsen factor text
+    if coarsen_factor is not None:
+        ax.text(0.05, 0.97, f'coarsen_factor: {coarsen_factor}', transform=ax.transAxes,
+                ha='left', va='top', fontsize=10, fontweight='bold')
+
+    # add a color legend
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.5)
+    cbar.set_label(f'mean {pretty[ind_var_name]} in neighbor [%]', fontsize=10)
+
+    fig.savefig(os.path.join(MWA_FIGDIR, f'{dep_var_name}_{aggregation}_vs_{ind_var_name}_mean_cc_response.png'), dpi=400, bbox_inches='tight')
+
 def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
                    area_slice=None, reset_caches=None):
 
@@ -1098,69 +1154,17 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
 # )
 
 
-#%%
+# #%%
 
-ind_var_name = 'cc'
-dep_var_name = 'tmax'
-aggregation = 'annual_mean'
-years = None
-aggregation = 'annual_mean'
-reset_caches = False
-area_slice = RESULTS_BBOX
-
-paired_dfs = load_and_cache_all_coarsens(
-    dep_var_name=dep_var_name,
-    ind_var_name=ind_var_name,
-    aggregation=aggregation,
-    reset_caches=reset_caches,
-)
+# ind_var_name = 'cc'
+# dep_var_name = 'tmax'
+# aggregation = 'annual_mean'
+# years = None
+# aggregation = 'annual_mean'
+# reset_caches = False
+# area_slice = RESULTS_BBOX
 
 
-#%%
-coarsen_factor = 25
 
-df = paired_dfs[coarsen_factor].copy().astype(float)
-
-idx = pd.IndexSlice
-fig, ax = plt.subplots(figsize=(10, 6))
-bins = np.arange(0, 110, 10)
-ind_diff_bindex = pd.cut(df['ind_diff'], bins)
-mean_ind_cc_bindex = pd.cut(df['ind_neighbour_mean'], bins)
-
-cmap = plt.get_cmap('summer_r')
-norm = plt.Normalize(0, 100)
-
-mean_df = df.groupby(ind_diff_bindex)['dep_diff'].mean()
-mean_df_count = df.groupby(ind_diff_bindex)['dep_diff'].count()
-bin_df = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).mean()
-bin_df_count = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).count()
-
-mean_df = mean_df.loc[mean_df_count > 10]
-mean_df.plot(ax=ax, color='black', marker='o', zorder=1)
-
-bindex = bin_df.index.get_level_values(0).unique()
-for ind_neighbour_mean_bin in bindex:
-    sr = bin_df.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff']
-    sr = sr.where(bin_df_count.loc[idx[:, ind_neighbour_mean_bin], 'dep_diff'] > 10)
-    sr.plot(ax=ax, color=cmap(norm(ind_neighbour_mean_bin.mid)), 
-            marker='o', zorder=0, markersize=4, lw=1)
-
-ax.set_xticks(range(len(mean_df.index)))
-xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in mean_df.index]
-ax.set_xticklabels(xticklabels, rotation=0)
-ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
-ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
-ax.grid(axis='y', linestyle='--', alpha= 0.7)
-
-# add coarsen factor text
-if coarsen_factor is not None:
-    ax.text(0.05, 0.97, f'coarsen_factor: {coarsen_factor}', transform=ax.transAxes,
-            ha='left', va='top', fontsize=10, fontweight='bold')
-
-# add a color legend
-sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-sm.set_array([])
-cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.5)
-cbar.set_label(f'mean {pretty[ind_var_name]} in neighbor [%]', fontsize=10)
-
-#%%
+# #%%
+# coarsen_factor = 25

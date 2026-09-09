@@ -22,6 +22,28 @@ SEASON_MAP = {'DJF': [12, 1, 2], 'MAM': [3, 4, 5], 'JJA': [6, 7, 8], 'SON': [9, 
 NEIGHBOUR_MAP_FILL_VALUE = np.int8(-128)
 CC_LOSS_EXPLAINED_FRACTION = 0.90
 MWA_ALGORITHM_TAG = f'cc-loss-explained-{int(CC_LOSS_EXPLAINED_FRACTION * 100):02d}'
+# bump when the parquet output schema changes, to force stale cached versions to recompute
+MWA_SCHEMA_VERSION = 2
+# minimum fraction of non-NaN pixels a coarsen block must have to produce a valid coarsened value
+COARSEN_MIN_VALID_FRACTION = 0.90
+
+
+def _coarsen_mean_min_valid(data_array, coarsen_factor, min_valid_fraction=COARSEN_MIN_VALID_FRACTION):
+    """Coarsen by mean, masking out blocks with too few non-NaN pixels.
+
+    Sums values and valid-pixel counts in a single coarsen pass (stacked along a temporary
+    axis) rather than two separate coarsen calls, since a second full coarsen pass over large
+    (often daily-resolution) dask-backed inputs doubles graph-construction time.
+    """
+    valid = data_array.notnull()
+    filled = data_array.fillna(0)
+    stacked = xr.concat([filled, valid.astype(filled.dtype)], dim='_stat')
+    coarsened_sum = stacked.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').sum()
+    value_sum = coarsened_sum.isel(_stat=0, drop=True)
+    valid_count = coarsened_sum.isel(_stat=1, drop=True)
+    total_pixels = coarsen_factor * coarsen_factor
+    mean = value_sum / valid_count.where(valid_count > 0)
+    return mean.where((valid_count / total_pixels) >= min_valid_fraction)
 
 
 def _load_canopy_cover_and_loss(era=False):
@@ -126,11 +148,12 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
         & (center_cc_loss >= loss_explained_fraction * max_ind_diff)
     )
 
+    # np.divide's out=/where= kwargs are unsupported in numba njit code; use np.where instead
+    has_neighbour_cc = neighbour_cc_count > 0
+    safe_neighbour_cc_count = np.where(has_neighbour_cc, neighbour_cc_count, 1)
     mean_neighbour_cc = np.where(
-    neighbour_cc_count > 0,
-    neighbour_cc_sum / neighbour_cc_count,
-    np.nan
-)
+        has_neighbour_cc, neighbour_cc_sum / safe_neighbour_cc_count, np.nan
+    )
 
     out[0] = np.where(valid, max_ind_diff_ioffset, NEIGHBOUR_MAP_FILL_VALUE)
     out[1] = np.where(valid, max_ind_diff_joffset, NEIGHBOUR_MAP_FILL_VALUE)
@@ -217,9 +240,11 @@ def _gather_mwa_results_kernel(arr, neighbour_maps, window_radius):
 
     
 
-    out = np.full((2, t_size, h_size, w_size), np.nan, dtype=np.float32)
+    out = np.full((3, t_size, h_size, w_size), np.nan, dtype=np.float32)
     center_arr = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
     neighbour_arr = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
+    neighbour_sum = np.zeros((t_size, h_size, w_size), dtype=np.float32)
+    neighbour_count = np.zeros((t_size, h_size, w_size), dtype=np.int16)
 
 
     center_vals = arr[:, window_radius:window_radius + h_size, window_radius:window_radius + w_size]
@@ -229,6 +254,43 @@ def _gather_mwa_results_kernel(arr, neighbour_maps, window_radius):
                 continue
             ri, rj = window_radius + di, window_radius + dj
             n_arr = arr[:, ri:ri + h_size, rj:rj + w_size]
+            neighbour_in = (neighbour_maps[0] == di) & (neighbour_maps[1] == dj)
+
+            neighbour_arr = np.where(neighbour_in, n_arr, neighbour_arr)
+            center_arr = np.where(neighbour_in, center_vals, center_arr)
+
+            finite_n = np.isfinite(n_arr)
+            neighbour_sum += np.where(finite_n, n_arr, 0.0)
+            neighbour_count += finite_n
+
+    # mean is over all neighbours, but only meaningful where a neighbour was actually selected
+    has_neighbours = neighbour_count > 0
+    mean_neighbour_arr = np.full_like(neighbour_sum, np.nan)
+    np.divide(neighbour_sum, neighbour_count, out=mean_neighbour_arr, where=has_neighbours)
+    mean_neighbour_arr = np.where(np.isfinite(neighbour_arr), mean_neighbour_arr, np.nan)
+
+    out[0] = center_arr
+    out[1] = neighbour_arr
+    out[2] = mean_neighbour_arr
+    return out
+
+
+def _gather_elev_kernel(elev_block, neighbour_maps, window_radius):
+    t_size = elev_block.shape[0]
+    h_size = elev_block.shape[1] - 2 * window_radius
+    w_size = elev_block.shape[2] - 2 * window_radius
+
+    out = np.full((2, t_size, h_size, w_size), np.nan, dtype=np.float32)
+    center_arr = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
+    neighbour_arr = np.full((t_size, h_size, w_size), np.nan, dtype=np.float32)
+
+    center_vals = elev_block[:, window_radius:window_radius + h_size, window_radius:window_radius + w_size]
+    for di in range(-window_radius, window_radius + 1):
+        for dj in range(-window_radius, window_radius + 1):
+            if di == 0 and dj == 0:
+                continue
+            ri, rj = window_radius + di, window_radius + dj
+            n_arr = elev_block[:, ri:ri + h_size, rj:rj + w_size]
             neighbour_in = (neighbour_maps[0] == di) & (neighbour_maps[1] == dj)
 
             neighbour_arr = np.where(neighbour_in, n_arr, neighbour_arr)
@@ -258,7 +320,7 @@ def gather_mwa_results(dep_var, neighbour_maps, dep_var_name, window_radius):
             boundary=[np.nan, NEIGHBOUR_MAP_FILL_VALUE],
             trim=False,
             dtype=np.float32,
-            chunks=((2,),) + dep_arr.chunks,
+            chunks=((3,),) + dep_arr.chunks,
         )
 
     elif dep_time_dim == 'time':
@@ -286,7 +348,7 @@ def gather_mwa_results(dep_var, neighbour_maps, dep_var_name, window_radius):
                 trim=False,
                 align_arrays=False,
                 dtype=np.float32,
-                chunks=((2,),) + dep_var_year.data.chunks,
+                chunks=((3,),) + dep_var_year.data.chunks,
             )
             dep_results_list.append(dep_results_year)
             
@@ -298,7 +360,7 @@ def gather_mwa_results(dep_var, neighbour_maps, dep_var_name, window_radius):
             dep_results),
         },
         coords={
-            'position': ['center', 'neighbour'],
+            'position': ['center', 'neighbour', 'mean_neighbour'],
             dep_time_dim: dep_var[dep_time_dim],
             'lat': dep_var['lat'],
             'lon': dep_var['lon'],
@@ -308,7 +370,43 @@ def gather_mwa_results(dep_var, neighbour_maps, dep_var_name, window_radius):
     return dep_results_ds
 
 
-def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_name, sname):
+def gather_elev_results(elev, neighbour_maps, window_radius):
+    """Gather centre/selected-neighbour elevation using the ind_var neighbour offsets."""
+    elev_broadcast = elev.broadcast_like(neighbour_maps.isel(offset=0).drop_vars('offset'))
+    elev_broadcast = elev_broadcast.chunk(
+        {dim: neighbour_maps.chunksizes[dim] for dim in elev_broadcast.dims}
+    )
+    elev_arr = elev_broadcast.astype(np.float32).data
+
+    elev_results = da.map_overlap(
+        _gather_elev_kernel,
+        elev_arr,
+        neighbour_maps.data,
+        window_radius=window_radius,
+        depth=[
+            {0: 0, 1: window_radius, 2: window_radius},
+            {0: 0, 1: 0, 2: 0, 3: 0},
+        ],
+        boundary=[np.nan, NEIGHBOUR_MAP_FILL_VALUE],
+        trim=False,
+        dtype=np.float32,
+        chunks=((2,),) + elev_arr.chunks,
+    )
+    elev_results_ds = xr.Dataset(
+        {
+            'elev_results': (('position', 'year', 'lat', 'lon'), elev_results),
+        },
+        coords={
+            'position': ['center', 'neighbour'],
+            'year': neighbour_maps['year'],
+            'lat': neighbour_maps['lat'],
+            'lon': neighbour_maps['lon'],
+        },
+    )
+    return elev_results_ds
+
+
+def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_name, sname, elev=None):
     """Moving-window analysis on (time, lat, lon) inputs."""
 
     selection = _get_mwa_neighbour_map(ind_var, cc_loss, window_radius, sname)['selection']
@@ -323,6 +421,12 @@ def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_nam
     'ind_neighbour': selection.sel(selection_field='neighbour_cc').drop_vars('selection_field'),
     'ind_neighbour_mean': selection.sel(selection_field='mean_neighbour_cc').drop_vars('selection_field'),
 })
+
+    if elev is not None:
+        elev_results_ds = gather_elev_results(elev, neighbour_maps, window_radius)
+        ind_results_ds['elev_centre'] = elev_results_ds['elev_results'].sel(position='center').drop_vars('position')
+        ind_results_ds['elev_neighbour'] = elev_results_ds['elev_results'].sel(position='neighbour').drop_vars('position')
+
     dep_results_ds = gather_mwa_results(
         dep_var=dep_var,
         neighbour_maps=neighbour_maps,
@@ -361,11 +465,19 @@ def _write_chunk_parquet(
     mean_neighbour_col,
     out_path,
     compression,
+    elev_centre_chunk=None,
+    elev_centre_col=None,
+    elev_neighbour_chunk=None,
+    elev_neighbour_col=None,
 ):
     centre_chunk = np.asarray(centre_chunk, dtype=np.float32)
     neighbour_chunk = np.asarray(neighbour_chunk, dtype=np.float32)
     if mean_neighbour_chunk is not None:
         mean_neighbour_chunk = np.asarray(mean_neighbour_chunk, dtype=np.float32)
+    if elev_centre_chunk is not None:
+        elev_centre_chunk = np.asarray(elev_centre_chunk, dtype=np.float32)
+    if elev_neighbour_chunk is not None:
+        elev_neighbour_chunk = np.asarray(elev_neighbour_chunk, dtype=np.float32)
 
     t_size = centre_chunk.shape[0]
     y_size = centre_chunk.shape[1]
@@ -389,6 +501,14 @@ def _write_chunk_parquet(
                 'mean_neighbour_col is required when mean_neighbour_chunk is provided.'
             )
         data[mean_neighbour_col] = mean_neighbour_chunk.ravel()
+    if elev_centre_chunk is not None:
+        if elev_centre_col is None:
+            raise ValueError('elev_centre_col is required when elev_centre_chunk is provided.')
+        data[elev_centre_col] = elev_centre_chunk.ravel()
+    if elev_neighbour_chunk is not None:
+        if elev_neighbour_col is None:
+            raise ValueError('elev_neighbour_col is required when elev_neighbour_chunk is provided.')
+        data[elev_neighbour_col] = elev_neighbour_chunk.ravel()
 
     df = pd.DataFrame(data)
     df = df.dropna(subset=[centre_col])
@@ -410,13 +530,23 @@ def _build_chunk_write_tasks(
     out_dir,
     compression,
     mean_neighbour_arr=None,
-    mean_neighbour_col=None
+    mean_neighbour_col=None,
+    elev_centre_arr=None,
+    elev_centre_col=None,
+    elev_neighbour_arr=None,
+    elev_neighbour_col=None,
 ):
     centre_delayed = centre_arr.to_delayed()
     neighbour_delayed = neighbour_arr.to_delayed()
     mean_neighbour_delayed = None
     if mean_neighbour_arr is not None:
         mean_neighbour_delayed = mean_neighbour_arr.to_delayed()
+    elev_centre_delayed = None
+    if elev_centre_arr is not None:
+        elev_centre_delayed = elev_centre_arr.to_delayed()
+    elev_neighbour_delayed = None
+    if elev_neighbour_arr is not None:
+        elev_neighbour_delayed = elev_neighbour_arr.to_delayed()
     time_chunks, lat_chunks, lon_chunks = centre_arr.chunks
     time_offsets = _chunk_offsets(time_chunks)
     lat_offsets = _chunk_offsets(lat_chunks)
@@ -443,6 +573,10 @@ def _build_chunk_write_tasks(
                 mean_neighbour_col,
                 out_path,
                 compression,
+                elev_centre_chunk=elev_centre_delayed[ti, yi, xi] if elev_centre_delayed is not None else None,
+                elev_centre_col=elev_centre_col,
+                elev_neighbour_chunk=elev_neighbour_delayed[ti, yi, xi] if elev_neighbour_delayed is not None else None,
+                elev_neighbour_col=elev_neighbour_col,
             )
         )
     return tasks
@@ -467,6 +601,7 @@ def _write_member_parquet(ind_results, dep_results, out_root, version_idx, clien
     ind_centre = ind_results['ind_centre'].astype(np.float32).data
     ind_neighbour = ind_results['ind_neighbour'].astype(np.float32).data
     ind_neighbour_mean = ind_results['ind_neighbour_mean'].astype(np.float32).data
+    has_elev = 'elev_centre' in ind_results
     ind_tasks = _build_chunk_write_tasks(
     centre_arr=ind_centre,
     neighbour_arr=ind_neighbour,
@@ -480,20 +615,27 @@ def _write_member_parquet(ind_results, dep_results, out_root, version_idx, clien
     mean_neighbour_col='ind_neighbour_mean',
     out_dir=ind_out,
     compression=compression,
+    elev_centre_arr=ind_results['elev_centre'].astype(np.float32).data if has_elev else None,
+    elev_centre_col='elev_centre' if has_elev else None,
+    elev_neighbour_arr=ind_results['elev_neighbour'].astype(np.float32).data if has_elev else None,
+    elev_neighbour_col='elev_neighbour' if has_elev else None,
     )
 
     dep_time_dim = 'year' if 'year' in dep_results.dims else 'time'
     dep_centre = dep_results.sel(position='center').reset_coords('position', drop=True).astype(np.float32).data
     dep_neighbour = dep_results.sel(position='neighbour').reset_coords('position', drop=True).astype(np.float32).data
+    dep_neighbour_mean = dep_results.sel(position='mean_neighbour').reset_coords('position', drop=True).astype(np.float32).data
     dep_tasks = _build_chunk_write_tasks(
         centre_arr=dep_centre,
         neighbour_arr=dep_neighbour,
+        mean_neighbour_arr=dep_neighbour_mean,
         time_vals=dep_results[dep_time_dim].values,
         lat_vals=dep_results['lat'].values,
         lon_vals=dep_results['lon'].values,
         time_col=dep_time_dim,
         centre_col='dep_centre',
         neighbour_col='dep_neighbour',
+        mean_neighbour_col='dep_neighbour_mean',
         out_dir=dep_out,
         compression=compression,
     )
@@ -533,6 +675,7 @@ def _run_metadata_matches_current_algorithm(out_root):
     return (
         metadata.get('algorithm') == MWA_ALGORITHM_TAG
         and metadata.get('cc_loss_explained_fraction') == CC_LOSS_EXPLAINED_FRACTION
+        and metadata.get('schema_version') == MWA_SCHEMA_VERSION
     )
 
 
@@ -555,28 +698,33 @@ def _write_run_metadata(out_root, sname, coarsen_factor, dep_var_agg, expected_v
         'ind_var_name': 'cc',
         'algorithm': MWA_ALGORITHM_TAG,
         'cc_loss_explained_fraction': CC_LOSS_EXPLAINED_FRACTION,
+        'schema_version': MWA_SCHEMA_VERSION,
         'expected_versions': expected_versions,
         'completed_versions': completed_versions,
         'complete': len(completed_versions) == expected_versions,
     }
     with open(os.path.join(out_root, '_run_metadata.json'), 'w', encoding='utf-8') as fobj:
         json.dump(metadata, fobj, indent=2)
-def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor):
-    """Generate coarsened cc, cumulative-loss, and dependent-variable versions.
+def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev=None):
+    """Generate coarsened cc, cumulative-loss, dependent-variable, and elevation versions.
 
-    Returns a list of (cc_coarse, cc_loss_coarse, dep_coarse) tuples.
-    For coarsen_factor >= 10, creates offset versions with 5-pixel intervals.
+    Returns a list of (cc_coarse, cc_loss_coarse, dep_coarse, elev_coarse) tuples, where
+    elev_coarse is None throughout if elev is None. For coarsen_factor >= 10, creates offset
+    versions with 5-pixel intervals.
     """
     dss = []
 
     # First version: standard coarsening
-    ind_coarse = ind_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-    cc_loss_coarse = cc_loss.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-    dep_coarse = dep_var.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+    ind_coarse = _coarsen_mean_min_valid(ind_var, coarsen_factor)
+    cc_loss_coarse = _coarsen_mean_min_valid(cc_loss, coarsen_factor)
+    dep_coarse = _coarsen_mean_min_valid(dep_var, coarsen_factor)
+    elev_coarse = None
+    if elev is not None:
+        elev_coarse = _coarsen_mean_min_valid(elev, coarsen_factor)
     # rechunk for the coarsened versions
     # ind_coarse = ind_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
     # dep_coarse = dep_coarse.chunk({'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
-    dss.append((ind_coarse, cc_loss_coarse, dep_coarse))
+    dss.append((ind_coarse, cc_loss_coarse, dep_coarse, elev_coarse))
 
     # Add offset versions if coarsen_factor >= 10
     if coarsen_factor >= 10:
@@ -600,13 +748,22 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor):
 
             dep_shifted = dep_var.loc[{'lat': slice(dep_var.lat.values[offset], dep_var.lat.values[-offset]),
                                        'lon': slice(dep_var.lon.values[offset], dep_var.lon.values[-offset])}]
+            elev_shifted = None
+            if elev is not None:
+                elev_shifted = elev.loc[
+                    {
+                        'lat': slice(elev.lat.values[offset], elev.lat.values[-offset]),
+                        'lon': slice(elev.lon.values[offset], elev.lon.values[-offset]),
+                    }
+                ]
 
             # Coarsen the shifted versions
-            ind_shifted_coarse = ind_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
-            cc_loss_shifted_coarse = cc_loss_shifted.coarsen(
-                lat=coarsen_factor, lon=coarsen_factor, boundary='trim'
-            ).mean()
-            dep_shifted_coarse = dep_shifted.coarsen(lat=coarsen_factor, lon=coarsen_factor, boundary='trim').mean()
+            ind_shifted_coarse = _coarsen_mean_min_valid(ind_shifted, coarsen_factor)
+            cc_loss_shifted_coarse = _coarsen_mean_min_valid(cc_loss_shifted, coarsen_factor)
+            dep_shifted_coarse = _coarsen_mean_min_valid(dep_shifted, coarsen_factor)
+            elev_shifted_coarse = None
+            if elev_shifted is not None:
+                elev_shifted_coarse = _coarsen_mean_min_valid(elev_shifted, coarsen_factor)
 
             # get mode chunk sizes for the coarsened versions
             mode_lat_chunk_size = np.bincount(ind_shifted_coarse.chunks[ind_shifted_coarse.dims.index('lat')]).argmax()
@@ -618,8 +775,12 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor):
                 {'lat': mode_lat_chunk_size, 'lon': mode_lon_chunk_size}
             )
             dep_shifted_coarse = dep_shifted_coarse.chunk({'lat': mode_lat_chunk_size, 'lon': mode_lon_chunk_size})
+            if elev_shifted_coarse is not None:
+                elev_shifted_coarse = elev_shifted_coarse.chunk(
+                    {'lat': mode_lat_chunk_size, 'lon': mode_lon_chunk_size}
+                )
 
-            dss.append((ind_shifted_coarse, cc_loss_shifted_coarse, dep_shifted_coarse))
+            dss.append((ind_shifted_coarse, cc_loss_shifted_coarse, dep_shifted_coarse, elev_shifted_coarse))
 
     return dss
 
@@ -636,12 +797,14 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
         ind_var = ind_var.where(elev < 1000)
         cc_loss = cc_loss.where(elev < 1000)
         dep_var = dep_var.where(elev < 1000)
+    else:
+        elev = None
 
     # Generate list of variable triplets (with offsets if applicable)
     if coarsen_factor:
-        dss = _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor)
+        dss = _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev=elev)
     else:
-        dss = [(ind_var, cc_loss, dep_var)]
+        dss = [(ind_var, cc_loss, dep_var, elev)]
 
     os.makedirs(MWA_DIR, exist_ok=True)
     out_root = os.path.join(MWA_DIR, f'{sname}_mwa_members_parquet')
@@ -650,7 +813,7 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
     reuse_existing_members = _run_metadata_matches_current_algorithm(out_root)
 
     # Process each version
-    for version_idx, (ind_var_version, cc_loss_version, dep_var_version) in enumerate(dss):
+    for version_idx, (ind_var_version, cc_loss_version, dep_var_version, elev_version) in enumerate(dss):
         if reuse_existing_members and _has_complete_version_members(out_root, version_idx):
             print(f"Version {version_idx} parquet outputs already exist. Skipping recompute.")
             continue
@@ -672,7 +835,8 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
             dep_var=dep_var_version,
             window_radius=window_radius,
             dep_var_name=dep_var_name,
-            sname=map_sname
+            sname=map_sname,
+            elev=elev_version,
         )
 
         ind_results = ind_results_ds
@@ -772,11 +936,11 @@ if __name__ == "__main__":
     with local_cluster(n_workers=32, threads_per_worker=1, memory_limit='20GB',
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
 
-        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
-                             dep_var_name='tmax', client=client)
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+        #                      dep_var_name='tmax', client=client)
 
-        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
-        #                              dep_var_name='heatwaves_gapfilled', client=client)
+        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
+                            dep_var_name='heatwaves_gapfilled', client=client)
 
         # run_mwa_coarsen_loop(ind_var_name='cc', 
         #                      dep_var_name='absthresh_heatwaves',
