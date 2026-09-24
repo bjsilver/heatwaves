@@ -1,29 +1,52 @@
 #%%
+
 import ee
 import xarray as xr
-import matplotlib.pyplot as plt
-from constants import STORAGE_DIR, AREA_BBOX
+from constants import ZZ_SOURCE_DIR
 
 # 1. Initialize and Authenticate Earth Engine
 ee.Authenticate(auth_mode='notebook')
 ee.Initialize()
 #%%
 
-# 2. Setup Data and ROI (South America / Amazon BBox)
+target = xr.open_dataset(ZZ_SOURCE_DIR + 'SouthAmerica_Ta_SVCMsp_2003TMAX_daily_tropics30N30S.nc')['Ta_TMAX']
+
+target_crs = 'EPSG:4326'
+lon_res = (target.lon[1] - target.lon[0]).item()
+lat_res = (target.lat[1] - target.lat[0]).item()
+
+# target.lon/lat are pixel CENTERS, but crsTransform anchors the top-left
+# pixel CORNER, so shift back by half a pixel in each direction to align.
+target_transform = [
+    lon_res,
+    0,
+    target.lon[0].item() - lon_res / 2,
+    0,
+    lat_res,
+    target.lat[0].item() - lat_res / 2,
+]
+
+print('Target CRS:', target_crs)
+print('Target transform:', target_transform)
+
+#%%
+
+# 2. Setup Data and ROI (exact extent of the target Ta grid)
 dataset = ee.Image('UMD/hansen/global_forest_change_2025_v1_13')
 roi = ee.Geometry.BBox(
-    AREA_BBOX['westlimit'],
-    AREA_BBOX['southlimit'],
-    AREA_BBOX['eastlimit'],
-    AREA_BBOX['northlimit']
+    target.lon.min().item() - abs(lon_res) / 2,
+    target.lat.min().item() - abs(lat_res) / 2,
+    target.lon.max().item() + abs(lon_res) / 2,
+    target.lat.max().item() + abs(lat_res) / 2,
 )
-# test small roi
-#roi = ee.Geometry.BBox(-63, -6, -62, -5)
 
 # Extract core bands
 tc00 = dataset.select('treecover2000').clip(roi)
 loss_year = dataset.select('lossyear').clip(roi)
 gain = dataset.select('gain').clip(roi)
+
+#%%
+
 
 
 #%%
@@ -39,33 +62,6 @@ for year_val in range(1, 25):
     annual_list.append(year_img)
 
 annual_stack = ee.Image.cat(annual_list)
-
-# 4. Regridding (0.01 degree)
-tmax_collection = ee.ImageCollection(
-    'projects/sat-io/open-datasets/global-daily-air-temp/latin_america'
-)
-
-tmax_img = (
-    tmax_collection
-    .filterDate('2003-01-01', '2003-01-02')
-    .filter(ee.Filter.stringContains('system:index', 'TMAX'))
-    .first()
-)
-
-tmax_proj = tmax_img.select('b1').projection()
-
-target_crs = 'EPSG:4326'
-target_transform = [
-    0.008055117514264009,
-    0,
-    -154.88527132920055,
-    0,
-    -0.008055117514264009,
-    28.075000000030002,
-]
-
-print('TMAX CRS:', target_crs)
-print('TMAX transform:', target_transform)
 
 regridded_tc = (
     annual_stack

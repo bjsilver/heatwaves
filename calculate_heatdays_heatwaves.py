@@ -9,6 +9,7 @@ from constants import (
     HEATWAVE_DAY_THRESH,
     LAT_CHUNK_SIZE,
     LON_CHUNK_SIZE,
+    TMAX_RECHUNKED_FILE
 )
 from ufuncs import ensure_match_coords, local_cluster
 from dask.diagnostics import ProgressBar
@@ -19,8 +20,8 @@ import matplotlib.pyplot as plt
 HEATWAVE_DAY_THRESH = 3
 
 
-def load_data(adjust_era5=False):
-    zz = xr.open_zarr(STORAGE_DIR + 'rechunked/zhang_zhou_regridded_rechunked.zarr',
+def load_data():
+    zz = xr.open_zarr(TMAX_RECHUNKED_FILE,
                     consolidated=True)['Ta_TMAX'] / 10
     
     # check if zz time has duplicates
@@ -30,8 +31,7 @@ def load_data(adjust_era5=False):
 
     zz_pct = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc.zarr',
                         consolidated=True)['Ta_TMAX_p95'] / 10
-    zz_pct_smooth = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc_smooth.zarr',
-                        consolidated=True)['Ta_TMAX_p95_smooth'] / 10
+
     zz_pct_gapfilled = xr.open_zarr(STORAGE_DIR + 'percentiles/zz_tmax_95pc_gapfilled.zarr',
                         consolidated=False)['Ta_TMAX_p95'] / 10
 
@@ -40,13 +40,8 @@ def load_data(adjust_era5=False):
     era = xr.open_zarr(STORAGE_DIR + 'regridded/era5_t2m_p95_2003-2020_regridded.zarr',
                         consolidated=True)['heatwaves']
     
-    if adjust_era5:
-        # Adjust ERA5 percentiles to match Zhang & Zhou percentiles
-        era = era * (zz_pct.median(['lat', 'lon']) / era.median(['lat', 'lon']))
-        era.to_zarr(STORAGE_DIR + 'percentiles/era5_t2m_p95_2003-2020_zzadjusted.zarr', mode='w', consolidated=True)
-    
-    
-    pct = xr.Dataset({'zz_2003-2020': zz_pct, 'zz_2003-2020_smooth': zz_pct_smooth,
+
+    pct = xr.Dataset({'zz_2003-2020': zz_pct,
                       'zz_2003-2020_gapfilled': zz_pct_gapfilled, 'era5_2003-2020': era})
     zz, pct = ensure_match_coords(zz, pct)
     return zz, pct
@@ -129,12 +124,13 @@ def remove_short_runs(heatdays, thresh=HEATWAVE_DAY_THRESH):
 #%%
 if __name__ == '__main__':
 
-    with local_cluster(n_workers=32, threads_per_worker=4, memory_limit='8GB',
+    with local_cluster(n_workers=1, threads_per_worker=128, memory_limit='500GB',
+                       processes=False,
         dashboard_address=':6767', suppress_dask_warnings=True, use_dask_dashboard=True):
 
-            zz, pct = load_data(adjust_era5=True)
+            zz, pct = load_data()
 
-            for pctlkey in ['era5_2003-2020']:
+            for pctlkey in ['zz_2003-2020_gapfilled']:
                 print(f"Calculating annual heatwave-day sums for {pctlkey}...")
                 pctda = pct[pctlkey]
                 write_path = STORAGE_DIR + f'heatdays/heatwaves_annual_sum_{pctlkey}.zarr'

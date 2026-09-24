@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import numpy as np
 import xarray as xr
-from constants import STORAGE_DIR
+from constants import STORAGE_DIR, HANSEN_DIR
 import xesmf as xe
 
 
@@ -119,30 +119,23 @@ da2 = open_globe_tile(Path(STORAGE_DIR) / "../elevation/j10g")
 da = xr.concat([da2, da1], dim="lat")
 
 # open zarr template
-template = xr.open_zarr(STORAGE_DIR+'heatdays/heatwaves_annual_sum_zz_2003-2020_gapfilled.zarr')
-template = template.isel(year=0)
+template = xr.open_zarr(HANSEN_DIR+'hansen_tc_2000_2024_rechunked.zarr')
+template = template.isel(time=0)
 
 # slice da by template limits
-da = da.sel(lat=slice(template.lat.min(), template.lat.max()),
-             lon=slice(template.lon.min(), template.lon.max()))
+da = da.sel(lat=slice(template.lat.min()-.1, template.lat.max()+.1),
+             lon=slice(template.lon.min()-.1, template.lon.max()+.1))
 #%%
 # create and save regridder weights
 regridder = xe.Regridder(da, template, "bilinear", reuse_weights=False)
-regridder.to_netcdf(STORAGE_DIR+"../elevation/elevation_regrid_weights.nc")
+regridder.to_netcdf(STORAGE_DIR+"../elevation/orig_resolution_regridded/elevation_regrid_weights.nc")
 
 #%%
-if os.path.exists(STORAGE_DIR+"../elevation/elevation_regrid_weights.nc"):
-    regridder = xe.Regridder(da, template, "bilinear", weights=STORAGE_DIR+"../elevation/elevation_regrid_weights.nc")
+if os.path.exists(STORAGE_DIR+"../elevation/orig_resolution_regridded/elevation_regrid_weights.nc"):
+    regridder = xe.Regridder(da, template, "bilinear", weights=STORAGE_DIR+"../elevation/orig_resolution_regridded/elevation_regrid_weights.nc")
 
 da_regridded = regridder(da)
 da_regridded.name = "elevation"
 da_regridded.attrs["source"] = "NOAA GLOBE (regridded to match heatwave template)"
-da_regridded.to_netcdf(STORAGE_DIR+"../elevation/elevation_regridded.nc")
+da_regridded.to_netcdf(STORAGE_DIR+"../elevation/orig_resolution_regridded/elevation_regridded.nc")
 
-
-#%%
-# fig = plt.figure(figsize=(12, 12))
-# map_ax = fig.add_subplot(projection=ccrs.PlateCarree())
-# map_ax.add_feature(cf.COASTLINE, linewidth=10)
-# da1[1000:2000, 1000:2000].plot(ax=map_ax, cmap="terrain", cbar_kwargs={"label": "Elevation (m)"},
-#          vmax=1000, vmin=-10)

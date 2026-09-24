@@ -59,6 +59,12 @@ def fetch_and_cleanup(filename):
 #%%
 def export_year(year):
 
+    # check if the file already exists locally
+    local_path = os.path.join(LOCAL_DIR, f'TMAX_mean_{year}.tif')
+    if os.path.exists(local_path):
+        print(f"{year}: file already exists locally, skipping export")
+        return
+
     tmax = (
         collection
         .filterDate(f'{year}-01-01', f'{year + 1}-01-01')

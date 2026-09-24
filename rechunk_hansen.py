@@ -1,14 +1,16 @@
 #%%
 import rioxarray as rxr
 import xarray as xr
-from constants import HANSEN_DIR, LON_CHUNK_SIZE, LAT_CHUNK_SIZE
+import numpy as np
+from constants import HANSEN_DIR, LON_CHUNK_SIZE, LAT_CHUNK_SIZE, TMAX_RECHUNKED_PATH
 from dask.distributed import Client, LocalCluster
-
 import dask
-from ufuncs import add_metadata_to_zarr
+from ufuncs import get_target_lat_lons, clip_to_even_chunks
 import regionmask
 
 TARGET_STORE = HANSEN_DIR + 'hansen_tc_2000_2024_rechunked.zarr'
+
+
 
 def open_hansen():
     da1 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000000000-0000000000.tif',
@@ -44,9 +46,7 @@ def mask_non_land(da):
     da = da.where(~land_mask.isnull())
     return da
 
-#%%
-
-def rechunk_hansen(da):
+def clip_to_even_chunks(da):
     n_lon_chunks = len(da.lon) // LON_CHUNK_SIZE
     n_lat_chunks = len(da.lat) // LAT_CHUNK_SIZE
 
@@ -55,6 +55,10 @@ def rechunk_hansen(da):
 
     da = da.isel(lon=slice(0, n_lon_chunks * LON_CHUNK_SIZE), 
                 lat=slice(0, n_lat_chunks * LAT_CHUNK_SIZE))
+    return da
+
+def rechunk_hansen(da):
+ 
 
     with dask.config.set({"array.rechunk.method": "p2p", "optimization.fuse.active": False}):
         rechunked = da.chunk({'time': 1, 
@@ -78,12 +82,17 @@ if __name__ == '__main__':
     hansen = hansen.fillna(0)
     hansen = mask_non_land(hansen)
 
+    hansen = clip_to_even_chunks(hansen)
+    target_lats, target_lons = get_target_lat_lons()
+
+    # assert that the lat and lon coords of hansen match those of tmax
+    assert np.allclose(hansen.lat.values, target_lats), "Latitudes of Hansen and TMAX do not match"
+    assert np.allclose(hansen.lon.values, target_lons), "Longitudes of Hansen and TMAX do not match"
+    print("Latitudes and longitudes of Hansen and TMAX match.")
+    
     hansen.encoding = {}
 
-    # da = hansen.chunk().data
-    
-
-    with LocalCluster(n_workers=4, threads_per_worker=8, memory_limit='128GB') as cluster:
+    with LocalCluster(processes=False, n_workers=4, threads_per_worker=8, memory_limit='128GB') as cluster:
             with Client(cluster) as client:
                 print(f"Dask Dashboard available at: {client.dashboard_link}")
                 rechunked = rechunk_hansen(hansen)
@@ -93,3 +102,4 @@ if __name__ == '__main__':
 
     ds = xr.open_zarr(TARGET_STORE, consolidated=True)
     print(ds)
+

@@ -19,8 +19,7 @@ import xyzservices.providers as xyz
 
 MWA_FIGDIR = FIGDIR + 'mwa_daily_results/'
 
-COARSEN_FACTORS = [None, 2, 5, 10, 25]
-RESET_CACHES = False
+COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 
 CARTO_POSITRON  = xyz.CartoDB.Positron.copy()
 CARTO_POSITRON["url"] += f"?key={os.environ['CARTO_API_KEY']}"
@@ -104,17 +103,24 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
         output_cols = [
             'time', 'year', 'lat', 'lon',
             'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour',
-            'ind_neighbour_mean'
+            'ind_neighbour_mean',  'dep_neighbour_mean',
         ]
-        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
-        dep_cols = ['lat', 'lon', 'time', 'dep_centre', 'dep_neighbour']
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean',
+                    ]
+        dep_cols = ['lat', 'lon', 'time', 'dep_centre', 'dep_neighbour',
+                    'dep_neighbour_mean']
         derive_year_from_time = True
     else:
         time_dim = 'year'
         join_keys = ['year', 'lat', 'lon']
-        output_cols = ['year', 'lat', 'lon', 'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
-        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean']
-        dep_cols = ['lat', 'lon', 'year', 'dep_centre', 'dep_neighbour']
+        output_cols = [
+            'year', 'lat', 'lon', 'dep_centre', 'dep_neighbour', 'ind_centre', 'ind_neighbour',
+            'ind_neighbour_mean',  'dep_neighbour_mean',
+        ]
+        ind_cols = ['lat', 'lon', 'year', 'ind_centre', 'ind_neighbour', 'ind_neighbour_mean',
+                    ]
+        dep_cols = ['lat', 'lon', 'year', 'dep_centre', 'dep_neighbour',
+                    'dep_neighbour_mean']
         derive_year_from_time = False
 
     delayed_parts = []
@@ -152,12 +158,14 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
         'ind_centre': 'float32',
         'ind_neighbour': 'float32',
         'ind_neighbour_mean': 'float32',
+        'dep_neighbour_mean': 'float32',
     }
     if aggregation == 'daily':
         meta_dict['year'] = 'str'
 
     meta = pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in meta_dict.items()})
     ddf = dd.from_delayed(delayed_parts, meta=meta)
+    breakpoint()
     with ProgressBar():
         df = ddf.compute(num_workers=64, memory_limit='2GB')
     df = df.dropna(how='any')
@@ -462,7 +470,6 @@ def plot_map_results(
     show_box=False
 ):
 
-    breakpoint()
     df = paired_dfs[coarsen_factor].copy()
     df['lon'] = df['lon'].round(0)
     df['lat'] = df['lat'].round(0)
@@ -1116,14 +1123,14 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
 
 
 
-# make_all_plots(
-#     ind_var_name='cc',
-#     dep_var_name='tmax',
-#     aggregation='annual_mean',
-#     years=None,
-#     reset_caches=False,
-#     area_slice=RESULTS_BBOX
-# )
+make_all_plots(
+    ind_var_name='cc',
+    dep_var_name='tmax',
+    aggregation='annual_mean',
+    years=None,
+    reset_caches=False,
+    area_slice=RESULTS_BBOX
+)
 
 # make_all_plots(
 #     ind_var_name='cc',
@@ -1154,17 +1161,111 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
 # )
 
 
-# #%%
+#%%
 
-# ind_var_name = 'cc'
-# dep_var_name = 'tmax'
-# aggregation = 'annual_mean'
-# years = None
-# aggregation = 'annual_mean'
-# reset_caches = False
-# area_slice = RESULTS_BBOX
+ind_var_name = 'cc'
+dep_var_name = 'heatwaves_gapfilled'
+years = None
+aggregation = 'annual_mean'
+reset_caches = True
+area_slice = RESULTS_BBOX
+
+paired_dfs = load_and_cache_all_coarsens(
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,
+    reset_caches=reset_caches,
+)
+#%%
+paired_dfs = load_and_cache_all_coarsens(
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,
+    reset_caches=reset_caches,
+)
 
 
 
-# #%%
-# coarsen_factor = 25
+coarsen_factor = 5
+df = paired_dfs[coarsen_factor].copy().astype(float)
+
+use_max_or_mean_dep_diff = 'mean'  # or 'max'
+if use_max_or_mean_dep_diff == 'max':
+    dep_col_name = 'dep_diff'
+elif use_max_or_mean_dep_diff == 'mean':
+    df['dep_mean_diff'] =  df['dep_centre'] - df['dep_neighbour_mean']
+    dep_col_name = 'dep_mean_diff'
+
+
+idx = pd.IndexSlice
+fig, ax = plt.subplots(figsize=(10, 6))
+bins = np.arange(0, 110, 10)
+ind_diff_bindex = pd.cut(df['ind_diff'], bins)
+mean_ind_cc_bindex = pd.cut(df['ind_neighbour_mean'], bins)
+
+cmap = plt.get_cmap('summer_r')
+norm = plt.Normalize(0, 100)
+
+mean_df = df.groupby(ind_diff_bindex)[dep_col_name].mean()
+mean_df_count = df.groupby(ind_diff_bindex)[dep_col_name].count()
+bin_df = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).mean()
+bin_df_count = df.groupby([ind_diff_bindex, mean_ind_cc_bindex]).count()
+
+mean_df = mean_df.loc[mean_df_count > 10]
+mean_df.plot(ax=ax, color='black', marker='o', zorder=1)
+
+bindex = bin_df.index.get_level_values(0).unique()
+for ind_neighbour_mean_bin in bindex:
+    sr = bin_df.loc[idx[:, ind_neighbour_mean_bin], dep_col_name]
+    sr = sr.where(bin_df_count.loc[idx[:, ind_neighbour_mean_bin], dep_col_name] > 10)
+    sr.plot(ax=ax, color=cmap(norm(ind_neighbour_mean_bin.mid)), 
+            marker='o', zorder=0, markersize=4, lw=1)
+
+ax.set_xticks(range(len(mean_df.index)))
+xticklabels = [f'{int(interval.left)}-{int(interval.right)}' for interval in mean_df.index]
+ax.set_xticklabels(xticklabels, rotation=0)
+ax.set_xlabel(f'{pretty[ind_var_name]} loss bin [%]', fontsize=12)
+ax.set_ylabel(f'mean difference in {pretty[dep_var_name]} [{units[dep_var_name]}]', fontsize=12)
+ax.grid(axis='y', linestyle='--', alpha= 0.7)
+
+# add coarsen factor text
+if coarsen_factor is not None:
+    ax.text(0.05, 0.97, f'coarsen_factor: {coarsen_factor}', transform=ax.transAxes,
+            ha='left', va='top', fontsize=10, fontweight='bold')
+
+# add a color legend
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, orientation='vertical', shrink=0.5)
+cbar.set_label(f'mean {pretty[ind_var_name]} in neighbor [%]', fontsize=10)
+
+#%%
+# import scipy.stats as stats
+
+# for coarsen_factor in COARSEN_FACTORS:
+#     print(f'~~~~~~~~~~~~~~ Coarsen factor: {coarsen_factor} ~~~~~~~~~~~~~')
+#     df = paired_dfs[coarsen_factor].copy().astype(float)
+#     diff = (df['elev_centre'] - df['elev_neighbour']).abs()
+
+#     df = df.loc[diff < 50]
+
+#     t_stat, p_val = stats.ttest_rel(df['elev_neighbour'], df['elev_centre'], alternative='two-sided')
+
+#     if p_val < 0.05:
+#         print(f"The mean of elev_neighbour is significantly different from the mean of elev_centre (p-value: {p_val:.4f})")
+#         mean_diff = df['elev_neighbour'].mean() - df['elev_centre'].mean()
+#         if mean_diff > 0:
+#             t_stat, p_val = stats.ttest_rel(df['elev_neighbour'], df['elev_centre'], alternative='greater')
+#             if p_val < 0.05:
+#                 print(f"The mean of elev_neighbour is significantly greater than the mean of elev_centre (p-value: {p_val:.4f})")
+#         elif mean_diff < 0:
+#             t_stat, p_val = stats.ttest_rel(df['elev_neighbour'], df['elev_centre'], alternative='less')
+#             if p_val < 0.05:
+#                 print(f"The mean of elev_neighbour is significantly less than the mean of elev_centre (p-value: {p_val:.4f})")
+#         else:
+#             print(f"The mean of elev_neighbour is not significantly different from the mean of elev_centre (p-value: {p_val:.4f})")
+#     else:
+#         print(f"There is no significant difference between the means of elev_neighbour and elev_centre (p-value: {p_val:.4f})")
+
+#     print(f"Mean of elev_neighbour: {df['elev_neighbour'].mean():.4f}, Mean of elev_centre: {df['elev_centre'].mean():.4f}")
+

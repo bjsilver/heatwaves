@@ -218,6 +218,7 @@ def save_heatwaves(heatwaves, output_path=OUTPUT_PATH):
             output_path,
             mode='w',
             consolidated=True,
+            zarr_format=2,
         )
 
 #%%

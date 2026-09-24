@@ -6,6 +6,8 @@ in Earth Engine. Python only builds the request graph, validates counts, and sub
 the export - no numpy/xarray/dask/local raster processing of the daily data.
 """
 #%%
+import time
+
 import ee
 from constants import AREA_BBOX
 
@@ -17,7 +19,7 @@ PERCENTILE = 95
 EXPECTED_YEARS = 22
 DAYS_PER_YEAR = 365
 EXPECTED_IMAGES = 8030
-EXPECTED_WINDOW_IMAGES = 330
+EXPECTED_WINDOW_IMAGES = 1
 
 GEE_FOLDER = 'GEE_Exports'
 OUTPUT_NAME = 'TMAX_p95_2003_2024'
@@ -25,6 +27,7 @@ OUTPUT_NAME = 'TMAX_p95_2003_2024'
 DATASET = 'projects/sat-io/open-datasets/global-daily-air-temp/latin_america'
 BAND = 'b1'
 MISSING_VALUE = -9999
+EXPORT_POLL_SECONDS = 60
 
 # Native TMAX grid - must match download_regrid_hansen_gee.py exactly (do not round).
 TMAX_CRS = 'EPSG:4326'
@@ -137,7 +140,7 @@ def calculate_doy_percentile(collection, d):
     # consistent offset (~0.9 tenths-degC in test data) vs the local method.
     # Accepted as-is per user decision; see validate() output for the measured offset.
     p95 = window.reduce(
-        ee.Reducer.percentile([PERCENTILE], maxRaw=EXPECTED_WINDOW_IMAGES)
+        ee.Reducer.percentile([PERCENTILE])
     )
     return p95.rename('Ta_TMAX_p95').set('doy', d)
 
@@ -148,33 +151,47 @@ def build_percentile_collection(collection):
     return ee.ImageCollection(images)
 
 
-def rename_percentile_bands(p95_collection):
-    """Stack the 365 percentile images and give them deterministic band names.
+def wait_for_export_task(task, task_name):
+    """Wait until a GEE export finishes, raising if it fails or is cancelled."""
+    while True:
+        status = task.status()
+        state = status.get('state')
+        print(f'{task_name}: {state}')
 
-    Renaming uses a plain Python list built client-side (no data pulled) - band
-    order is guaranteed because the collection was built from
-    ee.List.sequence(1, 365) in order.
-    """
-    names = [f'doy_{d:03d}' for d in range(1, DAYS_PER_YEAR + 1)]
-    return p95_collection.toBands().rename(names)
+        if state == 'COMPLETED':
+            return
+        if state in {'FAILED', 'CANCELLED'}:
+            error = status.get('error_message', 'no error message provided')
+            raise RuntimeError(f'{task_name} {state.lower()}: {error}')
+
+        time.sleep(EXPORT_POLL_SECONDS)
 
 
-def export_percentiles(image, roi):
-    task = ee.batch.Export.image.toDrive(
-        image=image,
-        description=OUTPUT_NAME,
-        folder=GEE_FOLDER,
-        fileNamePrefix=OUTPUT_NAME,
-        region=roi,
-        crs=TMAX_CRS,
-        crsTransform=TMAX_TRANSFORM,
-        fileFormat='GeoTIFF',
-        formatOptions={'cloudOptimized': True},
-        maxPixels=1e13,
-    )
-    task.start()
-    print(f'Submitted export task: {OUTPUT_NAME}')
-    return task
+def export_percentiles(p95_collection, roi):
+    """Submit one GeoTIFF export task for each day-of-year percentile image."""
+    images = p95_collection.toList(DAYS_PER_YEAR)
+    tasks = []
+
+    for doy in range(1, DAYS_PER_YEAR + 1):
+        task_name = f'{OUTPUT_NAME}_doy_{doy:03d}'
+        task = ee.batch.Export.image.toDrive(
+            image=ee.Image(images.get(doy - 1)),
+            description=task_name,
+            folder=GEE_FOLDER,
+            fileNamePrefix=task_name,
+            region=roi,
+            crs=TMAX_CRS,
+            crsTransform=TMAX_TRANSFORM,
+            fileFormat='GeoTIFF',
+            formatOptions={'cloudOptimized': True},
+            maxPixels=1e13,
+        )
+        task.start()
+        tasks.append(task)
+        print(f'Submitted export task: {task_name}')
+        wait_for_export_task(task, task_name)
+
+    return tasks
 
 
 # --- validation ---------------------------------------------------------------
@@ -258,8 +275,7 @@ def main():
     # validate(collection, scale)
 
     p95_collection = build_percentile_collection(collection)
-    p95_image = rename_percentile_bands(p95_collection)
-    export_percentiles(p95_image, roi)
+    export_percentiles(p95_collection, roi)
 
 
 if __name__ == '__main__':

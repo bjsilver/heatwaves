@@ -1,14 +1,18 @@
+#%%
 import zarr
 from pathlib import Path
 import json
 import shutil
 import xarray as xr
 import numpy as np
-from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR
+from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR, BORDERS_DIR, TMAX_RECHUNKED_PATH, LAT_CHUNK_SIZE, LON_CHUNK_SIZE, COORD_DUMP_PATH
 from dask.distributed import Client, LocalCluster
 import warnings
 from contextlib import contextmanager
-# import cartopy.crs as ccrs
+import regionmask
+import geopandas as gpd
+import os
+import pickle
 
 def lon_to_180(ds):
     ds = ds.copy()
@@ -17,33 +21,6 @@ def lon_to_180(ds):
     return ds
 
 
-def _add_gridlines(ax, tick_interval, alpha=0.5,
-                   color='white'):
-    minlon, maxlon, minlat, maxlat = ax.get_extent(crs=ccrs.PlateCarree())
-    eps = tick_interval * 1e-9
-    xstart = np.ceil((minlon - eps) / tick_interval) * tick_interval
-    xend = np.floor((maxlon + eps) / tick_interval) * tick_interval
-    ystart = np.ceil((minlat - eps) / tick_interval) * tick_interval
-    yend = np.floor((maxlat + eps) / tick_interval) * tick_interval
-
-    xticks = np.arange(xstart, xend + eps, tick_interval)
-    yticks = np.arange(ystart, yend + eps, tick_interval)
-
-    # ensure ticks stay strictly within the original extent
-    xticks = xticks[(xticks >= minlon - eps) & (xticks <= maxlon + eps)]
-    yticks = yticks[(yticks >= minlat - eps) & (yticks <= maxlat + eps)]
-    ax.set_xticks(xticks, crs=ccrs.PlateCarree())
-    ax.set_yticks(yticks, crs=ccrs.PlateCarree())
-    ax.gridlines(
-        crs=ccrs.PlateCarree(),
-        draw_labels=False,
-        xlocs=xticks,
-        ylocs=yticks,
-        linewidth=0.6,
-        color=color,
-        alpha=alpha,
-        linestyle='--',
-    )
 
 def add_metadata_to_zarr(
     store_path,
@@ -104,7 +81,7 @@ def add_metadata_to_zarr(
         zarr.consolidate_metadata(str(store))
 
 
-def ensure_match_coords(ds1, ds2, round_decimals=2):
+def ensure_match_coords(ds1, ds2, round_decimals=6):
     for ds in [ds1, ds2]:
         ds['lat'] = np.round(ds['lat'], round_decimals)
         ds['lon'] = np.round(ds['lon'], round_decimals)
@@ -128,7 +105,7 @@ def open_hansen():
     return ds
 
 @contextmanager
-def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
+def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB', processes=True,
                   suppress_dask_warnings=False, use_dask_dashboard=True, dashboard_address=':7878'):
 
     if suppress_dask_warnings:
@@ -140,10 +117,64 @@ def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB',
         )
 
     if use_dask_dashboard:
-        with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker,
+        with LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=processes,
                         memory_limit=memory_limit, dashboard_address=dashboard_address) as cluster:
             with Client(cluster) as client:
                 print(f'LocalCluster started: {client.dashboard_link}')
                 yield client
     else:
         yield None
+
+        
+def get_amazon_basin_mask(buffer_km=None):
+    hansen = xr.open_zarr(HANSEN_DIR+'hansen_tc_2000_2024_rechunked.zarr')
+    amazon_basin = gpd.read_file(BORDERS_DIR+'mrb_basins.shp')
+    if buffer_km is not None:
+        amazon_basin = amazon_basin.to_crs(epsg=3857).buffer(buffer_km * 1000).to_crs(epsg=4326)
+    # create a mask for the Amazon basin using the hansen grid
+    amazon_mask = regionmask.Regions([amazon_basin.geometry.iloc[0]]).mask(hansen.lon, hansen.lat)
+    return {'raster': amazon_mask, 'vector': amazon_basin}
+
+def get_target_lat_lons():
+# load only first time chunk of tmax to use as a template for the rechunked hansen dataset
+    tmax = xr.open_zarr(TMAX_RECHUNKED_PATH+'tmax_rechunked.zarr', 
+                        chunks={'time': 1, 'lat': LAT_CHUNK_SIZE, 'lon': LON_CHUNK_SIZE})
+    lats = tmax.lat.values
+    lons = tmax.lon.values
+    return lats, lons
+
+
+
+def clip_to_even_chunks(ds, lat_chunk_size=LAT_CHUNK_SIZE, lon_chunk_size=LON_CHUNK_SIZE):
+
+    # ensure that lat and lon are both ascendung
+    ds = ds.sortby('lat')
+    ds = ds.sortby('lon')
+
+    lat_full_chunks = ds['lat'].size // lat_chunk_size
+    lon_full_chunks = ds['lon'].size // lon_chunk_size
+
+    ds = ds.isel(lat=slice(0, lat_full_chunks * lat_chunk_size),
+                  lon=slice(0, lon_full_chunks * lon_chunk_size))
+    return ds
+
+def get_tmax_template_coords(coord_dump_path=COORD_DUMP_PATH):
+    if not os.path.exists(coord_dump_path):
+        raise FileNotFoundError(f"Template coords file not found at {coord_dump_path}. Please run the script to generate it.")
+        ds = xr.open_zarr(TMAX_RECHUNKED_FILE, consolidated=True)
+        # make a template for various other scripts to regrid/rechunk to
+        template = ds['Ta_TMAX'].isel(time=0).drop_vars('time')
+        coords = template.coords
+        # pickle the coords
+
+        with open(coord_dump_path, 'wb') as f:
+            pickle.dump(coords, f)
+
+    with open(coord_dump_path, 'rb') as f:
+        loaded_coords = pickle.load(f)
+
+    da = xr.DataArray(np.zeros((len(loaded_coords['lat']), len(loaded_coords['lon']))),
+                      coords={'lat': loaded_coords['lat'], 'lon': loaded_coords['lon']},
+                      dims=('lat', 'lon'))
+    return da
+

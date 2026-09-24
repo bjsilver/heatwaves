@@ -4,11 +4,11 @@ import os
 import numpy as np
 import xarray as xr
 import xesmf as xe
-
+from ufuncs import get_tmax_template_coords
 from constants import ERA5_PATH, STORAGE_DIR
 from calc_era5_percentiles import maybe_local_cluster, save_heatwaves
 
-WEIGHTS_FILE = ERA5_PATH + 'era5_regrid_weights_0.01deg_bilinear.nc'
+WEIGHTS_FILE = ERA5_PATH + 'era5_regrid_to_zz_bilinear.nc'
 INPUT_PATH = STORAGE_DIR + 'percentiles/era5_percentile_2003-2020.zarr'
 OUTPUT_PATH = STORAGE_DIR + 'regridded/era5_t2m_p95_2003-2020_regridded.zarr'
 
@@ -39,19 +39,8 @@ def get_regridder(source_da, target_ds):
 
 
 def regrid_to_zz(source_da):
-    lats = np.arange(-30, 20, 0.01)
-    lons = np.arange(-82, -34.5, 0.01)
-    target_ds = xr.Dataset(
-        {
-            'lat': (['lat'], lats),
-            'lon': (['lon'], lons),
-        }
-    )
 
-    target_ds['mask'] = xr.DataArray(
-        np.ones((len(target_ds.lat), len(target_ds.lon)), dtype=bool),
-        dims=['lat', 'lon'],
-    )
+    target_ds = get_tmax_template_coords()    
 
     source_da = source_da.chunk({'doy': 5, 'lat': -1, 'lon': -1})
     regridder = get_regridder(source_da, target_ds)
