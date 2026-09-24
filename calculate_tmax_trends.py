@@ -13,11 +13,10 @@ from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
-from constants import FIGDIR
+from constants import FIGDIR, TMAX_RECHUNKED_FILE
 
 
 # --- CONFIGURATION ---
-DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 OUT_ZARR = os.path.join(PERCENTILES_DIR, 'zz_tmax_95pc.zarr')
 PAD = 7
@@ -36,9 +35,9 @@ Path(PERCENTILES_DIR).mkdir(parents=True, exist_ok=True)
 
 
 def load_tmax_da():
-    print(f"Opening input Zarr: {DPATH}zhang_zhou_regridded_rechunked.zarr")
+    print(f"Opening input Zarr: {TMAX_RECHUNKED_FILE}")
     # Use consolidated=False to support stores without .zmetadata.
-    ds = xr.open_zarr(DPATH + 'zhang_zhou_regridded_rechunked.zarr', chunks={}, consolidated=False)
+    ds = xr.open_zarr(TMAX_RECHUNKED_FILE, chunks={}, consolidated=False)
     da = ds['Ta_TMAX']
     # check if zz time has duplicates
     if len(da.time) != len(np.unique(da.time)):

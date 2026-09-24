@@ -3,7 +3,7 @@ import xarray as xr
 import numpy as np
 import os
 import dask.array as da
-from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR
+from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR, TMAX_RECHUNKED_FILE
 import gc
 import json
 import shutil
@@ -13,8 +13,10 @@ from calc_era5_percentiles import load_era5_t2m
 from numba import njit
 import pandas as pd
 from dask import delayed
+from numcodecs import Blosc
 
-COARSEN_FACTORS = [None, 2, 5, 10, 25]
+# COARSEN_FACTORS = [None, 2, 5, 10, 25]
+COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 
 SPATH_SUFFIX = None
 USE_DASK_DASHBOARD = True
@@ -66,7 +68,7 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
 
 
     if dep_var_name == 'tmax':
-        dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'rechunked', 'zhang_zhou_regridded_rechunked.zarr'))['Ta_TMAX']
+        dep_var = xr.open_zarr(TMAX_RECHUNKED_FILE)['Ta_TMAX']
         dep_var = dep_var.astype(np.float32).where(dep_var != -9999.0) / 10.0  # convert to °C
     elif dep_var_name == 'heatwaves':
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heatdays', 'heatwaves_annual_sum_zz_2003-2020.zarr'))['heatwave_days']
@@ -162,10 +164,10 @@ def _mwa_kernel(cc_block, cc_loss_block, window_radius, loss_explained_fraction)
     out[4] = np.where(valid, mean_neighbour_cc, np.nan)
     return out
 
-def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
+def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname, overwrite=False):
     map_tag = sname
     spath = os.path.join(MWA_DIR, f'neighbour_maps/{map_tag}.zarr')
-    if os.path.exists(spath):
+    if os.path.exists(spath) and not overwrite:
         print(f"Neighbour map zarr already exists for {sname}.\nLoading from {spath}.")
         neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
 
@@ -181,9 +183,8 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
         )
     )
 
-    if years_match and lats_match and lons_match and fields_match:
-        return neighbour_maps_ds
-    else:
+        if years_match and lats_match and lons_match and fields_match:
+            return neighbour_maps_ds
         print(
             "Existing neighbour map grid does not match current input grid. "
             "Recomputing and overwriting existing neighbour map store."
@@ -221,15 +222,18 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname):
     )
     neighbour_maps_ds['selection'].attrs['missing_offset_value'] = int(NEIGHBOUR_MAP_FILL_VALUE)
 
+    neighbour_maps_ds = neighbour_maps_ds.drop_encoding() 
+
     encoding = {
         'selection': {
             'dtype': 'float32',
+            'compressor': Blosc(cname='zstd', clevel=3)
         }
     }
 
-    neighbour_maps_ds.to_zarr(spath, mode='w', consolidated=False, encoding=encoding,
-                              zarr_format=2)
-    neighbour_maps_ds = xr.open_zarr(spath, consolidated=False)
+    neighbour_maps_ds.to_zarr(spath, mode='w', encoding=encoding,
+    zarr_format=2)
+    neighbour_maps_ds = xr.open_zarr(spath)
     return neighbour_maps_ds
 
 
@@ -406,10 +410,13 @@ def gather_elev_results(elev, neighbour_maps, window_radius):
     return elev_results_ds
 
 
-def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_name, sname, elev=None):
+def moving_window_analysis(ind_var, cc_loss, dep_var, window_radius, dep_var_name, sname,
+                           elev=None, overwrite=False):
     """Moving-window analysis on (time, lat, lon) inputs."""
 
-    selection = _get_mwa_neighbour_map(ind_var, cc_loss, window_radius, sname)['selection']
+    selection = _get_mwa_neighbour_map(
+        ind_var, cc_loss, window_radius, sname, overwrite=overwrite
+    )['selection']
     neighbour_maps = (
         selection.sel(selection_field=['i_offset', 'j_offset'])
         .rename({'selection_field': 'offset'})
@@ -787,7 +794,8 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
 
 def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
                        client=None, dep_var_agg=None,
-                       coarsen_factor=None, window_radius=1, sname=None):
+                       coarsen_factor=None, window_radius=1, sname=None,
+                       overwrite=False):
 
 
     if len(dep_var.lat) == 5000 and len(dep_var.lon) == 4750:    
@@ -814,7 +822,7 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
 
     # Process each version
     for version_idx, (ind_var_version, cc_loss_version, dep_var_version, elev_version) in enumerate(dss):
-        if reuse_existing_members and _has_complete_version_members(out_root, version_idx):
+        if not overwrite and reuse_existing_members and _has_complete_version_members(out_root, version_idx):
             print(f"Version {version_idx} parquet outputs already exist. Skipping recompute.")
             continue
 
@@ -837,6 +845,7 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
             dep_var_name=dep_var_name,
             sname=map_sname,
             elev=elev_version,
+            overwrite=overwrite,
         )
 
         ind_results = ind_results_ds
@@ -889,7 +898,7 @@ def _check_member_parquets_exist(sname, coarsen_factor=None):
 
 
 def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
-        ind_var_name='cc', dep_var_name='heatwaves'):
+        ind_var_name='cc', dep_var_name='heatwaves', overwrite=False):
 
     ind_var, cc_loss, dep_var = load_ind_dep_data(
         ind_var_name=ind_var_name,
@@ -906,7 +915,9 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     if SPATH_SUFFIX:
         sname += f'_{SPATH_SUFFIX}'
 
-    if _check_member_parquets_exist(sname=sname, coarsen_factor=coarsen_factor):
+    if overwrite:
+        print(f"Overwrite flag is set. Proceeding with moving window analysis for {sname}.")
+    elif _check_member_parquets_exist(sname=sname, coarsen_factor=coarsen_factor):
         print(f"Parquet member outputs already complete for {sname}. Skipping run.")
         return
 
@@ -914,7 +925,8 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     calc_moving_window(ind_var=ind_var, cc_loss=cc_loss, dep_var=dep_var,
                         dep_var_name=dep_var_name,
                         client=client, window_radius=window_radius,
-                        coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg)
+                        coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg,
+                        overwrite=overwrite)
     print(
         f"Moving window analysis completed for {dep_var.name} vs {ind_var_name} "
         f"with coarsen factor {coarsen_factor}."
@@ -923,24 +935,25 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
 
 
 def run_mwa_coarsen_loop(ind_var_name, dep_var_agg,
-                         dep_var_name,
+                         dep_var_name, overwrite=False,
                          client=None):
     for coarsen_factor in COARSEN_FACTORS:
         run_mwa(coarsen_factor=coarsen_factor, window_radius=1, dep_var_agg=dep_var_agg, client=client,
-                ind_var_name=ind_var_name, 
+                ind_var_name=ind_var_name, overwrite=overwrite,
                 dep_var_name=dep_var_name)
             
 #%%
 if __name__ == "__main__":
     
-    with local_cluster(n_workers=32, threads_per_worker=1, memory_limit='20GB',
+    with local_cluster(n_workers=1, threads_per_worker=32, memory_limit='400GB',
+                       processes=False,
                        suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
 
-        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
-        #                      dep_var_name='tmax', client=client)
+        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+                             dep_var_name='tmax', client=client, overwrite=True)
 
         run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
-                            dep_var_name='heatwaves_gapfilled', client=client)
+                            dep_var_name='heatwaves_gapfilled', client=client, overwrite=True)
 
         # run_mwa_coarsen_loop(ind_var_name='cc', 
         #                      dep_var_name='absthresh_heatwaves',

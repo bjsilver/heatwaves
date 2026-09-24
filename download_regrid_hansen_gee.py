@@ -1,8 +1,9 @@
 #%%
+
 import ee
 import geemap
 import xarray as xr
-import matplotlib.pyplot as plt
+from constants import ZZ_SOURCE_DIR
 
 # 1. Initialize and Authenticate Earth Engine
 ee.Authenticate(auth_mode='notebook')
@@ -11,16 +12,44 @@ geemap.ee_initialize()
 
 #%%
 
-# 2. Setup Data and ROI (South America / Amazon BBox)
+target = xr.open_dataset(ZZ_SOURCE_DIR + 'SouthAmerica_Ta_SVCMsp_2003TMAX_daily_tropics30N30S.nc')['Ta_TMAX']
+
+target_crs = 'EPSG:4326'
+lon_res = (target.lon[1] - target.lon[0]).item()
+lat_res = (target.lat[1] - target.lat[0]).item()
+
+# target.lon/lat are pixel CENTERS, but crsTransform anchors the top-left
+# pixel CORNER, so shift back by half a pixel in each direction to align.
+target_transform = [
+    lon_res,
+    0,
+    target.lon[0].item() - lon_res / 2,
+    0,
+    lat_res,
+    target.lat[0].item() - lat_res / 2,
+]
+
+print('Target CRS:', target_crs)
+print('Target transform:', target_transform)
+
+#%%
+
+# 2. Setup Data and ROI (exact extent of the target Ta grid)
 dataset = ee.Image('UMD/hansen/global_forest_change_2025_v1_13')
-roi = ee.Geometry.BBox(-82, -30, -34.5, 20) 
-# test small roi
-#roi = ee.Geometry.BBox(-63, -6, -62, -5)
+roi = ee.Geometry.BBox(
+    target.lon.min().item() - abs(lon_res) / 2,
+    target.lat.min().item() - abs(lat_res) / 2,
+    target.lon.max().item() + abs(lon_res) / 2,
+    target.lat.max().item() + abs(lat_res) / 2,
+)
 
 # Extract core bands
 tc00 = dataset.select('treecover2000').clip(roi)
 loss_year = dataset.select('lossyear').clip(roi)
 gain = dataset.select('gain').clip(roi)
+
+#%%
+
 
 
 #%%
@@ -37,20 +66,17 @@ for year_val in range(1, 25):
 
 annual_stack = ee.Image.cat(annual_list)
 
-# 4. Regridding (0.01 degree)
-target_crs = 'EPSG:4326'
-grid_size = 0.01 
-target_transform = [grid_size, 0, -180.005, 0, -grid_size, 90.005]
-
-regridded_tc = annual_stack.reduceResolution(
-    reducer=ee.Reducer.mean(), 
-    maxPixels=2048
-).reproject(crs=target_crs, crsTransform=target_transform)
-
-regridded_gain = gain.reduceResolution(
-    reducer=ee.Reducer.mean(),
-    maxPixels=2048
-).reproject(crs=target_crs, crsTransform=target_transform).rename('forest_gain_fraction')
+regridded_tc = (
+    annual_stack
+    .reduceResolution(
+        reducer=ee.Reducer.mean(),
+        maxPixels=2048
+    )
+    .reproject(
+        crs=target_crs,
+        crsTransform=target_transform
+    )
+)
 
 # 5. Export Tasks
 # Use 'fileFormatConfig' for GeoTIFF compression options

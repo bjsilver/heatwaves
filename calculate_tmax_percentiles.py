@@ -11,10 +11,10 @@ import dask.array as da_lazy
 from pathlib import Path
 from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
-import metpy
+from constants import TMAX_RECHUNKED_FILE
+from ufuncs import local_cluster
 
 # --- CONFIGURATION ---
-DPATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/rechunked/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
 OUT_ZARR = os.path.join(PERCENTILES_DIR, 'zz_tmax_95pc.zarr')
 PAD = 7
@@ -74,9 +74,9 @@ def quantile_over_window_view_skipna(win_view, q):
 # --- HELPER FUNCTIONS ---
 
 def load_tmax_da():
-    print(f"Opening input Zarr: {DPATH}zhang_zhou_regridded_rechunked.zarr")
+    print(f"Opening input Zarr: {TMAX_RECHUNKED_FILE}")
     # Use consolidated=False to support stores without .zmetadata.
-    ds = xr.open_zarr(DPATH + 'zhang_zhou_regridded_rechunked.zarr', chunks={}, consolidated=False)
+    ds = xr.open_zarr(TMAX_RECHUNKED_FILE, chunks={}, consolidated=False)
     da = ds['Ta_TMAX']
     # check if zz time has duplicates
     if len(da.time) != len(np.unique(da.time)):
@@ -169,12 +169,15 @@ def save_percentiles(p95_da, out_path=OUT_ZARR):
     ds_out = ds_out.chunk({'doy': -1, 'lat': 250, 'lon': 250})
     print(f'Writing output to {out_path}...')
     with ProgressBar():
-        ds_out.to_zarr(out_path, mode='w', consolidated=True)
+        ds_out.to_zarr(out_path, mode='w', consolidated=True,
+                       zarr_format=2)
 
 
 #%%
 if __name__ == "__main__":
-    with maybe_local_cluster():
+    with local_cluster(processes=False, n_workers=1, memory_limit='600GB',
+                       threads_per_worker=10) as cluster:
+        print('Starting processing...')
         tmax = load_tmax_da()
         p95 = compute_percentiles_dask(tmax)
         save_percentiles(p95, OUT_ZARR)
