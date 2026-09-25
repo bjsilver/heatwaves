@@ -11,7 +11,6 @@ from ufuncs import local_cluster
 from pyproj import CRS, Transformer
 
 
-DATE_SLICE = slice('2003-01-01', '2020-12-31')
 METEOSTAT_DATA_PATH = STORAGE_DIR + 'meteostat_data/'
 LST_DIR = STORAGE_DIR + 'lst/'
 DATA_PATH = STORAGE_DIR + 'svcm_data/'

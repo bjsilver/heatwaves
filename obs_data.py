@@ -2,7 +2,7 @@
 import pandas as pd
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
-from constants import AREA_BBOX, STORAGE_DIR, RESULTS_BBOX, BORDERS_DIR
+from constants import AREA_BBOX, STORAGE_DIR, RESULTS_BBOX, BORDERS_DIR, METEOSTAT_DATA_PATH, INMET_PATH
 import geopandas as gpd
 import cartopy.feature as cfeature
 import matplotlib.ticker as mticker
@@ -22,8 +22,6 @@ from datetime import datetime
 
 LEGAL_AMAZON = gpd.read_file(BORDERS_DIR+'Limites_Amazonia_Legal_2022.shp')
 
-METEOSTAT_DATA_PATH = STORAGE_DIR + 'meteostat_data/'
-INMET_PATH = STORAGE_DIR + 'INMET/'
 ELEVATION_PATH = STORAGE_DIR + 'elevation/'
 
 AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
@@ -88,8 +86,8 @@ def download_meteostat_data():
     stations = load_meteostat_stations()
 
     # get stations within the amazon basin
+    stations = load_meteostat_stations()
     stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
-
     ms.config.block_large_requests = False
 
     start = datetime(2003, 1, 1)
@@ -119,7 +117,7 @@ def download_meteostat_data():
         if df is not None:
             print(f'Saving data for {station_id}.')
             df.to_parquet(METEOSTAT_DATA_PATH + f'{station_id}.parquet')
-
+#%%
 download_meteostat_data()
 
 #%%

@@ -2,6 +2,11 @@ import numpy as np
 
 #%%
 
+### GLOBAL PARAMETERS ###
+START_DATE = '2003-01-01'
+END_DATE = '2020-12-31'
+DATE_SLICE = slice(START_DATE, END_DATE)
+
 ### RAW DATA PATHS ###
 MODIS_PATH = '/uolstore/Research/b/b0122/earjba/MODIS_LST/modis_v6.1/processed_from_callum/'
 ERA5_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/'
@@ -13,6 +18,13 @@ MWA_DIR = STORAGE_DIR+ 'mwa_results/'
 BORDERS_DIR = '/uolstore/Research/b/b0256/Users/earbsi/borders/'
 ZZ_SOURCE_DIR = "/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/"
 MGWR_RESULTS_DIR = STORAGE_DIR + 'mgwr_results/'
+METEOSTAT_DATA_PATH = STORAGE_DIR + 'meteostat_data/'
+INMET_PATH = STORAGE_DIR + 'INMET/'
+MGWR_DATA_DIR = STORAGE_DIR + 'svcm_data/'
+
+### CONSTANTS ###
+LAPSE_RATE = -0.003773 # degrees C per meter, see mgwr_data.py for how this was calculated
+
 
 ### PROCESSED DATA ###
 TMAX_RECHUNKED_PATH = STORAGE_DIR + 'tmax/rechunked/'
@@ -50,9 +62,6 @@ IND_VAR_BINS = {
     'cc': np.arange(10, 110, 10),
 }
 
-### SVCM PARAMETERS ###
-MIN_VALID_YEARS = 12
-MIN_VALID_DAYS_PER_YEAR = 50
 
 # +/- days pooled around a target day-of-year across all years (noleap, 1-365)
 DOY_POOL_WINDOW = 10
