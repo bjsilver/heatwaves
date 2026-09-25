@@ -1,6 +1,6 @@
 #%%
 import os
-from constants import STORAGE_DIR, LST_DIR, DOY_POOL_WINDOW, MGWR_DATA_DIR, METEOSTAT_DATA_PATH, DATE_SLICE, MGWR_RESULTS_DIR, LAPSE_RATE
+from constants import STORAGE_DIR, LST_DIR, DOY_POOL_WINDOW, MGWR_DATA_DIR, METEOSTAT_DATA_PATH, DATE_SLICE, MGWR_RESULTS_DIR
 import numpy as np
 import pandas as pd
 import sqlite3
@@ -189,7 +189,6 @@ def get_climatologically_valid_data(recompute=False):
     df['doy'] = [i.dayofyr for i in df.index]
 
 
-    df['tmax'] = df['tmax'] - LAPSE_RATE * df['elevation']
 
     df.to_parquet(MGWR_DATA_DIR+'mgwr_climatological_long.parquet',
                   index=False, engine='pyarrow')
