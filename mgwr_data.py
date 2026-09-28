@@ -10,6 +10,7 @@ from ufuncs import local_cluster, get_amazon_basin_mask
 from pyproj import CRS
 import pickle as pkl
 import statsmodels.formula.api as smf
+import cartopy.crs as ccrs
 
 
 MIN_VALID_YEARS = 12
@@ -114,12 +115,19 @@ def intepolate_data_to_stations(mdf, recompute=False):
     else:
         print("Skipping interpolation of LST and elevation to stations. Set recompute=True to force recomputation.")
 
-def define_local_azimuthal_projection(mdf):
-    lon0, lat0 = mdf.centroid.x, mdf.centroid.y
-    az_proj = CRS(proj='aeqd', lat_0=lat0, lon_0=lon0, datum='WGS84')
+def define_local_azimuthal_projection(recalculate=False):
+    if not recalculate and os.path.exists('./data/azimuthal_projection.pkl'):
+        with open('./data/azimuthal_projection.pkl', 'rb') as f:
+            return pkl.load(f)
+
+    AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
+    stations = load_meteostat_stations()
+    stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
+    lon0, lat0 = stations_basin.centroid.x.mean(), stations_basin.centroid.y.mean()
+    az_proj =ccrs.AzimuthalEquidistant(central_longitude=lon0, central_latitude=lat0)
     # write projection to file
-    with open('./data/azimuthal_projection.txt', 'w') as f:
-        f.write(az_proj.to_wkt())
+    with open('./data/azimuthal_projection.pkl', 'wb') as f:
+        pkl.dump(az_proj, f)
     return az_proj
 
 
@@ -143,7 +151,7 @@ def get_climatologically_valid_data(recompute=False):
     print("Computing climatologically valid data...")
 
     mdf = get_climatologically_valid_meteostat_stations(min_valid_years=MIN_VALID_YEARS, min_valid_days_per_year=MIN_VALID_DAYS_PER_YEAR)
-    az_proj = define_local_azimuthal_projection(mdf)
+    az_proj = define_local_azimuthal_projection(recalculate=False)
     mdf_az_proj = mdf.to_crs(az_proj)
 
     # load the tmax data for the valid stations
@@ -193,12 +201,6 @@ def get_climatologically_valid_data(recompute=False):
     df.to_parquet(MGWR_DATA_DIR+'mgwr_climatological_long.parquet',
                   index=False, engine='pyarrow')
 
-#%%
-
-
-
-
-#%%
 def doy_gaussian_mean(df, target_doy, window=10, sigma=None, n_days_per_year=365):
     if sigma is None:
         sigma = window
@@ -264,7 +266,6 @@ def doy_gaussian_mean(df, target_doy, window=10, sigma=None, n_days_per_year=365
     return result.merge(station_info, on='station_id', how='left')
 
 
-#%%
 def doy_gaussian_climatology(window=10, sigma=None, recompute=False):
 
     if not recompute and os.path.exists(MGWR_DATA_DIR+'lst_climatology.zarr'):
@@ -307,43 +308,6 @@ def doy_gaussian_climatology(window=10, sigma=None, recompute=False):
 
 
 
-AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
-stations = load_meteostat_stations()
-stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
-meteo = load_meteostat_data(stations_basin)
-
-lst = xr.open_mfdataset(LST_DIR+'interped/lst_interped_obs_*.zarr', 
-                        concat_dim='year', combine='nested')['LST']
-lst = lst.assign_coords({'year':range(2003, 2021), 'doy':range(1, 366)})
-lst_clim = doy_gaussian_climatology(window=10, sigma=None)
-elev = xr.open_zarr(STORAGE_DIR+'elevation/elev_interped_obs.zarr')['elevation']
-mdf_az_proj = stations_basin.to_crs(define_local_azimuthal_projection(stations_basin))
-
-#%%
-
-
-date = '2015-06-05'
-doy = pd.Timestamp(date).dayofyear
-year = pd.Timestamp(date).year
-# get the tmax 
-tmax = meteo.loc[date].dropna()
-tmax.name = 'tmax'
-
-df = pd.DataFrame(tmax)
-df['northing'] = mdf_az_proj.set_index('id').loc[tmax.index]['geometry'].y
-df['easting'] = mdf_az_proj.set_index('id').loc[tmax.index]['geometry'].x
-# get the climatological LST
-df['lst_clim'] = lst_clim.loc[{'station':df.index.values, 'doy':doy}]
-df['lst'] = lst.loc[{'station':df.index.values, 'doy':doy, 'year':year}]
-df['lst_anomaly'] = df['lst'] - df['lst_clim']
-df['elev'] = elev.loc[{'station':df.index.values}]
-
-
-# get the model-predicted tmax
-with open(f'{MGWR_RESULTS_DIR}/layer1/mgwr_model_doy_{doy}.pkl', 'rb') as f:
-    layer1 = pkl.load(f)
-
-selector = layer1['selector']
 
 #%%
 #%% interpolate data to station_locations
@@ -352,5 +316,5 @@ if __name__ == '__main__':
     AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
     stations = load_meteostat_stations()
     stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
-    intepolate_data_to_stations(stations_basin, recompute=True)
+    intepolate_data_to_stations(stations_basin, recompute=False)
     get_climatologically_valid_data(recompute=True)

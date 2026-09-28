@@ -21,6 +21,7 @@ MGWR_RESULTS_DIR = STORAGE_DIR + 'mgwr_results/'
 METEOSTAT_DATA_PATH = STORAGE_DIR + 'meteostat_data/'
 INMET_PATH = STORAGE_DIR + 'INMET/'
 MGWR_DATA_DIR = STORAGE_DIR + 'svcm_data/'
+ISD_DATA_DIR = STORAGE_DIR + 'isd_data/'
 
 ### CONSTANTS ###
 LAPSE_RATE = -0.003773 # degrees C per meter, see mgwr_data.py for how this was calculated
