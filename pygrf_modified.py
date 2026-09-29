@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
+
 from scipy.spatial import distance
 from sklearn.ensemble import RandomForestRegressor
-from joblib import Parallel, delayed
+
 
 class PyGRFBuilder:
 
@@ -175,12 +176,54 @@ class PyGRFBuilder:
     # FIT
     # ------------------------------------------------------------------
 
+    def fit(
+        self,
+        X,
+        y,
+        coords,
+        location_ids=None,
+    ):
+        """
+        Fit one local RF per unique spatial location.
 
-    def fit(self, X, y, coords, location_ids=None):
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Predictor observations.
 
-        # --------------------------------------------------
-        # 1. Convert inputs to arrays
-        # --------------------------------------------------
+            Example:
+                lst_anomaly
+                elev
+
+        y : pandas.Series or array-like
+            Target observations.
+
+            Example:
+                tmax_anomaly
+
+        coords : pandas.DataFrame or array-like, shape (n_samples, 2)
+            Coordinates for every temporal observation.
+
+            Repeated coordinates are expected because each station has
+            many observations.
+
+        location_ids : array-like, optional
+            Station/location identifier for every observation.
+
+            Strongly recommended.
+
+            If omitted, unique coordinate pairs are used to identify
+            stations.
+
+        Returns
+        -------
+        self
+        """
+
+        # --------------------------------------------------------------
+        # Input formatting
+        # --------------------------------------------------------------
+
         if isinstance(X, pd.DataFrame):
             self.X_columns = X.columns.tolist()
             X_array = X.to_numpy(dtype=float)
@@ -196,7 +239,9 @@ class PyGRFBuilder:
         coords_array = np.asarray(coords, dtype=float)
 
         if coords_array.ndim != 2 or coords_array.shape[1] != 2:
-            raise ValueError("coords must have shape (n_samples, 2)")
+            raise ValueError(
+                "coords must have shape (n_samples, 2)"
+            )
 
         n_samples = len(X_array)
 
@@ -206,15 +251,23 @@ class PyGRFBuilder:
         if len(coords_array) != n_samples:
             raise ValueError("X and coords have different numbers of observations")
 
-        # --------------------------------------------------
-        # 2. Identify unique stations
-        # --------------------------------------------------
+        # --------------------------------------------------------------
+        # Identify unique stations
+        # --------------------------------------------------------------
+
         if location_ids is None:
+
+            # Use coordinate pairs as station IDs
             station_keys, station_index = np.unique(
-                coords_array, axis=0, return_inverse=True
+                coords_array,
+                axis=0,
+                return_inverse=True
             )
+
             self.station_ids = station_keys
+
         else:
+
             location_ids = np.asarray(location_ids)
 
             if len(location_ids) != n_samples:
@@ -222,20 +275,27 @@ class PyGRFBuilder:
                     "location_ids must have one value per observation"
                 )
 
+            # Preserve order of first occurrence
             unique_ids, station_index = np.unique(
-                location_ids, return_inverse=True
+                location_ids,
+                return_inverse=True
             )
+
             self.station_ids = unique_ids
 
+            # Get coordinates for each station.
+            #
+            # We check that a station has one spatial location.
             station_coords = []
 
             for i in range(len(unique_ids)):
+
                 rows = coords_array[station_index == i]
 
                 if not np.allclose(rows, rows[0]):
                     raise ValueError(
-                        f"location_id {unique_ids[i]} has "
-                        "multiple different coordinates"
+                        f"location_id {unique_ids[i]} has multiple "
+                        "different coordinates"
                     )
 
                 station_coords.append(rows[0])
@@ -248,53 +308,100 @@ class PyGRFBuilder:
         n_stations = len(self.station_coords)
 
         print(
-            f"Found {n_stations} unique locations from "
-            f"{n_samples:,} observations."
+            f"Found {n_stations} unique locations "
+            f"from {n_samples:,} observations."
         )
 
-        # --------------------------------------------------
-        # 3. Calculate station-to-station distances
-        # --------------------------------------------------
+        # --------------------------------------------------------------
+        # CRITICAL:
+        #
+        # Distance matrix is now station x station rather than
+        # observation x observation.
+        # --------------------------------------------------------------
+
         self.distance_matrix = distance.cdist(
             self.station_coords,
             self.station_coords,
-            metric="euclidean",
+            metric="euclidean"
         )
 
-        # Observation indices belonging to each station
+        # --------------------------------------------------------------
+        # Store which observations belong to each station
+        # --------------------------------------------------------------
+
         station_observation_indices = [
             np.where(station_index == i)[0]
             for i in range(n_stations)
         ]
 
-        # --------------------------------------------------
-        # 4. Define function to fit ONE local RF
-        # --------------------------------------------------
-        def fit_one_local_model(i):
+        # --------------------------------------------------------------
+        # Fit one local RF at every station
+        # --------------------------------------------------------------
+
+        self.local_models = []
+
+        for i in range(n_stations):
+
+            print(
+                f"Fitting local RF "
+                f"{i + 1}/{n_stations}",
+                end="\r"
+            )
+
+            # ----------------------------------------------------------
+            # Find neighbouring STATIONS
+            # ----------------------------------------------------------
 
             neighbour_stations, station_weights = (
                 self._get_station_neighbourhood(i)
             )
 
+            # ----------------------------------------------------------
+            # Convert station-level neighbourhood into temporal
+            # observations.
+            #
+            # This is the crucial bit.
+            #
+            # If station j has 5,000 observations and gets spatial
+            # weight 0.7, ALL 5,000 observations receive weight 0.7.
+            # ----------------------------------------------------------
+
             local_observations = []
+
             local_weights = []
 
             for station_j, station_weight in zip(
-                neighbour_stations, station_weights
+                neighbour_stations,
+                station_weights
             ):
+
                 obs_idx = station_observation_indices[station_j]
 
                 local_observations.append(obs_idx)
 
                 local_weights.append(
-                    np.full(len(obs_idx), station_weight)
+                    np.full(
+                        len(obs_idx),
+                        station_weight
+                    )
                 )
 
-            local_observations = np.concatenate(local_observations)
-            local_weights = np.concatenate(local_weights)
+            local_observations = np.concatenate(
+                local_observations
+            )
+
+            local_weights = np.concatenate(
+                local_weights
+            )
 
             X_local = X_array[local_observations]
             y_local = y_array[local_observations]
+
+            self.local_observation_indices.append(local_observations)
+
+            # ----------------------------------------------------------
+            # Fit RF
+            # ----------------------------------------------------------
 
             rf = RandomForestRegressor(
                 n_estimators=self.n_estimators,
@@ -305,41 +412,28 @@ class PyGRFBuilder:
                     if self.random_state is None
                     else self.random_state + i
                 ),
-                n_jobs=1,  # Parallelism is handled outside the RF
+                n_jobs=self.n_jobs,
                 min_samples_leaf=self.min_samples_leaf,
             )
 
             if self.train_weighted:
+
                 rf.fit(
                     X_local,
                     y_local,
-                    sample_weight=local_weights,
+                    sample_weight=local_weights
                 )
+
             else:
-                rf.fit(X_local, y_local)
 
-            return rf, local_observations
+                rf.fit(
+                    X_local,
+                    y_local
+                )
 
-        # --------------------------------------------------
-        # 5. Fit local RFs in parallel
-        # --------------------------------------------------
-        results = Parallel(
-            n_jobs=self.n_jobs,
-            verbose=10,
-            prefer="threads",
-        )(
-            delayed(fit_one_local_model)(i)
-            for i in range(n_stations)
-        )
+            self.local_models.append(rf)
 
-        # Results are returned in station-index order
-        self.local_models = [result[0] for result in results]
-
-        self.local_observation_indices = [
-            result[1] for result in results
-        ]
-
-        print(f"Finished fitting {n_stations} local RFs.")
+        print()
 
         return self
 
@@ -347,181 +441,170 @@ class PyGRFBuilder:
     # PREDICT
     # ------------------------------------------------------------------
 
+    def predict(
+        self,
+        X,
+        coords,
+    ):
+        """
+        Predict at arbitrary locations.
 
-    def predict(self, X, coords):
-        X = np.asarray(X)
-        coords = np.asarray(coords)
+        Importantly, coords do NOT have to correspond to existing
+        stations.
 
-        def predict_one(i):
-            """
-            Predict at arbitrary locations.
-    
-            Importantly, coords do NOT have to correspond to existing
-            stations.
-    
-            Parameters
-            ----------
-            X : pandas.DataFrame or array-like
-                Predictor values at prediction locations.
-    
-            coords : array-like, shape (n_predictions, 2)
-                Coordinates of prediction locations.
-    
-            Returns
-            -------
-            predictions : ndarray
-                Spatially weighted local-RF predictions.
-            """
-    
-            if isinstance(X, pd.DataFrame):
-                X_array = X.to_numpy(dtype=float)
-            else:
-                X_array = np.asarray(X, dtype=float)
-    
-            coords_array = np.asarray(coords, dtype=float)
-    
-            if coords_array.ndim != 2 or coords_array.shape[1] != 2:
-                raise ValueError(
-                    "coords must have shape (n_predictions, 2)"
-                )
-    
-            n_predictions = len(X_array)
-            n_stations = len(self.local_models)
-    
-            # --------------------------------------------------------------
-            # Each prediction location -> every station
-            # --------------------------------------------------------------
-    
-            prediction_distances = distance.cdist(
-                coords_array,
-                self.station_coords,
-                metric="euclidean"
-            )
-    
-            # --------------------------------------------------------------
-            # Every local RF predicts every target point
-            #
-            # Shape:
-            #     n_predictions x n_stations
-            # --------------------------------------------------------------
-    
-            local_predictions = np.empty(
-                (n_predictions, n_stations),
-                dtype=float
-            )
-    
-            for i, rf in enumerate(self.local_models):
-    
-                local_predictions[:, i] = rf.predict(
-                    X_array
-                )
-    
-            # --------------------------------------------------------------
-            # Spatially combine the local RF predictions
-            # --------------------------------------------------------------
-    
-            predictions = np.full(
-                n_predictions,
-                np.nan,
-                dtype=float
-            )
-    
-            for i in range(n_predictions):
-    
-                distances_i = prediction_distances[i]
-    
-                # ----------------------------------------------------------
-                # Select neighbouring station-level RFs
-                # ----------------------------------------------------------
-    
-                if self.kernel == "adaptive":
-    
-                    k = min(
-                        int(self.band_width),
-                        n_stations
-                    )
-    
-                    station_indices = np.argpartition(
-                        distances_i,
-                        k - 1
-                    )[:k]
-    
-                    station_distances = (
-                        distances_i[station_indices]
-                    )
-    
-                    bandwidth = (
-                        np.partition(
-                            distances_i,
-                            k - 1
-                        )[k - 1] * 1.0000001
-                    )
-    
-                else:
-    
-                    bandwidth = float(self.band_width)
-    
-                    station_indices = np.where(
-                        distances_i < bandwidth
-                    )[0]
-    
-                    station_distances = (
-                        distances_i[station_indices]
-                    )
-    
-                # ----------------------------------------------------------
-                # Spatial weights
-                # ----------------------------------------------------------
-    
-                weights = self._calculate_weights(
-                    station_distances,
-                    bandwidth
-                )
-    
-                # ----------------------------------------------------------
-                # Weighted local prediction
-                # ----------------------------------------------------------
-    
-                if self.predict_weighted:
-    
-                    weight_sum = weights.sum()
-    
-                    if weight_sum == 0:
-    
-                        # Should only happen for pathological fixed
-                        # bandwidth choices.
-    
-                        predictions[i] = np.nan
-    
-                    else:
-    
-                        predictions[i] = (
-                            np.sum(
-                                local_predictions[
-                                    i,
-                                    station_indices
-                                ] * weights
-                            )
-                            / weight_sum
-                        )
-    
-                else:
-    
-                    predictions[i] = np.mean(
-                        local_predictions[
-                            i,
-                            station_indices
-                        ]
-                    )
-            
-            return predictions
+        Parameters
+        ----------
+        X : pandas.DataFrame or array-like
+            Predictor values at prediction locations.
 
-        predictions = Parallel(
-            n_jobs=self.n_jobs,
-            prefer="threads",
-        )(
-            delayed(predict_one)(i)
-            for i in range(len(X))
+        coords : array-like, shape (n_predictions, 2)
+            Coordinates of prediction locations.
+
+        Returns
+        -------
+        predictions : ndarray
+            Spatially weighted local-RF predictions.
+        """
+
+        if isinstance(X, pd.DataFrame):
+            X_array = X.to_numpy(dtype=float)
+        else:
+            X_array = np.asarray(X, dtype=float)
+
+        coords_array = np.asarray(coords, dtype=float)
+
+        if coords_array.ndim != 2 or coords_array.shape[1] != 2:
+            raise ValueError(
+                "coords must have shape (n_predictions, 2)"
+            )
+
+        n_predictions = len(X_array)
+        n_stations = len(self.local_models)
+
+        # --------------------------------------------------------------
+        # Each prediction location -> every station
+        # --------------------------------------------------------------
+
+        prediction_distances = distance.cdist(
+            coords_array,
+            self.station_coords,
+            metric="euclidean"
         )
 
-        return np.asarray(predictions)
+        # --------------------------------------------------------------
+        # Every local RF predicts every target point
+        #
+        # Shape:
+        #     n_predictions x n_stations
+        # --------------------------------------------------------------
+
+        local_predictions = np.empty(
+            (n_predictions, n_stations),
+            dtype=float
+        )
+
+        for i, rf in enumerate(self.local_models):
+
+            local_predictions[:, i] = rf.predict(
+                X_array
+            )
+
+        # --------------------------------------------------------------
+        # Spatially combine the local RF predictions
+        # --------------------------------------------------------------
+
+        predictions = np.full(
+            n_predictions,
+            np.nan,
+            dtype=float
+        )
+
+        for i in range(n_predictions):
+
+            distances_i = prediction_distances[i]
+
+            # ----------------------------------------------------------
+            # Select neighbouring station-level RFs
+            # ----------------------------------------------------------
+
+            if self.kernel == "adaptive":
+
+                k = min(
+                    int(self.band_width),
+                    n_stations
+                )
+
+                station_indices = np.argpartition(
+                    distances_i,
+                    k - 1
+                )[:k]
+
+                station_distances = (
+                    distances_i[station_indices]
+                )
+
+                bandwidth = (
+                    np.partition(
+                        distances_i,
+                        k - 1
+                    )[k - 1] * 1.0000001
+                )
+
+            else:
+
+                bandwidth = float(self.band_width)
+
+                station_indices = np.where(
+                    distances_i < bandwidth
+                )[0]
+
+                station_distances = (
+                    distances_i[station_indices]
+                )
+
+            # ----------------------------------------------------------
+            # Spatial weights
+            # ----------------------------------------------------------
+
+            weights = self._calculate_weights(
+                station_distances,
+                bandwidth
+            )
+
+            # ----------------------------------------------------------
+            # Weighted local prediction
+            # ----------------------------------------------------------
+
+            if self.predict_weighted:
+
+                weight_sum = weights.sum()
+
+                if weight_sum == 0:
+
+                    # Should only happen for pathological fixed
+                    # bandwidth choices.
+
+                    predictions[i] = np.nan
+
+                else:
+
+                    predictions[i] = (
+                        np.sum(
+                            local_predictions[
+                                i,
+                                station_indices
+                            ] * weights
+                        )
+                        / weight_sum
+                    )
+
+            else:
+
+                predictions[i] = np.mean(
+                    local_predictions[
+                        i,
+                        station_indices
+                    ]
+                )
+
+        return predictions
