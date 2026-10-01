@@ -25,7 +25,7 @@ ISD_DATA_DIR = STORAGE_DIR + 'isd_data/'
 
 ### CONSTANTS ###
 LAPSE_RATE = -0.003773 # degrees C per meter, see mgwr_data.py for how this was calculated
-
+AMAZON_BASIN_BUFFER_KM = 35
 
 ### PROCESSED DATA ###
 TMAX_RECHUNKED_PATH = STORAGE_DIR + 'tmax/rechunked/'

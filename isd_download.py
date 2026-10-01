@@ -1,10 +1,9 @@
 #%%
-from sre_constants import SRE_FLAG_UNICODE
 
 import pandas as pd
 import geopandas as gpd
 from ufuncs import get_amazon_basin_mask
-from constants import ISD_DATA_DIR
+from constants import ISD_DATA_DIR, INMET_PATH
 import concurrent.futures as cf
 import os
 from glob import glob
@@ -12,7 +11,7 @@ from glob import glob
 STATION_DOWNLOAD_WORKER_COUNT = 20
 
 
-def load_isd_amazon_metadata():
+def load_isd_amazon_metadata(gdf=True):
     stations = pd.read_csv('data/isd-history.csv')
 
     stations = gpd.GeoDataFrame(
@@ -27,6 +26,8 @@ def load_isd_amazon_metadata():
     stations_in['BEGIN'] = pd.to_datetime(stations_in['BEGIN'], format='%Y%m%d')
     stations_in['END'] = pd.to_datetime(stations_in['END'], format='%Y%m%d')
     stations_in = stations_in[(stations_in['BEGIN'] <= '2020-01-01') & (stations_in['END'] >= '2003-01-01')]
+    stations_in['station_id'] = stations_in['USAF'] + stations_in['WBAN'].astype(str).str.zfill(5)
+    stations_in = stations_in.rename({'LAT': 'latitude', 'LON': 'longitude'}, axis=1)
     return stations_in
 #%%
 
@@ -46,15 +47,15 @@ def download_station_data(station_id, start_year=2003, end_year=2020):
             print(f'Error downloading data for station {station_id} for year {year}: {e}')
 
 def download_all_stations_data(stations_df, start_year=2003, end_year=2020):
-    station_ids = stations_df['USAF'] + stations_df['WBAN'].astype(str).str.zfill(5)
+    station_ids = stations_df['station_id'].tolist()
     with cf.ThreadPoolExecutor(max_workers=STATION_DOWNLOAD_WORKER_COUNT) as executor:
         futures = {executor.submit(download_station_data, station_id, start_year, end_year): station_id for station_id in station_ids}
         for future in cf.as_completed(futures):
             station_id = futures[future]
             future.result()
 
-if __name__ == "__main__":
-    download_all_stations_data(stations_in)
+# if __name__ == "__main__":
+#     download_all_stations_data(stations_in)
 
 #%% 
 def load_station_data(station_id):
@@ -89,7 +90,7 @@ def load_tmax_data(station_id):
         return sr
 
 def load_all_tmax_data(stations_df):
-    station_ids = stations_df['USAF'] + stations_df['WBAN'].astype(str).str.zfill(5)
+    station_ids = stations_df['station_id'].tolist()
     tmax_data = {}
     for station_id in station_ids:
         df = load_tmax_data(station_id)
@@ -98,7 +99,12 @@ def load_all_tmax_data(stations_df):
     df = pd.DataFrame(tmax_data).astype(float)
     return df
 
-def get_isd_tmax():
-    stations_in = load_isd_amazon_metadata()
-    tmax_df = load_all_tmax_data(stations_in)
+def get_isd_tmax(recompute=False):
+    cache_path = f'{ISD_DATA_DIR}isd_tmax_data.pkl'
+    if recompute or not os.path.exists(cache_path):
+        stations_in = load_isd_amazon_metadata()
+        tmax_df = load_all_tmax_data(stations_in)
+        tmax_df.to_parquet(cache_path)
+    else:
+        tmax_df = pd.read_parquet(cache_path)
     return tmax_df

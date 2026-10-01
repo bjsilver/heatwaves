@@ -1,9 +1,8 @@
 #%%
 import os
-from constants import STORAGE_DIR, LST_DIR, DOY_POOL_WINDOW, MGWR_DATA_DIR, METEOSTAT_DATA_PATH, DATE_SLICE, MGWR_RESULTS_DIR
+from constants import STORAGE_DIR, LST_DIR, MGWR_DATA_DIR, DATE_SLICE, AMAZON_BASIN_BUFFER_KM
 import numpy as np
 import pandas as pd
-import sqlite3
 import geopandas as gpd
 import xarray as xr
 from ufuncs import local_cluster, get_amazon_basin_mask
@@ -11,79 +10,29 @@ from pyproj import CRS
 import pickle as pkl
 import statsmodels.formula.api as smf
 import cartopy.crs as ccrs
+from obs_data import get_harmonised_data
+
+MIN_VALID_YEARS = 15
+MIN_VALID_DAYS_PER_YEAR = 200
 
 
-MIN_VALID_YEARS = 12
-MIN_VALID_DAYS_PER_YEAR = 120
+def get_climatologically_valid_data(min_valid_years=MIN_VALID_YEARS, min_valid_days_per_year=MIN_VALID_DAYS_PER_YEAR):
 
-def load_meteostat_stations():
-    db = "./data/stations.db"
-    con = sqlite3.connect(db)
-    stations = pd.read_sql_query(
-        "SELECT * FROM stations",
-        con
-    )
-    con.close()
-    stations = gpd.GeoDataFrame(stations, geometry=gpd.points_from_xy(stations.longitude, stations.latitude), crs='EPSG:4326')
-    return stations
+    tmax_df = get_interpolated_data(recompute=False)
 
-def get_climatologically_valid_meteostat_stations(min_valid_years=MIN_VALID_YEARS, min_valid_days_per_year=MIN_VALID_DAYS_PER_YEAR):
+    year_counts = tmax_df['tmax'].groupby(tmax_df.station_id).resample('YS').count()
+    station_counts = (year_counts>= min_valid_days_per_year).groupby(year_counts.index.get_level_values(0)).sum() 
 
-    meteostat_paths = [f for f in os.listdir(METEOSTAT_DATA_PATH) if f.endswith('.parquet')]
+    valid_stations = station_counts[station_counts >= min_valid_years].index.get_level_values(0).unique()
 
-    year_counts = pd.DataFrame()
-    for path in meteostat_paths:
-        station_id = path.split('/')[-1].split('.')[0]
-        df = pd.read_parquet(METEOSTAT_DATA_PATH+path)
-        if 'temp' in df.columns:
-            sr = df['temp'].resample('D').max().squeeze()
-        elif 'tmax' in df.columns:
-            sr = df.squeeze()
-        else:
-            continue
-        if type(sr) is not pd.Series:
-            continue
-        sr_annual_count = sr.loc[DATE_SLICE].resample('YS').count()
-        sr_annual_count =sr_annual_count.reindex(pd.date_range(start=DATE_SLICE.start, end=DATE_SLICE.stop, freq='YS'), fill_value=0)
-        year_counts[station_id] = sr_annual_count
-
-    valid_stations = year_counts.T.loc[((year_counts >= min_valid_days_per_year).sum() >= min_valid_years)].index
-
-    meteostat_stations = load_meteostat_stations()
-    valid_meteostat_stations = meteostat_stations[meteostat_stations['id'].isin(valid_stations)]
-    return valid_meteostat_stations
-
-def load_meteostat_data(mdf):
-
-    # load the stations in the valid paths
-    meteostat_df = pd.DataFrame()
-    for station_id in mdf['id']:
-        path = METEOSTAT_DATA_PATH + f'{station_id}.parquet'
-        if not os.path.exists(path):
-            continue
-        df = pd.read_parquet(path)
-        if len(df) < 25:
-            continue
-        if 'temp' in df.columns:
-            sr = df['temp'].resample('D').max().squeeze()
-        elif 'tmax' in df.columns:
-            sr = df.squeeze()
-        else:
-            raise ValueError(f"Station {station_id} has unrecognised format")
-        sr = sr.loc[DATE_SLICE]
-        
-        meteostat_df[station_id] = sr
-
-    meteostat_df.columns.name = 'station_id'
-    return meteostat_df
-
-
+    df = tmax_df[tmax_df['station_id'].isin(valid_stations)]
+    return df
 
 def interpolate_lst_to_stations(mdf):
 
-    station = xr.DataArray(mdf['id'].values, dims='station')
-    lat = xr.DataArray(mdf['latitude'].values, dims='station', coords={'station': station})
-    lon = xr.DataArray(mdf['longitude'].values, dims='station', coords={'station': station})
+    station = xr.DataArray(mdf['station_id'].values, dims='station')
+    lat = xr.DataArray(mdf['lat'].values, dims='station', coords={'station': station})
+    lon = xr.DataArray(mdf['lon'].values, dims='station', coords={'station': station})
 
 
     for year in range(2003, 2021):
@@ -95,9 +44,9 @@ def interpolate_lst_to_stations(mdf):
 
 def intepolate_elevation_to_stations(mdf):
 
-    station = xr.DataArray(mdf['id'].values, dims='station')
-    lat = xr.DataArray(mdf['latitude'].values, dims='station', coords={'station': station})
-    lon = xr.DataArray(mdf['longitude'].values, dims='station', coords={'station': station})
+    station = xr.DataArray(mdf['station_id'].values, dims='station')
+    lat = xr.DataArray(mdf['lat'].values, dims='station', coords={'station': station})
+    lon = xr.DataArray(mdf['lon'].values, dims='station', coords={'station': station})
 
     elev = xr.open_dataset(os.path.join(STORAGE_DIR, '../' 'elevation/orig_resolution_regridded', 'elevation_regridded.nc'))['elevation']
     elev_interped = elev.interp(lon=lon, lat=lat, method='linear')
@@ -115,20 +64,6 @@ def intepolate_data_to_stations(mdf, recompute=False):
     else:
         print("Skipping interpolation of LST and elevation to stations. Set recompute=True to force recomputation.")
 
-def define_local_azimuthal_projection(recalculate=False):
-    if not recalculate and os.path.exists('./data/azimuthal_projection.pkl'):
-        with open('./data/azimuthal_projection.pkl', 'rb') as f:
-            return pkl.load(f)
-
-    AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
-    stations = load_meteostat_stations()
-    stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
-    lon0, lat0 = stations_basin.centroid.x.mean(), stations_basin.centroid.y.mean()
-    az_proj =ccrs.AzimuthalEquidistant(central_longitude=lon0, central_latitude=lat0)
-    # write projection to file
-    with open('./data/azimuthal_projection.pkl', 'wb') as f:
-        pkl.dump(az_proj, f)
-    return az_proj
 
 
 def calc_lapse_rate(df):
@@ -142,7 +77,7 @@ def calc_lapse_rate(df):
     lapse_rate = model.params['elevation']
     return lapse_rate
 
-def get_climatologically_valid_data(recompute=False):
+def get_interpolated_data(recompute=False):
 
     if not recompute and os.path.exists(MGWR_DATA_DIR+'mgwr_climatological_long.parquet'):
         print("Loading climatologically valid data from cache...")
@@ -150,12 +85,10 @@ def get_climatologically_valid_data(recompute=False):
         return df
     print("Computing climatologically valid data...")
 
-    mdf = get_climatologically_valid_meteostat_stations(min_valid_years=MIN_VALID_YEARS, min_valid_days_per_year=MIN_VALID_DAYS_PER_YEAR)
-    az_proj = define_local_azimuthal_projection(recalculate=False)
-    mdf_az_proj = mdf.to_crs(az_proj)
+    tmax_df, stations, az_proj = get_harmonised_data()
+
 
     # load the tmax data for the valid stations
-    tmax_df = load_meteostat_data(mdf)
     tmax_df = tmax_df.loc[slice(DATE_SLICE.start, DATE_SLICE.stop)]
     tmax_df = tmax_df.reindex(pd.date_range(start=DATE_SLICE.start, end=DATE_SLICE.stop, freq='D'))
     # drop leap days
@@ -175,12 +108,10 @@ def get_climatologically_valid_data(recompute=False):
     ds = xr.merge([lst, elev], compat='no_conflicts', join='override')
     ds = ds.rename({'station': 'station_id'})
     # select only stations in mdf+tmax
-    ds = ds.loc[{'station_id':mdf['id'].values}]
+    ds = ds.loc[{'station_id':stations['station_id'].values}]
     # add northing and easting
-    ds = ds.assign_coords({'easting': (('station_id'), mdf_az_proj['geometry'].x.values),
-                            'northing': (('station_id'), mdf_az_proj['geometry'].y.values)})
-
-
+    ds = ds.assign_coords({'easting': (('station_id'), stations['geometry'].x.values),
+                            'northing': (('station_id'), stations['geometry'].y.values)})
 
 
     ds = ds.stack(time=('year', 'doy')).drop_vars(['band', 'spatial_ref'])
@@ -191,15 +122,18 @@ def get_climatologically_valid_data(recompute=False):
     lst_df = lst_df.sort_index()
 
     df = pd.concat([tmax, lst_df], axis=1)
+    # set names for multiindex levels
+    df.index.names = ['datetime', 'station_id']
     df = df.reset_index(level='station_id')
 
     df['year'] = [i.year for i in df.index]
     df['doy'] = [i.dayofyr for i in df.index]
 
-
+    datetimes = df.reset_index()['datetime'].apply(lambda i: pd.Timestamp(i.strftime()))
+    df.index = datetimes
 
     df.to_parquet(MGWR_DATA_DIR+'mgwr_climatological_long.parquet',
-                  index=False, engine='pyarrow')
+                  index=True, engine='pyarrow')
 
 def doy_gaussian_mean(df, target_doy, window=10, sigma=None, n_days_per_year=365):
     if sigma is None:
@@ -307,14 +241,14 @@ def doy_gaussian_climatology(window=10, sigma=None, recompute=False):
     lst_clim.to_zarr(MGWR_DATA_DIR+'lst_climatology.zarr', mode='w')
 
 
-
+# with local_cluster(n_workers=4, threads_per_worker=16, memory_limit='50GB',
+#                     suppress_dask_warnings=False) as cluster:
+#     doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False)
 
 #%%
 #%% interpolate data to station_locations
 if __name__ == '__main__':
 
-    AMAZON_BASIN = get_amazon_basin_mask(buffer_km=800)
-    stations = load_meteostat_stations()
-    stations_basin = stations[stations.geometry.within(AMAZON_BASIN['vector'].geometry.iloc[0])]
-    intepolate_data_to_stations(stations_basin, recompute=False)
-    get_climatologically_valid_data(recompute=True)
+    stations_basin, mdf, crs = get_harmonised_data(recompute=False)
+    intepolate_data_to_stations(mdf, recompute=False)
+    get_interpolated_data(recompute=False)
