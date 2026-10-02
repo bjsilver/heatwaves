@@ -1,6 +1,13 @@
 #%%
 import os
-from constants import STORAGE_DIR, LST_DIR, MGWR_DATA_DIR, DATE_SLICE, AMAZON_BASIN_BUFFER_KM
+from constants import (
+    STORAGE_DIR,
+    LST_DIR,
+    MGWR_DATA_DIR,
+    DATE_SLICE,
+    DOY_POOL_WINDOW,
+    CLIMATOLOGY_SCORE_THRESHOLD
+)
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -12,18 +19,20 @@ import statsmodels.formula.api as smf
 import cartopy.crs as ccrs
 from obs_data import get_harmonised_data
 
-MIN_VALID_YEARS = 15
-MIN_VALID_DAYS_PER_YEAR = 200
 
 
-def get_climatologically_valid_data(min_valid_years=MIN_VALID_YEARS, min_valid_days_per_year=MIN_VALID_DAYS_PER_YEAR):
+
+def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD, min_valid_years=10):
 
     tmax_df = get_interpolated_data(recompute=False)
 
-    year_counts = tmax_df['tmax'].groupby(tmax_df.station_id).resample('YS').count()
-    station_counts = (year_counts>= min_valid_days_per_year).groupby(year_counts.index.get_level_values(0)).sum() 
+    station_doy_count = tmax_df.groupby([tmax_df.station_id, tmax_df.doy])['tmax'].count()
+    station_doy_mean = station_doy_count.groupby(level='station_id').mean()
+    station_doy_std  = station_doy_count.groupby(level='station_id').std()
+    score = station_doy_mean / np.sqrt(station_doy_std)
+    score = score.sort_values(ascending=False)
 
-    valid_stations = station_counts[station_counts >= min_valid_years].index.get_level_values(0).unique()
+    valid_stations = score[score >= climatology_score_threshold].index.get_level_values(0).unique()
 
     df = tmax_df[tmax_df['station_id'].isin(valid_stations)]
     return df
@@ -135,7 +144,7 @@ def get_interpolated_data(recompute=False):
     df.to_parquet(MGWR_DATA_DIR+'mgwr_climatological_long.parquet',
                   index=True, engine='pyarrow')
 
-def doy_gaussian_mean(df, target_doy, window=10, sigma=None, n_days_per_year=365):
+def doy_gaussian_mean(df, target_doy, window=DOY_POOL_WINDOW, sigma=None, n_days_per_year=365):
     if sigma is None:
         sigma = window
 
@@ -200,7 +209,7 @@ def doy_gaussian_mean(df, target_doy, window=10, sigma=None, n_days_per_year=365
     return result.merge(station_info, on='station_id', how='left')
 
 
-def doy_gaussian_climatology(window=10, sigma=None, recompute=False):
+def doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False):
 
     if not recompute and os.path.exists(MGWR_DATA_DIR+'lst_climatology.zarr'):
         return xr.open_zarr(MGWR_DATA_DIR+'lst_climatology.zarr')['LST']
@@ -243,7 +252,7 @@ def doy_gaussian_climatology(window=10, sigma=None, recompute=False):
 
 # with local_cluster(n_workers=4, threads_per_worker=16, memory_limit='50GB',
 #                     suppress_dask_warnings=False) as cluster:
-#     doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False)
+#     doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=True)
 
 #%%
 #%% interpolate data to station_locations
