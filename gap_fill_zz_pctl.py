@@ -10,7 +10,7 @@ import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 # import lru_cache
 from functools import lru_cache
-from ufuncs import _add_gridlines
+from ufuncs_plot import _add_gridlines
 
 PCT_PATH = os.path.join(STORAGE_DIR, 'percentiles', 'zz_tmax_95pc.zarr')
 OUT_PATH = os.path.join(STORAGE_DIR, 'percentiles', 'zz_tmax_95pc_gapfilled.zarr')
@@ -286,147 +286,146 @@ if __name__ == '__main__':
         main()
 
 
-#%%
-# plot the process
+#%% plot the process
 
 
     
-# def interp_tests():
+def interp_tests():
 
-#     westlimit=-60.2; southlimit =-10.5; eastlimit=-58.7; northlimit=-9
-#     TEST_AREA_SLICER = dict(lat=slice(southlimit, northlimit), lon=slice(westlimit, eastlimit))
+    westlimit=-60.2; southlimit =-10.5; eastlimit=-58.7; northlimit=-9
+    TEST_AREA_SLICER = dict(lat=slice(southlimit, northlimit), lon=slice(westlimit, eastlimit))
 
-#     @lru_cache(maxsize=10)
-#     def quick_interp_test(k, power, distance_upper_bound,
-#                         loss_threshold):
-#         pct, mask, loss = load_data(TEST_AREA_SLICER)
-#         pct = pct / 10.0
-#         ok = loss.max('time') < loss_threshold
-#         pct_ok = pct.where(ok)
-#         pct_ok = pct_ok.chunk({'doy': 1, 'lat': -1, 'lon': -1})
+    @lru_cache(maxsize=10)
+    def quick_interp_test(k, power, distance_upper_bound,
+                        loss_threshold):
+        pct, mask, loss = load_data(TEST_AREA_SLICER)
+        pct = pct / 10.0
+        ok = loss.max('time') < loss_threshold
+        pct_ok = pct.where(ok)
+        pct_ok = pct_ok.chunk({'doy': 1, 'lat': -1, 'lon': -1})
 
-#         lookup = _build_lookup_from_static_masks(
-#             pct_ok,
-#             mask,
-#             k=k,
-#             power=power,
-#             distance_upper_bound=distance_upper_bound
-#         )
+        lookup = _build_lookup_from_static_masks(
+            pct_ok,
+            mask,
+            k=k,
+            power=power,
+            distance_upper_bound=distance_upper_bound
+        )
 
-#         with ProgressBar():
-#             filled = interpolate_missing(pct_ok, lookup).mean('doy').compute(processes=4)
-#             pct_mean = pct.mean('doy').compute(processes=4)
-#         return ok, pct_mean, filled
+        with ProgressBar():
+            filled = interpolate_missing(pct_ok, lookup).mean('doy').compute(processes=4)
+            pct_mean = pct.mean('doy').compute(processes=4)
+        return ok, pct_mean, filled
 
-#     def quick_interp_test_plots(tests, pct_lims=None, diff_lims=None):
+    def quick_interp_test_plots(tests, pct_lims=None, diff_lims=None):
 
-#         # run the tests for each parameter combination
-#         results = []
-#         for test in tests:
-#             k = test['k']
-#             power = test['power']
-#             distance_upper_bound = test['distance_upper_bound']
-#             loss_threshold = test['loss_threshold']
-#             ok, pct_mean, filled = quick_interp_test(k, power, distance_upper_bound, loss_threshold)
-#             results.append((k, power, distance_upper_bound, ok, pct_mean, filled))
+        # run the tests for each parameter combination
+        results = []
+        for test in tests:
+            k = test['k']
+            power = test['power']
+            distance_upper_bound = test['distance_upper_bound']
+            loss_threshold = test['loss_threshold']
+            ok, pct_mean, filled = quick_interp_test(k, power, distance_upper_bound, loss_threshold)
+            results.append((k, power, distance_upper_bound, ok, pct_mean, filled))
 
-#         # plot the results
-#         nrows = len(tests)
-#         fig, axes = plt.subplots(nrows, 3, figsize=(12, 5 * nrows), subplot_kw={'projection': ccrs.PlateCarree()})
-#         axes = np.atleast_2d(axes)
+        # plot the results
+        nrows = len(tests)
+        fig, axes = plt.subplots(nrows, 3, figsize=(12, 5 * nrows), subplot_kw={'projection': ccrs.PlateCarree()})
+        axes = np.atleast_2d(axes)
 
-#         cbar_kwargs = {'label': '', 'orientation': 'horizontal', 'shrink': .5, 'pad': 0.1}
-#         # plot the result and difference from original pct_mean for each test
-#         for i, (k, power, distance_upper_bound, ok, pct_mean, filled) in enumerate(results):
-#             ax1 = axes[i, 0]
-#             ax2 = axes[i, 1]
-#             ax3 = axes[i, 2]
+        cbar_kwargs = {'label': '', 'orientation': 'horizontal', 'shrink': .5, 'pad': 0.1}
+        # plot the result and difference from original pct_mean for each test
+        for i, (k, power, distance_upper_bound, ok, pct_mean, filled) in enumerate(results):
+            ax1 = axes[i, 0]
+            ax2 = axes[i, 1]
+            ax3 = axes[i, 2]
 
-#             # Keep all map panels on identical bounds to avoid subtle misalignment.
-#             extent = [
-#                 float(pct_mean.lon.min()),
-#                 float(pct_mean.lon.max()),
-#                 float(pct_mean.lat.min()),
-#                 float(pct_mean.lat.max()),
-#             ]
-#             for ax in (ax1, ax2, ax3):
-#                 ax.set_extent(extent, crs=ccrs.PlateCarree())
+            # Keep all map panels on identical bounds to avoid subtle misalignment.
+            extent = [
+                float(pct_mean.lon.min()),
+                float(pct_mean.lon.max()),
+                float(pct_mean.lat.min()),
+                float(pct_mean.lat.max()),
+            ]
+            for ax in (ax1, ax2, ax3):
+                ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-#             # plot original pct_mean
-#             pct_mean.plot.imshow(ax=ax1, cmap='magma', vmin=pct_lims[0], vmax=pct_lims[1],
-#                                 cbar_kwargs=cbar_kwargs)
-#             ax1.set_title('')
-#             _add_gridlines(ax1, tick_interval=.5)
-#             # plot result
-#             filled.plot.imshow(ax=ax2, cmap='magma', vmin=pct_lims[0], vmax=pct_lims[1],
-#                             cbar_kwargs=cbar_kwargs)
-#             # annotate the parameters as small white text
-#             ax2.text(0.5, 0.05, f'k={k}, power={power}, dist={distance_upper_bound}',
-#                     transform=ax2.transAxes, color='white', fontsize=10, ha='center', va='bottom',
-#                     fontweight='bold')
-#             ax2.set_title('')   
-#             _add_gridlines(ax2, tick_interval=.5)
+            # plot original pct_mean
+            pct_mean.plot.imshow(ax=ax1, cmap='magma', vmin=pct_lims[0], vmax=pct_lims[1],
+                                cbar_kwargs=cbar_kwargs)
+            ax1.set_title('')
+            _add_gridlines(ax1, tick_interval=.5)
+            # plot result
+            filled.plot.imshow(ax=ax2, cmap='magma', vmin=pct_lims[0], vmax=pct_lims[1],
+                            cbar_kwargs=cbar_kwargs)
+            # annotate the parameters as small white text
+            ax2.text(0.5, 0.05, f'k={k}, power={power}, dist={distance_upper_bound}',
+                    transform=ax2.transAxes, color='white', fontsize=10, ha='center', va='bottom',
+                    fontweight='bold')
+            ax2.set_title('')   
+            _add_gridlines(ax2, tick_interval=.5)
 
 
-#             # plot diff
-#             diff = filled - pct_mean
-#             diff.plot.imshow(ax=ax3, cmap='RdBu_r', vmin=diff_lims[0], vmax=diff_lims[1],
-#                             cbar_kwargs=cbar_kwargs)
-#             ax3.set_title('')
-#             _add_gridlines(ax3, tick_interval=.5, color='black')
+            # plot diff
+            diff = filled - pct_mean
+            diff.plot.imshow(ax=ax3, cmap='RdBu_r', vmin=diff_lims[0], vmax=diff_lims[1],
+                            cbar_kwargs=cbar_kwargs)
+            ax3.set_title('')
+            _add_gridlines(ax3, tick_interval=.5, color='black')
 
-#             for axis in (ax1, ax2, ax3):
-#                 axis.set_xlabel('')
-#                 axis.set_ylabel('')
-#         plt.subplots_adjust(hspace=0, wspace=.17)
+            for axis in (ax1, ax2, ax3):
+                axis.set_xlabel('')
+                axis.set_ylabel('')
+        plt.subplots_adjust(hspace=0, wspace=.17)
             
-#     quick_interp_test_plots([
-#         {'k': 16, 'power': 2, 'distance_upper_bound': 0.25,
-#         'loss_threshold': 10},
-#         {'k': 256, 'power': 2, 'distance_upper_bound': 0.25,
-#         'loss_threshold': 10},
-#         {'k': 256, 'power': 1, 'distance_upper_bound': 0.25,
+    quick_interp_test_plots([
+        {'k': 16, 'power': 2, 'distance_upper_bound': 0.25,
+        'loss_threshold': 10},
+        {'k': 256, 'power': 2, 'distance_upper_bound': 0.25,
+        'loss_threshold': 10},
+        {'k': 256, 'power': 1, 'distance_upper_bound': 0.25,
 
-#         'loss_threshold': 10},
-#         {'k': 256, 'power': 1, 'distance_upper_bound': 0.1,
-#         'loss_threshold': 10}
-#     ], pct_lims=(35, 36.3), diff_lims=(-0.4, 0.4))
-
-
-# #%%%
+        'loss_threshold': 10},
+        {'k': 256, 'power': 1, 'distance_upper_bound': 0.1,
+        'loss_threshold': 10}
+    ], pct_lims=(35, 36.3), diff_lims=(-0.4, 0.4))
 
 
-# # def plot_gapfill_example():
-# WLAT = -65
-# slicer = {'lat': slice(-10.5, -9.5), 'lon': slice(WLAT, WLAT+1)}
+#%%%
 
-# pct, mask, loss = load_data()
-# pct = pct / 10.0
-# ok = loss.max('time') < LOSS_THRESHOLD
-# pct_ok = pct.where(ok)
-# out_ds = xr.open_zarr(OUT_PATH, consolidated=False) / 10.0
 
-# fig, axes = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
-# # plot the loss
-# axes[0, 0].set_title('Max Loss < 10%')
-# loss.loc[slicer].max('time').plot.imshow(ax=axes[0, 0], cmap='Reds', vmin=0, vmax=100,
-#                                         cbar_kwargs={'label': 'Loss (%)', 'orientation': 'horizontal',
-#                                                     'shrink':.5, 'pad':0.05})
-# pct.loc[slicer].mean('doy').plot.imshow(ax=axes[0, 1], cmap='magma', vmin=34, vmax=36,
-#                                     cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-#                                                     'shrink':.5, 'pad':0.05})
-# pct.loc[slicer].where(ok).mean('doy').plot.imshow(ax=axes[1, 0], cmap='magma', vmin=34, vmax=36,
-#                                     cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-#                                                     'shrink':.5, 'pad':0.05})
-# (xr.where(mask, np.nan, 1)).loc[slicer].plot.imshow(ax=axes[1,0], cmap='viridis', alpha=0.5, add_colorbar=False)
+# def plot_gapfill_example():
+WLAT = -65
+slicer = {'lat': slice(-10.5, -9.5), 'lon': slice(WLAT, WLAT+1)}
 
-# out_ds['Ta_TMAX_p95'].loc[slicer].mean('doy').plot.imshow(ax=axes[1, 1], cmap='magma', vmin=34, vmax=36,
-#                                     cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
-#                                                     'shrink':.5, 'pad':0.05})
+pct, mask, loss = load_data()
+pct = pct / 10.0
+ok = loss.max('time') < LOSS_THRESHOLD
+pct_ok = pct.where(ok)
+out_ds = xr.open_zarr(OUT_PATH, consolidated=False) / 10.0
 
-# plt.tight_layout()
+fig, axes = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+# plot the loss
+axes[0, 0].set_title('Max Loss < 10%')
+loss.loc[slicer].max('time').plot.imshow(ax=axes[0, 0], cmap='Reds', vmin=0, vmax=100,
+                                        cbar_kwargs={'label': 'Loss (%)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+pct.loc[slicer].mean('doy').plot.imshow(ax=axes[0, 1], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+pct.loc[slicer].where(ok).mean('doy').plot.imshow(ax=axes[1, 0], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
+(xr.where(mask, np.nan, 1)).loc[slicer].plot.imshow(ax=axes[1,0], cmap='viridis', alpha=0.5, add_colorbar=False)
 
-# # plot_gapfill_example()
+out_ds['Ta_TMAX_p95'].loc[slicer].mean('doy').plot.imshow(ax=axes[1, 1], cmap='magma', vmin=34, vmax=36,
+                                    cbar_kwargs={'label': 'Tmax 95th Percentile (°C)', 'orientation': 'horizontal',
+                                                    'shrink':.5, 'pad':0.05})
 
-# #%%
+plt.tight_layout()
+
+# plot_gapfill_example()
+
+#%%
 

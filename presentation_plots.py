@@ -41,7 +41,7 @@ SLICER = {'lat': slice(-10.5, -9.5), 'lon': slice(WLAT, WLAT+1), 'year': 2020}
 ind_var, cc_loss, dep_var = load_ind_dep_data(ind_var_name='cc', dep_var_name='tmax', include_cc_loss=True)
 dep_var_annual = dep_var.groupby('time.year').mean(dim='time')
 tmax = dep_var_annual.loc[{s: k for s, k in SLICER.items() if s != 'year'}].compute()
-elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
+elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation/orig_resolution_regridded', 'elevation_regridded.nc'))['elevation']
 
 #%% background img
 OUTER_SLICER = {'lat': slice(-15, -8), 'lon': slice(-54 - 12.44444444, -54), 'year': 2020}
@@ -190,14 +190,14 @@ fig.savefig(FIGDIR +'presentation_plots/tmax_2020.png',
             dpi=400, bbox_inches='tight')
 
 #%%
-COARSEN_FACTORS = [2, 5, 10, 25]
+COARSEN_FACTORS = [2, 4, 8, 16, 32]
 def coarsen_da(da, cf, shift=0):
     da = da.isel(lat=slice(shift, None), lon=slice(shift, None))
     da = da.coarsen({'lat': cf, 'lon': cf}, boundary='trim').mean()
     return da
 
 
-COARSEN_FACTORS = [2, 5, 10, 25]
+
 
 
 def make_coarsened_gif(data, output_prefix, cmap, vmin, vmax, cbar_label,

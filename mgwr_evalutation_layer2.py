@@ -49,3 +49,12 @@ for comp, ax in zip(comparisons, axes):
     # best fit line
     m, b = np.polyfit(x, y, 1)
     ax.plot(x, m*x + b, color='blue', linestyle='-')
+
+    # print r2 on each
+    r2 = np.corrcoef(x, y)[0, 1] ** 2
+    ax.text(0.05, 0.95, f'$R^2$ = {r2:.3f}', transform=ax.transAxes, fontsize=12,
+            verticalalignment='top')
+    # print rmse on each
+    rmse = np.sqrt(np.mean((x - y) ** 2))
+    ax.text(0.05, 0.90, f'RMSE = {rmse:.3f}', transform=ax.transAxes, fontsize=12,
+            verticalalignment='top')

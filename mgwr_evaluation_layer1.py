@@ -1,5 +1,5 @@
 #%%
-from constants import  MGWR_RESULTS_DIR, TMAX_RECHUNKED_FILE, STORAGE_DIR
+from constants import  MGWR_RESULTS_DIR, TMAX_RECHUNKED_FILE, STORAGE_DIR, DATE_SLICE
 import pickle as pkl
 from tqdm import tqdm
 import pandas as pd
@@ -7,16 +7,19 @@ import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import xarray as xr
-from ufuncs import local_cluster
+from ufuncs import get_amazon_basin_mask, local_cluster
 from obs_data import get_harmonised_data
 import os
+from ufuncs import get_amazon_basin_mask
 
-
-def retrieve_pickled_results():
+def retrieve_pickled_results(test_run=None):
     results = {}
     for doy in range(1, 366):
+        results_dir = f'{MGWR_RESULTS_DIR}/layer1/mgwr_model_doy_{doy}.pkl'
+        if test_run is not None:
+            results_dir = f'{MGWR_RESULTS_DIR}/layer1/tests/mgwr_model_doy_{doy}_{test_run}.pkl'
         try:
-            with open(f'{MGWR_RESULTS_DIR}/layer1/mgwr_model_doy_{doy}.pkl', 'rb') as f:
+            with open(results_dir, 'rb') as f:
                 data = pkl.load(f)
                 results[doy] = data
         except FileNotFoundError:
@@ -39,7 +42,10 @@ def get_annual_mean_df(df):
     mean_df = pd.concat(mean_dfs, axis=0)
     return mean_df
 
-def retrieve_model_results(eval_type='unseen_data_predictions'):
+def retrieve_model_results(eval_type='unseen_data_predictions',
+                           test_run=None):
+
+    results = retrieve_pickled_results(test_run=test_run)
     dfs = []
     for doy in range(1, 366):
 
@@ -52,7 +58,7 @@ def retrieve_model_results(eval_type='unseen_data_predictions'):
             df = df.rename({'obs':'tmax_obs', 'pred':'tmax_pred'}, axis=1)
             df['doy'] = doy
             # prepend doy to the index to avoid duplicate indices when concatenating
-            df = df.reset_index().set_index(['doy', 'index'])
+            df = df.reset_index().set_index(['doy', 'station_id'])
         dfs.append(df)
 
     df = pd.concat(dfs, axis=0)
@@ -84,9 +90,8 @@ def format_evaluation_plot_ax(ax, x, y):
     ax.set_facecolor('lightgrey')
 
 
-def evaluation_plot(df, title):
-    x = df['tmax_obs']
-    y = df['tmax_pred']
+def evaluation_plot(x, y, title=''):
+
 
     # plot a density scatter plot of tmax_observed vs tmax_predicted
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -152,7 +157,7 @@ def merge_zz_into_df(df, zz_interped):
     zz.name = 'tmax_pred_zz'
     zz.index.names = ['datetime', 'station_id']
     # merge into df as a new column, but drop zz where multiindex doesn't overlap
-    df = df.merge(zz, left_index=True, right_index=True, how='inner')
+    df = df.merge(zz, how='left', left_index=True, right_index=True)
     return df
 
 def evaluation_plot_with_zz(df):
@@ -195,8 +200,8 @@ def evaluation_plot_with_zz(df):
 #%%
 if __name__ == '__main__':
     results = retrieve_pickled_results()
-    df = retrieve_model_results(eval_type='unseen_data_predictions')
-    _, meta, _ = get_harmonised_data()
+    df = retrieve_model_results(eval_type='k-fold_predictions')
+    all_obs, meta, _ = get_harmonised_data()
     
     zz_interped = interpolate_zz_to_stations(meta, recompute=False)
     df = merge_zz_into_df(df, zz_interped)
@@ -205,7 +210,7 @@ if __name__ == '__main__':
     evaluation_plot(df, title='daily')
     evaluation_plot_with_zz(df)
     evaluation_plot_with_zz(mean_df)
-#%%
+
     df = retrieve_model_results(eval_type='k-fold_predictions')
     diff = df['tmax_pred'] - df['tmax_obs']
 
@@ -216,3 +221,82 @@ if __name__ == '__main__':
         ax.plot(doy, rmse, 'o', color='black', markersize=4, alpha=1)
         ax.plot(doy, mae, 'o', color='blue', markersize=4, alpha=1)
         ax.plot(doy, r2, 'o', color='orange', markersize=4, alpha=1)
+
+
+def get_zz_obs_df():
+    all_obs, meta, _ = get_harmonised_data()
+    # drop leap days
+    all_obs = all_obs.loc[~((all_obs.index.month == 2) & (all_obs.index.day == 29))]
+    obs = all_obs.stack()
+    obs.index.names = ['datetime', 'station_id']
+
+    zz_interped = interpolate_zz_to_stations(meta, recompute=False) / 10
+    # convert cftime to datetime
+    zz_interped.coords['time'] = pd.DatetimeIndex([pd.Timestamp(t.strftime()) for t in zz_interped.time.values])
+    zz_interped = zz_interped.rename({'time':'datetime'})
+    zz = zz_interped.to_pandas().stack()
+
+    df = pd.merge(obs.rename('tmax_obs'), zz.rename('tmax_pred_zz'), how='left', left_index=True, right_index=True)
+    df = df.dropna()
+    return df, meta
+
+
+def zz_evaluation():
+    df, meta = get_zz_obs_df()
+    # evaluation
+    AMAZON_BASIN = get_amazon_basin_mask(buffer_km=0)['vector']
+    basin_stations = meta[meta.to_crs('EPSG:4326').geometry.within(AMAZON_BASIN.geometry.iloc[0])]
+    in_basin_stations = basin_stations['station_id'].values
+    df_basin = df[df.index.get_level_values('station_id').isin(in_basin_stations)]
+    evaluation_plot(df_basin['tmax_obs'], df_basin['tmax_pred_zz'], title='')
+
+    # annual
+    df_basin_annual = get_annual_mean_df(df_basin)
+    evaluation_plot(df_basin_annual['tmax_obs'], df_basin_annual['tmax_pred_zz'], title='annual mean')
+
+
+
+
+
+def compare_layer1_with_zz(df, all_obs, zz_interped):
+    start_year = DATE_SLICE.start[:4]
+    end_year = DATE_SLICE.stop[:4]
+    tindex = xr.date_range(start=f'{start_year}-01-01', end=f'{end_year}-12-31', 
+                        freq='D', calendar='noleap')
+    # convert from cftime to pandas datetime
+    tindex = pd.DatetimeIndex([pd.Timestamp(t.strftime()) for t in tindex])
+
+    years = tindex.year.unique()
+    df_dt = pd.concat([df] * len(years), keys=years, names=['year'])
+    df_dt = df_dt.reset_index()
+    df_dt['datetime'] = tindex.repeat(len(df.index.get_level_values('station_id').unique())).values
+    df_dt = df_dt.drop(columns=['year', 'doy']).set_index(['datetime', 'station_id']).sort_index()
+
+    df_dt = merge_zz_into_df(df_dt, zz_interped)
+
+
+    obs = all_obs.stack()
+    obs.index.names = ['datetime', 'station_id']
+    df_dt = df_dt.drop('tmax_obs', axis=1).merge(obs.rename('tmax_obs'), how='left', left_index=True, right_index=True)
+
+    # plot scatter of tmax_obs vs tmax_pred and of tmax_obs vs tmax_pred_zz
+    evaluation_plot_with_zz(df_dt)
+
+
+
+df = retrieve_model_results(eval_type='daily_k-fold_predictions')
+zz_interped = interpolate_zz_to_stations(meta, recompute=False)
+all_obs, meta, _ = get_harmonised_data()
+evaluation_plot(x=df['obs'], y=df['pred'], title='layer 1 model evaluation - daily')
+compare_layer1_with_zz(df, all_obs, zz_interped)
+#%% temp test delete later
+
+nmbs = pd.Series(dtype=float)
+for doy, r in results.items():
+    df = r['k-fold_predictions']
+    nmb = np.sum(df['pred'] - df['obs']) / np.sum(df['obs'])
+    nmbs.loc[doy] = nmb
+
+nmbs.plot()
+
+#%% zz evaluation

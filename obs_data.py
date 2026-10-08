@@ -2,7 +2,7 @@
 import pandas as pd
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
-from constants import AREA_BBOX, STORAGE_DIR, AMAZON_BASIN_BUFFER_KM
+from constants import AREA_BBOX, STORAGE_DIR, AMAZON_BASIN_BUFFER_KM, FIGDIR
 import geopandas as gpd
 import cartopy.feature as cfeature
 import matplotlib.ticker as mticker
@@ -88,6 +88,8 @@ def plot_stations(meta, crs):
         .plot(ax=ax, color='darkorange',markersize=30, alpha=1, label='ISD station',
             marker='^')
     ax.legend(loc='lower left')
+
+    fig.savefig(FIGDIR+'mgwr_results/station_map.png', dpi=400, bbox_inches='tight')
 
 
 

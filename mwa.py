@@ -735,10 +735,10 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
     dss.append((ind_coarse, cc_loss_coarse, dep_coarse, elev_coarse))
 
     # Add offset versions if coarsen_factor >= 10
-    if coarsen_factor >= 10:
-        num_offsets = (coarsen_factor - 10) // 5 + 1
+    if coarsen_factor >= 8:
+        num_offsets = (coarsen_factor - 10) // 4 + 1
         for offset_idx in range(num_offsets):
-            offset = (offset_idx + 1) * 5
+            offset = (offset_idx + 1) * 4
 
             # Create shifted versions with offset slicing
             ind_shifted = ind_var.loc[
@@ -796,7 +796,7 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
 def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
                        client=None, dep_var_agg=None,
                        coarsen_factor=None, window_radius=1, sname=None,
-                       overwrite=False):
+                       neighbour_map_sname=None, overwrite=False):
 
 
     if len(dep_var.lat) == 5000 and len(dep_var.lon) == 4750:    
@@ -832,8 +832,10 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
             # Clear any partial output for this version only.
             shutil.rmtree(version_root)
 
-        suffix = f'_{version_idx}' if expected_versions > 1 else ''
-        map_sname = f'{sname}{suffix}'
+        shift_pixels = 0 if (not coarsen_factor or version_idx == 0) else 4 * version_idx
+        map_sname = f'{neighbour_map_sname or sname}'
+        if expected_versions > 1:
+            map_sname = f'{map_sname}_shift{shift_pixels}'
 
         if dep_var_agg is not None:
             dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg)
@@ -913,8 +915,13 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
 
+    neighbour_map_sname = f'{ind_var_name}_vs_cc'
+    if coarsen_factor:
+        neighbour_map_sname += f'_coarsened{coarsen_factor}'
+
     if SPATH_SUFFIX:
         sname += f'_{SPATH_SUFFIX}'
+        neighbour_map_sname += f'_{SPATH_SUFFIX}'
 
     if overwrite:
         print(f"Overwrite flag is set. Proceeding with moving window analysis for {sname}.")
@@ -926,7 +933,9 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     calc_moving_window(ind_var=ind_var, cc_loss=cc_loss, dep_var=dep_var,
                         dep_var_name=dep_var_name,
                         client=client, window_radius=window_radius,
-                        coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg,
+                        coarsen_factor=coarsen_factor, sname=sname,
+                        neighbour_map_sname=neighbour_map_sname,
+                        dep_var_agg=dep_var_agg,
                         overwrite=overwrite)
     print(
         f"Moving window analysis completed for {dep_var.name} vs {ind_var_name} "
@@ -946,9 +955,9 @@ def run_mwa_coarsen_loop(ind_var_name, dep_var_agg,
 #%%
 if __name__ == "__main__":
     
-    with local_cluster(n_workers=1, threads_per_worker=32, memory_limit='400GB',
-                       processes=False,
-                       suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
+    with local_cluster(n_workers=12, threads_per_worker=6, memory_limit='32GB',
+                        dashboard_address=':8787',
+                       suppress_dask_warnings=False, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
 
         run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
                              dep_var_name='tmax', client=client, overwrite=True)

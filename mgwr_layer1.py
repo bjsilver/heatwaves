@@ -92,12 +92,12 @@ def fit_model(coords_train, y_train, X_train):
     results = model.fit()
     return selector, model, results
 
-def kfold_cross_validation(doy_set, n_splits=10):
+def kfold_cross_validation(doy_set, daily_df, n_splits=10):
     stations_in_basin = doy_set[doy_set.geometry.within(AMAZON_BASIN.geometry.iloc[0])]
     stations_out_basin = doy_set[~doy_set.geometry.within(AMAZON_BASIN.geometry.iloc[0])]
-
     kf = KFold(n_splits=10, shuffle=True, random_state=42)
     predictions = pd.DataFrame(index=stations_in_basin.index, columns=['obs', 'pred'], dtype=float)
+    predictions_daily = pd.DataFrame(index=daily_df.index, columns=['obs', 'pred'], dtype=float)
     for fold, (train_idx, test_idx) in enumerate(kf.split(stations_in_basin)):
 
         test_stations = stations_in_basin.iloc[test_idx]
@@ -118,20 +118,38 @@ def kfold_cross_validation(doy_set, n_splits=10):
         tmax, _, _, _ = predict_tmax(results, coords_train, coords_test, X_test[:, 0], X_test[:, 1], k=5)
         predictions.loc[test_stations.index, 'pred'] = tmax
 
-    return predictions
+        # also make predictions using the daily LST and elevation
+        test_daily_df = daily_df.loc[daily_df.index.get_level_values('station_id').isin(test_stations.index)]
+        coords_daily_df = test_daily_df[['easting', 'northing']].values
+        y_daily_df = test_daily_df['tmax'].astype(float).values.reshape(-1, 1)
+        X_daily_df = test_daily_df[['LST', 'elevation']].values
+        tmax_pred_daily, _, _, _ = predict_tmax(results, coords_train, coords_daily_df, X_daily_df[:, 0], X_daily_df[:, 1], k=5)
+        predictions_daily.loc[test_daily_df.index, 'obs'] = y_daily_df.flatten()
+        predictions_daily.loc[test_daily_df.index, 'pred'] = tmax_pred_daily
 
-def fit_layer1_model(df, target_doy, all_df):
+    
+    return predictions, predictions_daily
+
+def fit_layer1_model(df, target_doy, doy_pool_window,
+                     test=False):
     doy_set = doy_gaussian_mean(
         df,
         target_doy,
-        window=DOY_POOL_WINDOW,
+        window=doy_pool_window,
         n_days_per_year=365
     )
 
+    daily_df = df.loc[df['doy'] == target_doy]
+    daily_df = daily_df.reset_index().set_index(['datetime', 'station_id'])
+
     doy_set = doy_set.dropna(subset=['tmax', 'LST', 'elevation', 'easting', 'northing'])
     doy_set = gpd.GeoDataFrame(doy_set, geometry=gpd.points_from_xy(doy_set['easting'], doy_set['northing']), crs=CRS)
+    doy_set = doy_set.set_index('station_id')
     
-    predictions = kfold_cross_validation(doy_set, n_splits=10)
+    predictions, predictions_daily = kfold_cross_validation(doy_set, daily_df, n_splits=10)
+    print('normlalised mean bias')
+    print((predictions['pred'] - predictions['obs']).mean() / predictions['obs'].mean())
+
 
     # do a final fit on all stations in and outside basin, and save the model and results
     y_train = doy_set['tmax'].astype(float).values.reshape(-1, 1)
@@ -141,60 +159,60 @@ def fit_layer1_model(df, target_doy, all_df):
     selector, model, results = fit_model(coords_train, y_train, X_train)
 
 
-    def predict_tmax_doy_all(all_df, target_doy, results):
-        # use the final model to predict tmax at the target coordinates
-        # on stations in that basin that aren't climatologically valid
-        doy_all = all_df[all_df['doy'] == target_doy]
-        doy_all = doy_all.loc[~doy_all.station_id.isin(doy_set.station_id)]
-        doy_all = gpd.GeoDataFrame(doy_all, geometry=gpd.points_from_xy(doy_all['easting'], doy_all['northing']), crs=CRS)
-        doy_all = doy_all[doy_all.geometry.within(AMAZON_BASIN.geometry.iloc[0])]
-
-        coords_all = doy_all[['easting', 'northing']].values
-        lst_all = doy_all['LST'].values
-        elev_all = doy_all['elevation'].values
-
-        tmax_all, _, _, _ = predict_tmax(results, coords_train, coords_all, lst_all, elev_all, k=5)
-        cdf = pd.DataFrame({
-            'station_id': doy_all['station_id'],
-            'tmax_pred': tmax_all,
-            'tmax_obs': doy_all['tmax'],},
-            index=doy_all.index
-        )
-
-        return cdf
-
-    # predict tmax at all stations in the basin that weren't used in model training
-    # i.e. these models weren't used because the weren't in the climatologically valid set, but we can still predict tmax at those stations using the model fitted on the valid stations
-    cdf = predict_tmax_doy_all(all_df, target_doy, results)
 
     # pickle the selector, model and results
-    with open(f'{MGWR_RESULTS_DIR}layer1/mgwr_model_doy_{target_doy}.pkl', 'wb') as f:
+    if not test:
+        spath = f'{MGWR_RESULTS_DIR}layer1/mgwr_model_doy_{target_doy}.pkl'
+    else:
+        spath = f'{MGWR_RESULTS_DIR}layer1/tests/mgwr_model_doy_{target_doy}_{doy_pool_window}.pkl'
+    # ensure path exists
+    os.makedirs(os.path.dirname(spath), exist_ok=True)
+    with open(spath, 'wb') as f:
         pkl.dump({
             'k-fold_predictions': predictions,
             'selector': selector,
             'model': model,
             'results': results,
             'df': doy_set,
-            'unseen_data_predictions': cdf
+            'daily_k-fold_predictions': predictions_daily
         }, f)
 
-    print(f'MGWR model for DOY {target_doy} fitted and saved to {MGWR_RESULTS_DIR}layer1/mgwr_model_doy_{target_doy}.pkl')
+    print(f'MGWR model for DOY {target_doy} fitted and saved to {spath}')
     return target_doy
 
-#%%
-
-def fit_all_layer1_models():
+def fit_all_layer1_models(doy_pool_window, test=False):
     df = get_climatologically_valid_data()
     _, meta, _ = get_harmonised_data(recompute=False)
     all_df = get_interpolated_data(recompute=False)
-    predict_coords_xy = meta.geometry.apply(lambda p: (p.x, p.y)).to_list()
     target_doys = range(1, 366)
-    Parallel(n_jobs=64)(delayed(fit_layer1_model)(df, doy, all_df) for doy in target_doys)
+    Parallel(n_jobs=64)(delayed(fit_layer1_model)(df, 
+                                                  doy,
+                                                  doy_pool_window,
+                                                  test) for doy in target_doys)
 
 
 
 #%%
 if __name__ == '__main__':
-    fit_all_layer1_models()
+    # for  window in [2, 4, 8, 16]:
+    #     fit_all_layer1_models(doy_pool_window=window, )
+    fit_all_layer1_models(doy_pool_window=DOY_POOL_WINDOW)
 
 
+#%%
+df = get_climatologically_valid_data()
+
+rdf = pd.DataFrame(index=range(1, 366))
+for target_doy in range(1, 366):
+    doy_set = doy_gaussian_mean(
+            df,
+            target_doy,
+            window=4,
+            n_days_per_year=365
+        )
+
+    print(len(doy_set))
+
+    
+    rdf.loc[target_doy, 'gaus'] = doy_set['tmax'].mean()
+    rdf.loc[target_doy, 'mean'] = df[df['doy'] == target_doy]['tmax'].mean()

@@ -211,8 +211,9 @@ def doy_gaussian_mean(df, target_doy, window=DOY_POOL_WINDOW, sigma=None, n_days
 
 def doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False):
 
-    if not recompute and os.path.exists(MGWR_DATA_DIR+'lst_climatology.zarr'):
-        return xr.open_zarr(MGWR_DATA_DIR+'lst_climatology.zarr')['LST']
+    spath = MGWR_DATA_DIR+f'lst_climatology_{window}.zarr'
+    if not recompute and os.path.exists(spath):
+        return xr.open_zarr(spath)['LST']
 
     da = xr.open_mfdataset(LST_DIR+'interped/lst_interped_obs_*.zarr', 
                             concat_dim='year', combine='nested')['LST']
@@ -247,16 +248,17 @@ def doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False
         dim=xr.DataArray(np.arange(1, 366), dims='doy', name='doy')
     )
     lst_clim.name = 'LST'
-    lst_clim.to_zarr(MGWR_DATA_DIR+'lst_climatology.zarr', mode='w')
+    lst_clim.to_zarr(spath, mode='w')
 
-
-# with local_cluster(n_workers=4, threads_per_worker=16, memory_limit='50GB',
-#                     suppress_dask_warnings=False) as cluster:
-#     doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=True)
+if __name__ == '__main__':
+    with local_cluster(n_workers=4, threads_per_worker=16, memory_limit='50GB',
+                        suppress_dask_warnings=False) as cluster:
+        for window in [2, 4, 8, 16]:
+            doy_gaussian_climatology(window=window, sigma=None, recompute=False)
 
 #%%
 #%% interpolate data to station_locations
-if __name__ == '__main__':
+
 
     stations_basin, mdf, crs = get_harmonised_data(recompute=False)
     intepolate_data_to_stations(mdf, recompute=False)

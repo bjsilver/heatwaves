@@ -26,13 +26,14 @@ ISD_DATA_DIR = STORAGE_DIR + 'isd_data/'
 ### CONSTANTS ###
 LAPSE_RATE = -0.003773 # degrees C per meter, see mgwr_data.py for how this was calculated
 AMAZON_BASIN_BUFFER_KM = 350
+# original res
+ZZ_ORIGINAL_RES = 0.00765385
+COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 
 ### PROCESSED DATA ###
 TMAX_RECHUNKED_PATH = STORAGE_DIR + 'tmax/rechunked/'
 TMAX_RECHUNKED_FILE = TMAX_RECHUNKED_PATH + 'tmax_rechunked.zarr'
 
-### MGWR PARAMETERS ###
-CLIMATOLOGY_SCORE_THRESHOLD = 5
 
 AREA_BBOX = {'westlimit':-82, 'eastlimit':-34.5, 'southlimit':-30, 'northlimit':20}
 
@@ -65,9 +66,10 @@ IND_VAR_BINS = {
     'cc': np.arange(10, 110, 10),
 }
 
-
+### MGWR PARAMETERS ###
 # +/- days pooled around a target day-of-year across all years (noleap, 1-365)
 DOY_POOL_WINDOW = 2
 # shared smoothing parameter grid searched over during station cross-validation
 LAMBDA_GRID = np.logspace(-3, 2, 6)
 CV_N_FOLDS = 5
+CLIMATOLOGY_SCORE_THRESHOLD = 10
