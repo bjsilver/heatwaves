@@ -18,6 +18,7 @@ MWA_DIR = STORAGE_DIR+ 'mwa_results/'
 BORDERS_DIR = '/uolstore/Research/b/b0256/Users/earbsi/borders/'
 ZZ_SOURCE_DIR = "/uolstore/Research/b/b0256/Users/earjba/ZhangandZhou/tropical_regions/"
 MGWR_RESULTS_DIR = STORAGE_DIR + 'mgwr_results/'
+GRF_RESULTS_DIR = STORAGE_DIR + 'grf_results/'
 METEOSTAT_DATA_PATH = STORAGE_DIR + 'meteostat_data/'
 INMET_PATH = STORAGE_DIR + 'INMET/'
 MGWR_DATA_DIR = STORAGE_DIR + 'svcm_data/'
@@ -72,4 +73,5 @@ DOY_POOL_WINDOW = 2
 # shared smoothing parameter grid searched over during station cross-validation
 LAMBDA_GRID = np.logspace(-3, 2, 6)
 CV_N_FOLDS = 5
-CLIMATOLOGY_SCORE_THRESHOLD = 10
+CLIMATOLOGY_SCORE_THRESHOLD = 5
+LST_CORRELATION_THRESHOLD = .4

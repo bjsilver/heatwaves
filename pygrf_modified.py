@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from sklearn.utils.parallel import Parallel, delayed
 from scipy.spatial import distance
 from sklearn.ensemble import RandomForestRegressor
 
@@ -19,6 +20,8 @@ class PyGRFBuilder:
         random_state=None,
         n_jobs=None,
         min_samples_leaf=1,
+        max_depth=None,
+        n_jobs_models=1,
         **kwargs,
     ):
         """
@@ -85,6 +88,8 @@ class PyGRFBuilder:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.min_samples_leaf = min_samples_leaf
+        self.max_depth = max_depth
+        self.n_jobs_models = n_jobs_models
 
         self.local_models = []
         self.station_coords = None
@@ -182,6 +187,7 @@ class PyGRFBuilder:
         y,
         coords,
         location_ids=None,
+        parallel=None,
     ):
         """
         Fit one local RF per unique spatial location.
@@ -339,14 +345,9 @@ class PyGRFBuilder:
         # --------------------------------------------------------------
 
         self.local_models = []
+        self.local_observation_indices = []
 
-        for i in range(n_stations):
-
-            print(
-                f"Fitting local RF "
-                f"{i + 1}/{n_stations}",
-                end="\r"
-            )
+        def fit_local(i):
 
             # ----------------------------------------------------------
             # Find neighbouring STATIONS
@@ -397,8 +398,6 @@ class PyGRFBuilder:
             X_local = X_array[local_observations]
             y_local = y_array[local_observations]
 
-            self.local_observation_indices.append(local_observations)
-
             # ----------------------------------------------------------
             # Fit RF
             # ----------------------------------------------------------
@@ -414,6 +413,7 @@ class PyGRFBuilder:
                 ),
                 n_jobs=self.n_jobs,
                 min_samples_leaf=self.min_samples_leaf,
+                max_depth=self.max_depth,
             )
 
             if self.train_weighted:
@@ -431,9 +431,21 @@ class PyGRFBuilder:
                     y_local
                 )
 
-            self.local_models.append(rf)
+            return rf, local_observations
 
-        print()
+        # Threads share X/y without copying; RF fitting releases the GIL.
+        print(
+            f"Fitting {n_stations} local RFs "
+            f"({self.n_jobs_models} models in parallel x {self.n_jobs} RF jobs)..."
+        )
+
+        results = (
+            parallel
+            or Parallel(n_jobs=self.n_jobs_models, backend="threading", verbose=5)
+        )(delayed(fit_local)(i) for i in range(n_stations))
+
+        self.local_models = [r[0] for r in results]
+        self.local_observation_indices = [r[1] for r in results]
 
         return self
 
@@ -445,6 +457,7 @@ class PyGRFBuilder:
         self,
         X,
         coords,
+        parallel=None,
     ):
         """
         Predict at arbitrary locations.
@@ -481,10 +494,6 @@ class PyGRFBuilder:
         n_predictions = len(X_array)
         n_stations = len(self.local_models)
 
-        # --------------------------------------------------------------
-        # Each prediction location -> every station
-        # --------------------------------------------------------------
-
         prediction_distances = distance.cdist(
             coords_array,
             self.station_coords,
@@ -492,120 +501,79 @@ class PyGRFBuilder:
         )
 
         # --------------------------------------------------------------
-        # Every local RF predicts every target point
-        #
-        # Shape:
-        #     n_predictions x n_stations
+        # Spatial neighbourhood of every prediction point. Only the
+        # neighbouring station RFs are evaluated for each point.
         # --------------------------------------------------------------
 
-        local_predictions = np.empty(
-            (n_predictions, n_stations),
-            dtype=float
-        )
-
-        for i, rf in enumerate(self.local_models):
-
-            local_predictions[:, i] = rf.predict(
-                X_array
-            )
-
-        # --------------------------------------------------------------
-        # Spatially combine the local RF predictions
-        # --------------------------------------------------------------
-
-        predictions = np.full(
-            n_predictions,
-            np.nan,
-            dtype=float
-        )
+        rows, stations, weights = [], [], []
 
         for i in range(n_predictions):
 
             distances_i = prediction_distances[i]
 
-            # ----------------------------------------------------------
-            # Select neighbouring station-level RFs
-            # ----------------------------------------------------------
-
             if self.kernel == "adaptive":
 
-                k = min(
-                    int(self.band_width),
-                    n_stations
-                )
+                k = min(int(self.band_width), n_stations)
 
-                station_indices = np.argpartition(
-                    distances_i,
-                    k - 1
-                )[:k]
-
-                station_distances = (
-                    distances_i[station_indices]
-                )
+                station_indices = np.argpartition(distances_i, k - 1)[:k]
 
                 bandwidth = (
-                    np.partition(
-                        distances_i,
-                        k - 1
-                    )[k - 1] * 1.0000001
+                    np.partition(distances_i, k - 1)[k - 1] * 1.0000001
                 )
 
             else:
 
                 bandwidth = float(self.band_width)
 
-                station_indices = np.where(
-                    distances_i < bandwidth
-                )[0]
+                station_indices = np.where(distances_i < bandwidth)[0]
 
-                station_distances = (
-                    distances_i[station_indices]
-                )
-
-            # ----------------------------------------------------------
-            # Spatial weights
-            # ----------------------------------------------------------
-
-            weights = self._calculate_weights(
-                station_distances,
+            w = self._calculate_weights(
+                distances_i[station_indices],
                 bandwidth
             )
 
-            # ----------------------------------------------------------
-            # Weighted local prediction
-            # ----------------------------------------------------------
+            if not self.predict_weighted:
+                w = np.ones_like(w)
 
-            if self.predict_weighted:
+            keep = w > 0
 
-                weight_sum = weights.sum()
+            rows.append(np.full(keep.sum(), i))
+            stations.append(station_indices[keep])
+            weights.append(w[keep])
 
-                if weight_sum == 0:
+        rows = np.concatenate(rows)
+        stations = np.concatenate(stations)
+        weights = np.concatenate(weights)
 
-                    # Should only happen for pathological fixed
-                    # bandwidth choices.
+        # --------------------------------------------------------------
+        # Group by station so each local RF predicts only the rows that
+        # need it, in parallel across RFs.
+        # --------------------------------------------------------------
 
-                    predictions[i] = np.nan
+        order = np.argsort(stations, kind="stable")
+        rows, stations, weights = rows[order], stations[order], weights[order]
 
-                else:
+        unique_stations, starts = np.unique(stations, return_index=True)
+        row_groups = np.split(rows, starts[1:])
+        weight_groups = np.split(weights, starts[1:])
 
-                    predictions[i] = (
-                        np.sum(
-                            local_predictions[
-                                i,
-                                station_indices
-                            ] * weights
-                        )
-                        / weight_sum
-                    )
+        local_predictions = (
+            parallel
+            or Parallel(n_jobs=self.n_jobs_models, backend="threading")
+        )(
+            delayed(self.local_models[s].predict)(X_array[r])
+            for s, r in zip(unique_stations, row_groups)
+        )
 
-            else:
+        numerator = np.zeros(n_predictions)
+        denominator = np.zeros(n_predictions)
 
-                predictions[i] = np.mean(
-                    local_predictions[
-                        i,
-                        station_indices
-                    ]
-                )
+        for p, r, w in zip(local_predictions, row_groups, weight_groups):
+            numerator[r] += p * w
+            denominator[r] += w
+
+        predictions = np.full(n_predictions, np.nan)
+        valid = denominator > 0
+        predictions[valid] = numerator[valid] / denominator[valid]
 
         return predictions
-        

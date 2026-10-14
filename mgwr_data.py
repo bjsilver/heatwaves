@@ -6,7 +6,8 @@ from constants import (
     MGWR_DATA_DIR,
     DATE_SLICE,
     DOY_POOL_WINDOW,
-    CLIMATOLOGY_SCORE_THRESHOLD
+    CLIMATOLOGY_SCORE_THRESHOLD,
+    LST_CORRELATION_THRESHOLD
 )
 import numpy as np
 import pandas as pd
@@ -22,7 +23,8 @@ from obs_data import get_harmonised_data
 
 
 
-def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD, min_valid_years=10):
+def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD,
+                                    lst_correlation_threshold=LST_CORRELATION_THRESHOLD):
 
     tmax_df = get_interpolated_data(recompute=False)
 
@@ -35,6 +37,13 @@ def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCOR
     valid_stations = score[score >= climatology_score_threshold].index.get_level_values(0).unique()
 
     df = tmax_df[tmax_df['station_id'].isin(valid_stations)]
+
+    if lst_correlation_threshold is not None:
+        lst_corr = df.groupby('station_id')[['tmax', 'LST']].corr().iloc[0::2,-1]
+        lst_corr = lst_corr.reset_index(level=1, drop=True)
+        valid_stations = lst_corr[lst_corr >= lst_correlation_threshold].index.get_level_values(0).unique()
+        df = df[df['station_id'].isin(valid_stations)]
+
     return df
 
 def interpolate_lst_to_stations(mdf):
@@ -249,7 +258,7 @@ def doy_gaussian_climatology(window=DOY_POOL_WINDOW, sigma=None, recompute=False
     )
     lst_clim.name = 'LST'
     lst_clim.to_zarr(spath, mode='w')
-
+#%%
 if __name__ == '__main__':
     with local_cluster(n_workers=4, threads_per_worker=16, memory_limit='50GB',
                         suppress_dask_warnings=False) as cluster:
