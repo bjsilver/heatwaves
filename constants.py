@@ -74,4 +74,5 @@ DOY_POOL_WINDOW = 2
 LAMBDA_GRID = np.logspace(-3, 2, 6)
 CV_N_FOLDS = 5
 CLIMATOLOGY_SCORE_THRESHOLD = 5
-LST_CORRELATION_THRESHOLD = .4
+LST_CORRELATION_THRESHOLD = .25
+ELEVATION_THRESHOLD = 500 # meters, stations above this elevation are excluded from the climatologically valid set

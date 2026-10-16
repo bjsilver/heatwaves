@@ -1,219 +1,329 @@
-"""
-Parameter / basin-buffer sweep for the station-level GRF.
-
-Evaluates every combination of GRF hyperparameters x outside-basin buffer
-distances using leave-one-out over a fixed random subset of in-basin stations
-(same folds for every configuration, so configurations are directly comparable).
-Training data can be thinned in time with --time-stride to keep it fast.
-
-Results are appended to a CSV after every configuration, and configurations
-already in the CSV are skipped, so the sweep can be interrupted and resumed.
-
-Examples
---------
-python grf_test.py                                  # default grid
-python grf_test.py --n-folds 15 --time-stride 5     # cheaper
-python grf_test.py --max-configs 30                 # random subset of the grid
-"""
-import argparse
-import itertools
+#%%
 import json
 import os
+import time
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from bayes_opt import BayesianOptimization
 from sklearn.utils.parallel import Parallel
 
 from constants import GRF_RESULTS_DIR
+from grf_data import get_climatologically_valid_data
 from grf_fit import AMAZON_BASIN, CRS, N_JOBS_MODELS
-from mgwr_data import get_climatologically_valid_data
 from pygrf_modified import PyGRFBuilder
+import sys
 
-FEATURES = ['LST', 'elevation', 'doy_sin', 'doy_cos', 'day']
+FEATURES = ["LST", "elevation", "doy_sin", "doy_cos", "day"]
 
-# ----------------------------------------------------------------------
-# Search space. Edit freely: every key except `buffer_km` is passed to
-# PyGRFBuilder. buffer_km=None keeps ALL out-of-basin stations; a number keeps
-# only those within that many km of the basin perimeter.
-# ----------------------------------------------------------------------
-PARAM_GRID = {
-    'band_width': [10, 25, 50],
-    'n_estimators': [30, 60],
-    'min_samples_leaf': [5, 20],
-    'max_depth': [10, 20],
-    'max_features': [1.0, 0.6],
-    'train_weighted': [True],
-    'buffer_km': [0, 50, 100,  350],
+# Minimal fixed settings
+N_FOLDS = 10
+TIME_STRIDE = 1
+SEED = 0
+INIT_POINTS = 25
+N_ITER = 100
+MODEL_TYPE = sys.argv[1] if len(sys.argv) > 1 else "rf"  # "rf" or "xgb"
+OUT_CSV = os.path.join(GRF_RESULTS_DIR, f"grf_test/results_{MODEL_TYPE}.csv")
+
+
+RF_PBOUNDS = {
+    "band_width": (10, 80),
+    "n_estimators": (20, 60),
+    "min_samples_leaf": (2, 40),
+    "max_depth": (5, 30),
+    "max_features": (0.3, 1.0),
+    "min_samples_split": (2, 40),
+}
+
+XGB_PBOUNDS = {
+    "band_width": (10, 80),
+    "n_estimators": (100, 600),
+    "max_depth": (3, 12),
+    "learning_rate": (0.01, 0.3),
+    "subsample": (0.5, 1.0),
+    "colsample_bytree": (0.5, 1.0),
 }
 
 
 def prepare_data(df, time_stride):
     rfd = df.copy()
-    rfd = rfd.dropna(subset=['tmax', 'LST', 'elevation', 'easting', 'northing'])
+    rfd = rfd.dropna(subset=["tmax", "LST", "elevation", "easting", "northing"])
     datetimes = rfd.index
     rfd = gpd.GeoDataFrame(
         rfd,
-        geometry=gpd.points_from_xy(rfd['easting'], rfd['northing']),
+        geometry=gpd.points_from_xy(rfd["easting"], rfd["northing"]),
         crs=CRS,
     )
-    rfd = rfd.reset_index().set_index(['station_id', 'datetime'])
-    rfd['doy_sin'] = np.sin(2 * np.pi * datetimes.dayofyear / 365)
-    rfd['doy_cos'] = np.cos(2 * np.pi * datetimes.dayofyear / 365)
-    # computed before thinning so 'day' keeps its meaning
-    rfd['day'] = (datetimes - datetimes.min()).days
+    rfd = rfd.reset_index().set_index(["station_id", "datetime"])
+    rfd["doy_sin"] = np.sin(2 * np.pi * datetimes.dayofyear / 365)
+    rfd["doy_cos"] = np.cos(2 * np.pi * datetimes.dayofyear / 365)
+    rfd["day"] = (datetimes - datetimes.min()).days
 
     if time_stride > 1:
-        dates = rfd.index.get_level_values('datetime')
+        dates = rfd.index.get_level_values("datetime")
         keep = ((dates - dates.min()).days % time_stride) == 0
         rfd = rfd[keep]
     return rfd
 
 
-def split_stations(rfd, n_folds, seed):
+def split_in_basin(rfd, n_folds, seed):
     basin_geom = AMAZON_BASIN.geometry.iloc[0]
-    coord_df = rfd.groupby('station_id')['geometry'].first()
-    inside = coord_df.geometry.within(basin_geom)
-
-    in_ids = coord_df.index[inside]
-    out_ids = coord_df.index[~inside]
-    # distance (km) from each outside station to the basin; CRS is in metres
-    out_dist_km = coord_df[~inside].apply(basin_geom.distance) / 1000.0
+    station_geom = rfd.groupby("station_id")["geometry"].first()
+    in_ids = station_geom.index[station_geom.geometry.within(basin_geom)]
 
     rng = np.random.default_rng(seed)
     n_folds = min(n_folds, len(in_ids))
     test_ids = rng.choice(np.asarray(in_ids), size=n_folds, replace=False)
-    return in_ids, out_ids, out_dist_km, test_ids
+    return in_ids, test_ids
 
 
-def evaluate(rfd, in_ids, out_dist_km, test_ids, model_params, buffer_km, parallel):
-    station_level = rfd.index.get_level_values('station_id')
-
-    if buffer_km is None:
-        out_keep = out_dist_km.index
-    else:
-        out_keep = out_dist_km.index[out_dist_km <= buffer_km]
-    out_df = rfd[station_level.isin(out_keep)]
+def evaluate_metrics(rfd, in_ids, test_ids, model_params, parallel):
+    station_level = rfd.index.get_level_values("station_id")
     in_df = rfd[station_level.isin(in_ids)]
-    in_level = in_df.index.get_level_values('station_id')
+    in_level = in_df.index.get_level_values("station_id")
 
     obs_all, pred_all, fold_rmse = [], [], []
-    for sid in test_ids:
+    n_folds = len(test_ids)
+    for fold_i, sid in enumerate(test_ids, start=1):
+        fold_start = time.perf_counter()
+        print(f"  fold {fold_i}/{n_folds} station={sid} starting", flush=True)
         is_test = in_level == sid
         test = in_df[is_test]
-        train = pd.concat([in_df[~is_test], out_df])
+        train = in_df[~is_test]
 
         model = PyGRFBuilder(
-            kernel='adaptive',
-            bootstrap=True,
+            band_width=model_params["band_width"],
+            base_model=MODEL_TYPE,
+            model_hyperparameters=model_params["model_hyperparameters"],
+            kernel="adaptive",
+            train_weighted=True,
+            predict_weighted=True,
             random_state=42,
             n_jobs=4,
             n_jobs_models=N_JOBS_MODELS,
-            **model_params,
         )
         model.fit(
             train[FEATURES].values,
-            train['tmax'].astype(float).values.reshape(-1, 1),
-            train[['easting', 'northing']].values,
-            location_ids=train.index.get_level_values('station_id').values,
+            train["tmax"].astype(float).values.reshape(-1, 1),
+            train[["easting", "northing"]].values,
+            location_ids=train.index.get_level_values("station_id").values,
             parallel=parallel,
         )
         pred = np.asarray(
-            model.predict(test[FEATURES].values,
-                          test[['easting', 'northing']].values,
-                          parallel=parallel)
+            model.predict(
+                test[FEATURES].values,
+                test[["easting", "northing"]].values,
+                parallel=parallel,
+            )
         ).flatten()
-        obs = test['tmax'].astype(float).values
+        obs = test["tmax"].astype(float).values
 
         obs_all.append(obs)
         pred_all.append(pred)
-        fold_rmse.append(np.sqrt(np.mean((pred - obs) ** 2)))
+        this_fold_rmse = np.sqrt(np.mean((pred - obs) ** 2))
+        fold_rmse.append(this_fold_rmse)
+        fold_secs = time.perf_counter() - fold_start
+        running_mean = float(np.mean(fold_rmse))
+        print(
+            f"  fold {fold_i}/{n_folds} done rmse={this_fold_rmse:.4f} "
+            f"running_mean={running_mean:.4f} time={fold_secs:.1f}s",
+            flush=True,
+        )
 
     obs = np.concatenate(obs_all)
     pred = np.concatenate(pred_all)
     err = pred - obs
     return {
-        'n_out_stations': len(out_keep),
-        'rmse': float(np.sqrt(np.mean(err ** 2))),
-        'mae': float(np.mean(np.abs(err))),
-        'bias': float(np.mean(err)),
-        'r2': float(1 - np.sum(err ** 2) / np.sum((obs - obs.mean()) ** 2)),
-        'mean_fold_rmse': float(np.mean(fold_rmse)),
-        'worst_fold_rmse': float(np.max(fold_rmse)),
-        'n_test_obs': len(obs),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
+        "mae": float(np.mean(np.abs(err))),
+        "bias": float(np.mean(err)),
+        "r2": float(1 - np.sum(err ** 2) / np.sum((obs - obs.mean()) ** 2)),
+        "mean_fold_rmse": float(np.mean(fold_rmse)),
+        "worst_fold_rmse": float(np.max(fold_rmse)),
+        "n_test_obs": int(len(obs)),
     }
 
 
-def config_key(cfg):
-    return json.dumps(cfg, sort_keys=True, default=str)
+def normalize_params(raw):
+    if MODEL_TYPE == "rf":
+        return {
+            "band_width": int(round(raw["band_width"])),
+            "model_hyperparameters": {
+                "n_estimators": int(round(raw["n_estimators"])),
+                "min_samples_leaf": int(round(raw["min_samples_leaf"])),
+                "max_depth": int(round(raw["max_depth"])),
+                "max_features": float(raw["max_features"]),
+                "bootstrap": True,
+            },
+        }
+    if MODEL_TYPE == "xgb":
+        return {
+            "band_width": int(round(raw["band_width"])),
+            "model_hyperparameters": {
+                "n_estimators": int(round(raw["n_estimators"])),
+                "max_depth": int(round(raw["max_depth"])),
+                "learning_rate": float(raw["learning_rate"]),
+                "subsample": float(raw["subsample"]),
+                "colsample_bytree": float(raw["colsample_bytree"]),
+                "tree_method": "hist",
+            },
+        }
+    raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
+
+
+def config_key(params):
+    hp = params["model_hyperparameters"]
+    stable = {
+        "model_type": MODEL_TYPE,
+        "band_width": int(params["band_width"]),
+    }
+    for k, v in hp.items():
+        if isinstance(v, float):
+            stable[k] = round(v, 6)
+        else:
+            stable[k] = v
+    return json.dumps(stable, sort_keys=True)
+
+
+def flat_result_row(model_params, metrics):
+    row = {
+        "model_type": MODEL_TYPE,
+        "band_width": model_params["band_width"],
+        "rmse": metrics["rmse"],
+        "mae": metrics["mae"],
+        "bias": metrics["bias"],
+        "r2": metrics["r2"],
+        "mean_fold_rmse": metrics["mean_fold_rmse"],
+        "worst_fold_rmse": metrics["worst_fold_rmse"],
+        "n_test_obs": metrics["n_test_obs"],
+        "config_key": config_key(model_params),
+    }
+    row.update(model_params["model_hyperparameters"])
+    return row
+
+
+def optimizer_params_from_row(row):
+    if MODEL_TYPE == "rf":
+        return {
+            "band_width": float(row["band_width"]),
+            "n_estimators": float(row["n_estimators"]),
+            "min_samples_leaf": float(row["min_samples_leaf"]),
+            "max_depth": float(row["max_depth"]),
+            "max_features": float(row["max_features"]),
+            "min_samples_split": float(row["min_samples_split"]),
+        }
+    if MODEL_TYPE == "xgb":
+        return {
+            "band_width": float(row["band_width"]),
+            "n_estimators": float(row["n_estimators"]),
+            "max_depth": float(row["max_depth"]),
+            "learning_rate": float(row["learning_rate"]),
+            "subsample": float(row["subsample"]),
+            "colsample_bytree": float(row["colsample_bytree"]),
+        }
+    raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--n-folds', type=int, default=20,
-                    help='number of in-basin stations held out (LOO subset)')
-    ap.add_argument('--time-stride', type=int, default=3,
-                    help='keep every k-th day to speed things up (1 = all)')
-    ap.add_argument('--max-configs', type=int, default=None,
-                    help='randomly sample this many configs from the grid')
-    ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--out', default='grf_test/results.csv',
-                    help='CSV path relative to GRF_RESULTS_DIR')
-    args = ap.parse_args()
-
-    out_path = os.path.join(GRF_RESULTS_DIR, args.out)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
 
     df = get_climatologically_valid_data()
-    rfd = prepare_data(df, args.time_stride)
-    in_ids, out_ids, out_dist_km, test_ids = split_stations(rfd, args.n_folds, args.seed)
-    print(f"{len(in_ids)} in-basin stations ({len(test_ids)} held out in turn), "
-          f"{len(out_ids)} out-of-basin stations, {len(rfd):,} obs.", flush=True)
+    rfd = prepare_data(df, TIME_STRIDE)
+    in_ids, test_ids = split_in_basin(rfd, N_FOLDS, SEED)
 
-    keys = list(PARAM_GRID)
-    configs = [dict(zip(keys, v)) for v in itertools.product(*PARAM_GRID.values())]
-    if args.max_configs and args.max_configs < len(configs):
-        rng = np.random.default_rng(args.seed)
-        idx = rng.choice(len(configs), size=args.max_configs, replace=False)
-        configs = [configs[i] for i in sorted(idx)]
+    print(
+        f"In-basin stations: {len(in_ids)}, held-out stations: {len(test_ids)}, obs: {len(rfd):,}",
+        flush=True,
+    )
 
     results = pd.DataFrame()
-    if os.path.exists(out_path):
-        results = pd.read_csv(out_path)
-    done = set(results['config_key']) if len(results) else set()
-    print(f"{len(configs)} configs, {len(done)} already done.", flush=True)
+    if os.path.exists(OUT_CSV):
+        results = pd.read_csv(OUT_CSV)
 
-    with Parallel(n_jobs=N_JOBS_MODELS, backend='threading') as parallel:
-        for i, cfg in enumerate(configs):
-            key = config_key(cfg)
+    if len(results) and "model_type" in results.columns:
+        results = results[results["model_type"] == MODEL_TYPE].copy()
+
+    done = set(results["config_key"]) if len(results) else set()
+    rmse_by_key = {row["config_key"]: float(row["rmse"]) for _, row in results.iterrows()} if len(results) else {}
+
+    with Parallel(n_jobs=N_JOBS_MODELS, backend="threading") as parallel:
+
+        eval_counter = len(done)
+        total_eval_budget = INIT_POINTS + N_ITER
+
+        def objective(**suggested):
+            nonlocal results, eval_counter
+            model_params = normalize_params(suggested)
+            key = config_key(model_params)
+
             if key in done:
-                continue
-            model_params = {k: v for k, v in cfg.items() if k != 'buffer_km'}
-            print(f"[{i + 1}/{len(configs)}] {cfg}", flush=True)
-            metrics = evaluate(rfd, in_ids, out_dist_km, test_ids,
-                               model_params, cfg['buffer_km'], parallel)
-            print(f"    RMSE={metrics['rmse']:.4f}  R2={metrics['r2']:.4f}  "
-                  f"bias={metrics['bias']:.4f}  n_out={metrics['n_out_stations']}",
-                  flush=True)
-            row = pd.DataFrame([{**cfg, **metrics, 'config_key': key}])
-            results = pd.concat([results, row], ignore_index=True)
-            # rewrite the full DataFrame each time so the CSV is always complete
-            results.to_csv(out_path, index=False)
+                print("Skipping already-computed config.", flush=True)
+                return -rmse_by_key[key]
 
-    res = results.drop(columns='config_key').sort_values('rmse').reset_index(drop=True)
-    sorted_path = out_path.replace('.csv', '_sorted.csv')
-    res.to_csv(sorted_path, index=False)
-    print(f"\nSaved {len(res)} results to {out_path}\nand ranked copy to {sorted_path}")
-    print("\nTop 10 configurations by RMSE:")
-    print(res.head(10).to_string(index=False))
+            eval_counter += 1
+            eval_start = time.perf_counter()
+            print(
+                f"\n=== Evaluation {eval_counter} (budget {total_eval_budget}) ===",
+                flush=True,
+            )
+            print(f"params={model_params}", flush=True)
 
-    # marginal effect of each parameter: mean RMSE per value, averaged over the rest
-    print("\nMean RMSE by parameter value:")
-    for k in keys:
-        if res[k].nunique() > 1:
-            print(res.assign(**{k: res[k].astype(str)}).groupby(k)['rmse'].mean().round(4).to_string())
-            print()
+            metrics = evaluate_metrics(rfd, in_ids, test_ids, model_params, parallel)
+            row = flat_result_row(model_params, metrics)
+            results = pd.concat([results, pd.DataFrame([row])], ignore_index=True)
+            results.to_csv(OUT_CSV, index=False)
 
+            done.add(key)
+            rmse_by_key[key] = metrics["rmse"]
+            eval_secs = time.perf_counter() - eval_start
+            print(
+                "evaluation complete "
+                f"rmse={metrics['rmse']:.4f} "
+                f"mae={metrics['mae']:.4f} "
+                f"bias={metrics['bias']:.4f} "
+                f"r2={metrics['r2']:.4f} "
+                f"mean_fold_rmse={metrics['mean_fold_rmse']:.4f} "
+                f"worst_fold_rmse={metrics['worst_fold_rmse']:.4f} "
+                f"n_test_obs={metrics['n_test_obs']} "
+                f"time={eval_secs:.1f}s",
+                flush=True,
+            )
+            return -metrics["rmse"]
 
-if __name__ == '__main__':
+        optimizer = BayesianOptimization(
+            f=objective,
+            pbounds=RF_PBOUNDS if MODEL_TYPE == "rf" else XGB_PBOUNDS,
+            random_state=SEED,
+            verbose=0,
+            allow_duplicate_points=True,
+        )
+
+        if len(results):
+            for _, row in results.iterrows():
+                optimizer.register(
+                    params=optimizer_params_from_row(row),
+                    target=-float(row["rmse"]),
+                )
+
+        print(
+            f"Loaded {len(done)} completed runs from CSV. "
+            f"New evaluation budget: {total_eval_budget}",
+            flush=True,
+        )
+        optimizer.maximize(init_points=INIT_POINTS, n_iter=N_ITER)
+
+    best = optimizer.max
+    best_params = normalize_params(best["params"])
+    print("\nBest parameters:")
+    print(best_params)
+    print(f"Best RMSE: {-best['target']:.4f}")
+    print(f"Results CSV: {OUT_CSV}")
+
+#%%
+if __name__ == "__main__":
     main()
+
+#%% plot results csv
+
+results = pd.read_csv(OUT_CSV)

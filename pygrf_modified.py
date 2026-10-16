@@ -1,9 +1,39 @@
 import numpy as np
 import pandas as pd
-
 from sklearn.utils.parallel import Parallel, delayed
 from scipy.spatial import distance
 from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from contextlib import contextmanager
+import joblib
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # tqdm is optional; fall back to no progress bar
+    tqdm = None
+
+
+@contextmanager
+def joblib_progress_bar(total, desc):
+    if tqdm is None:
+        yield
+        return
+
+    pbar = tqdm(total=total, desc=desc, unit="model")
+
+    class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            pbar.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_callback = joblib.parallel.BatchCompletionCallBack
+    joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+
+    try:
+        yield
+    finally:
+        joblib.parallel.BatchCompletionCallBack = old_callback
+        pbar.close()
 
 
 class PyGRFBuilder:
@@ -11,16 +41,13 @@ class PyGRFBuilder:
     def __init__(
         self,
         band_width,
-        n_estimators=100,
-        max_features=1.0,
+        base_model="rf",
+        model_hyperparameters=None,
         kernel="adaptive",
         train_weighted=True,
         predict_weighted=True,
-        bootstrap=True,
         random_state=None,
         n_jobs=None,
-        min_samples_leaf=1,
-        max_depth=None,
         n_jobs_models=1,
         **kwargs,
     ):
@@ -79,17 +106,14 @@ class PyGRFBuilder:
         """
 
         self.band_width = band_width
-        self.n_estimators = n_estimators
-        self.max_features = max_features
         self.kernel = kernel
         self.train_weighted = train_weighted
         self.predict_weighted = predict_weighted
-        self.bootstrap = bootstrap
         self.random_state = random_state
         self.n_jobs = n_jobs
-        self.min_samples_leaf = min_samples_leaf
-        self.max_depth = max_depth
         self.n_jobs_models = n_jobs_models
+        self.base_model = base_model
+        self.model_hyperparameters = model_hyperparameters or {}
 
         self.local_models = []
         self.station_coords = None
@@ -402,23 +426,33 @@ class PyGRFBuilder:
             # Fit RF
             # ----------------------------------------------------------
 
-            rf = RandomForestRegressor(
-                n_estimators=self.n_estimators,
-                max_features=self.max_features,
-                bootstrap=self.bootstrap,
-                random_state=(
-                    None
-                    if self.random_state is None
-                    else self.random_state + i
-                ),
-                n_jobs=self.n_jobs,
-                min_samples_leaf=self.min_samples_leaf,
-                max_depth=self.max_depth,
-            )
+            if self.base_model == "rf":
+
+                model = RandomForestRegressor(
+                    random_state=(
+                        None
+                        if self.random_state is None
+                        else self.random_state + i
+                    ),
+                    n_jobs=self.n_jobs,
+                    **self.model_hyperparameters
+                )
+
+            elif self.base_model == "xgb":
+
+                model = XGBRegressor(
+                    random_state=(
+                        None
+                        if self.random_state is None
+                        else self.random_state + i
+                    ),
+                    n_jobs=self.n_jobs,
+                    **self.model_hyperparameters
+                )
 
             if self.train_weighted:
 
-                rf.fit(
+                model.fit(
                     X_local,
                     y_local,
                     sample_weight=local_weights
@@ -426,23 +460,30 @@ class PyGRFBuilder:
 
             else:
 
-                rf.fit(
+                model.fit(
                     X_local,
                     y_local
                 )
 
-            return rf, local_observations
+            return model, local_observations
+
 
         # Threads share X/y without copying; RF fitting releases the GIL.
-        print(
-            f"Fitting {n_stations} local RFs "
-            f"({self.n_jobs_models} models in parallel x {self.n_jobs} RF jobs)..."
+        # print(
+        #     f"Fitting {n_stations} local RFs "
+        #     f"({self.n_jobs_models} models in parallel x {self.n_jobs} RF jobs)..."
+        # )
+
+        parallel_runner = (
+            parallel
+            or Parallel(n_jobs=self.n_jobs_models, backend="threading")
         )
 
-        results = (
-            parallel
-            or Parallel(n_jobs=self.n_jobs_models, backend="threading", verbose=5)
-        )(delayed(fit_local)(i) for i in range(n_stations))
+        with joblib_progress_bar(
+            total=n_stations,
+            desc=f"Fitting local {self.base_model.upper()} models",
+        ):
+            results = parallel_runner(delayed(fit_local)(i) for i in range(n_stations))
 
         self.local_models = [r[0] for r in results]
         self.local_observation_indices = [r[1] for r in results]

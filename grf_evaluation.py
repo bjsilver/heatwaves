@@ -10,7 +10,6 @@ import xarray as xr
 from ufuncs import get_amazon_basin_mask, local_cluster
 from obs_data import get_harmonised_data
 import os
-from ufuncs import get_amazon_basin_mask
 from glob import glob
 import cartopy.crs as ccrs
 import contextily as ctx
@@ -26,11 +25,13 @@ os.makedirs(figpath, exist_ok=True)
 
 FEATURES = ['LST', 'elevation', 'doy_sin', 'doy_cos', 'day']
 
-pretty_model = {'grf': 'Geographical Random Forest', 'zz': 'Zhang+Zhou'}
+pretty_model = {'grf': 'Geographical Random Forest', 'zz': 'Zhang+Zhou',
+                'xgb': 'Geographical XGBoost'}
+LABEL = 'XGB'
 
-def retrieve_pickled_results(sdir):
+def retrieve_pickled_results(sdir, model_type="rf"):
 
-    fpaths = GRF_RESULTS_DIR + sdir + '/fold_*_results.pkl'
+    fpaths = GRF_RESULTS_DIR + f'{model_type}/{sdir}/fold_*_results.pkl'
     fpaths = glob(fpaths)
 
     dfs = []
@@ -78,8 +79,7 @@ def calc_evaluation_metrics(x, y):
     return rmse, mae, r2, nmb
 
 def format_evaluation_plot_ax(ax, x, y):
-    
-    
+
     ax.set_xlim(max(min(x), min(y)), min(max(x), max(y)))
     ax.set_ylim(max(min(x), min(y)), min(max(x), max(y)))
     # plot a 1:1 line
@@ -188,7 +188,7 @@ def evaluation_plot_with_zz(obs, rf_pred, zz_pred, title, sfname):
         ))
 
     textstr_mgwr = '\n'.join((
-        f'GRF Predicted:',
+        f'{LABEL} Predicted:',
         f'RMSE: {rmse_mgwr:.2f} °C',
         f'MAE: {mae_mgwr:.2f} °C',
         f'R²: {r2_mgwr:.2f}',
@@ -281,7 +281,7 @@ def seasonal_evaluation_plot(df):
     # plot the observed and predicted tmax as a function of day of year
     ax.plot(doy_mean.index, doy_mean['obs'], label='Observed', color='black', lw=2)
     ax.plot(doy_mean.index, doy_mean['tmax_pred_zz'], label='ZZ predicted', color='blue', lw=2)
-    ax.plot(doy_mean.index, doy_mean['pred'], label='GRF predicted', color='orange', lw=2)
+    ax.plot(doy_mean.index, doy_mean['pred'], label=f'{LABEL} predicted', color='orange', lw=2)
     ax.set_xlabel('day of year')
     ax.set_ylabel(r'$\mathrm{T_{max}}$ (°C)')
     ax.legend()
@@ -310,7 +310,7 @@ def seasonal_evaluation_plot(df):
         metric_ax = fig.add_subplot(gs[1 + i // 2, i % 2])
         x = np.arange(len(season_order))
         width = 0.36
-        metric_ax.bar(x - width / 2, values['GRF'], width, label='GRF', color='orange')
+        metric_ax.bar(x - width / 2, values['GRF'], width, label=LABEL, color='orange')
         metric_ax.bar(x + width / 2, values['ZZ'], width, label='ZZ', color='blue')
         metric_ax.set_xticks(x, season_order)
         metric_ax.set_title(f'Seasonal {metric}')
@@ -337,7 +337,7 @@ def trend_evaluation_plot(df):
     ax = fig.add_subplot(gs[0, :])
     ax.plot(annual_mean.index, annual_mean['obs'], label='Observed', color='black', lw=1.5, marker='.')
     ax.plot(annual_mean.index, annual_mean['tmax_pred_zz'], label='ZZ predicted', color='blue', lw=1.5, marker='.')
-    ax.plot(annual_mean.index, annual_mean['pred'], label='GRF predicted', color='orange', lw=1.5, marker='.')
+    ax.plot(annual_mean.index, annual_mean['pred'], label=f'{LABEL} predicted', color='orange', lw=1.5, marker='.')
     ax.set_xlabel('Year')
     ax.set_ylabel(r'$\mathrm{T_{max}}$ (°C)')
     ax.set_title('Annual mean T$_{max}$ trend')
@@ -359,7 +359,7 @@ def trend_evaluation_plot(df):
 
     for i, (metric, values) in enumerate(annual_metrics.items()):
         metric_ax = fig.add_subplot(gs[1 + i // 2, i % 2])
-        metric_ax.plot(years, values['GRF'], label='GRF', color='orange', marker='o', lw=1.5)
+        metric_ax.plot(years, values['GRF'], label=LABEL, color='orange', marker='o', lw=1.5)
         metric_ax.plot(years, values['ZZ'], label='ZZ', color='blue', marker='o', lw=1.5)
         metric_ax.set_title(f'Annual {metric}')
         metric_ax.set_ylabel(metric)
@@ -373,8 +373,8 @@ def trend_evaluation_plot(df):
     fig.savefig(figpath + 'grf_annual_trend_evaluation.png', dpi=300, bbox_inches='tight')
 
 
-def retrieve_final_model_results(sdir):
-    spath = os.path.join(GRF_RESULTS_DIR, f'{sdir}/grf_final_model.pkl')
+def retrieve_final_model_results(sdir, model_type="rf"):
+    spath = os.path.join(GRF_RESULTS_DIR, f'{model_type}/{sdir}/grf_final_model.pkl')
     with open(spath, 'rb') as f:
         results = pkl.load(f)
     return results
@@ -415,11 +415,64 @@ def plot_feature_importance_maps(results):
     fig.tight_layout()
     fig.savefig(figpath + 'grf_feature_importance_maps.png', dpi=300, bbox_inches='tight')
 
+
+def plot_feature_response(sdir, model_type="rf"):
+    global figpath
+    figpath = os.path.join(FIGDIR, 'grf_evaluation', model_type, sdir) + '/'
+    os.makedirs(figpath, exist_ok=True)
+
+    final_model_results = retrieve_final_model_results(sdir=sdir, model_type=model_type)
+
+
+    feature_responses = final_model_results['feature_responses']
+
+    fig = plt.figure(figsize=(16, 12))
+    axes = fig.subplots(2, 2)
+
+    pretty_features = {'LST': 'land surface temperature', 'elevation': 'elevation',
+                        'doy': 'day of year', 'day': 'day'}
+
+    ymin = round(min([feature_responses[f]['prediction'].quantile(0.01).min() for f in ['LST', 'elevation', 'day', 'doy']]))
+    ymax = round(max([feature_responses[f]['prediction'].quantile(0.99).max() for f in ['LST', 'elevation', 'day', 'doy']]))
+    for i, feature in enumerate(['LST', 'elevation', 'day', 'doy']):
+        ax = axes.flatten()[i]
+
+        fdf = feature_responses[feature].sort_index().astype(float)
+        x = fdf.reset_index()[feature]
+        y = fdf['prediction'].reset_index()['prediction'].squeeze()
+
+        # split into n intervals of equal number of samples, and plot the mean and std of each interval
+        n_intervals = 15
+        intervals = pd.cut(x, bins=n_intervals)
+
+        y_mean = y.groupby(intervals).median()
+        y_upper = y.groupby(intervals).quantile(0.75)
+        y_lower = y.groupby(intervals).quantile(0.25)
+        x_mean = x.groupby(intervals).median()
+
+        ax.plot(x_mean, y_mean, color='blue', lw=2)
+        ax.fill_between(x_mean, y_lower, y_upper, color='blue', alpha=0.3)
+        ax.set_ylim(ymin, ymax)
+
+        # set x label and title
+        ax.set_xlabel(pretty_features.get(feature, feature))
+        ax.set_title(f'Partial dependence of {pretty_features.get(feature, feature)} on predicted Tmax')
+
+        # grid and background
+        ax.grid(alpha=0.3)
+
+    fig.savefig(figpath + f'grf_feature_response_{model_type}.png', dpi=300, bbox_inches='tight')
+
 #%%
 
-def evaluate_grf(sdir):
-    
-    df = retrieve_pickled_results(sdir=sdir)
+def evaluate_grf(sdir, model_type="rf"):
+
+    global LABEL, figpath
+    LABEL = {'rf': 'GRF', 'xgb': 'GXGB'}[model_type]
+    pretty_model['grf'] = pretty_model.get(model_type, pretty_model['grf'])
+    figpath = os.path.join(FIGDIR, 'grf_evaluation', model_type, sdir) + '/'
+    os.makedirs(figpath, exist_ok=True)
+    df = retrieve_pickled_results(sdir=sdir, model_type=model_type)
     all_obs, meta, _ = get_harmonised_data()
     
     zz_interped = interpolate_zz_to_stations(meta, recompute=False)
@@ -434,42 +487,8 @@ def evaluate_grf(sdir):
     seasonal_evaluation_plot(df)
     trend_evaluation_plot(df)
 
-    final_model_results = retrieve_final_model_results(sdir='climvalid_obs')
+    final_model_results = retrieve_final_model_results(sdir='climvalid_obs', model_type=model_type)
     plot_feature_importance_maps(final_model_results)
 
-evaluate_grf(sdir='climvalid_obs')
+evaluate_grf(sdir='low_corr', model_type='xgb')
 
-
-#%%
-final_model_results = retrieve_final_model_results(sdir='climvalid_obs')
-
-
-#%%
-feature_responses = final_model_results['feature_responses']
-
-
-
-
-#%%
-fig = plt.figure(figsize=(16, 12))
-axes = fig.subplots(2, 3)
-
-for i, feature in enumerate(feature_responses.keys()):
-    ax = axes.flatten()[i]
-
-    fdf = feature_responses[feature].sort_index().astype(float)
-    x = fdf.reset_index()[feature]
-    y = fdf['prediction'].reset_index()['prediction'].squeeze()
-
-    # split into n intervals of equal number of samples, and plot the mean and std of each interval
-    n_intervals = 10
-    intervals = pd.cut(x, bins=n_intervals)
-
-    y_mean = y.groupby(intervals).median()
-    y_upper = y.groupby(intervals).quantile(0.75)
-    y_lower = y.groupby(intervals).quantile(0.25)
-    x_mean = x.groupby(intervals).median()
-
-    ax.plot(x_mean, y_mean, color='blue', lw=2)
-    ax.fill_between(x_mean, y_lower, y_upper, color='blue', alpha=0.3)
- 

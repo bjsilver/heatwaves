@@ -7,7 +7,8 @@ from constants import (
     DATE_SLICE,
     DOY_POOL_WINDOW,
     CLIMATOLOGY_SCORE_THRESHOLD,
-    LST_CORRELATION_THRESHOLD
+    LST_CORRELATION_THRESHOLD,
+    ELEVATION_THRESHOLD
 )
 import numpy as np
 import pandas as pd
@@ -24,7 +25,8 @@ from obs_data import get_harmonised_data
 
 
 def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD,
-                                    lst_correlation_threshold=LST_CORRELATION_THRESHOLD):
+                                    lst_correlation_threshold=LST_CORRELATION_THRESHOLD,
+                                    elevation_threshold=ELEVATION_THRESHOLD):
 
     tmax_df = get_interpolated_data(recompute=False)
 
@@ -42,6 +44,11 @@ def get_climatologically_valid_data(climatology_score_threshold=CLIMATOLOGY_SCOR
         lst_corr = df.groupby('station_id')[['tmax', 'LST']].corr().iloc[0::2,-1]
         lst_corr = lst_corr.reset_index(level=1, drop=True)
         valid_stations = lst_corr[lst_corr >= lst_correlation_threshold].index.get_level_values(0).unique()
+        df = df[df['station_id'].isin(valid_stations)]
+
+    if elevation_threshold is not None:
+        elev = df.groupby('station_id')['elevation'].mean()
+        valid_stations = elev[elev < elevation_threshold].index.get_level_values(0).unique()
         df = df[df['station_id'].isin(valid_stations)]
 
     return df
