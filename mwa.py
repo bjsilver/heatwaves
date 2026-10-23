@@ -3,20 +3,17 @@ import xarray as xr
 import numpy as np
 import os
 import dask.array as da
-from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR, TMAX_RECHUNKED_FILE
+from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR, TMAX_RECHUNKED_FILE, COARSEN_FACTORS, ELEV_PATH, LST_DIR, GRF_TMAX_PATH
 import gc
 import json
 import shutil
 from glob import glob
-from ufuncs import local_cluster
+from ufuncs import local_cluster, _check_coords_match
 from calc_era5_percentiles import load_era5_t2m
 from numba import njit
 import pandas as pd
 from dask import delayed
 from numcodecs import Blosc
-
-# COARSEN_FACTORS = [None, 2, 5, 10, 25]
-COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 
 SPATH_SUFFIX = None
 USE_DASK_DASHBOARD = True
@@ -64,7 +61,6 @@ def _load_canopy_cover_and_loss(era=False):
     cc_loss.name = 'cc_loss'
     return cc, cc_loss
 
-
 def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
 
 
@@ -85,6 +81,12 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heat_metrics', 'heat_metrics.zarr'))['warmest_days']
     elif dep_var_name == 'tmax_era5':
         dep_var = load_era5_t2m()
+    elif dep_var_name == 'lst':
+        dep_var = xr.open_zarr(LST_DIR+'regridded_rechunked.zarr')['LST'] / 10
+    elif dep_var_name == 'tmax_grf':
+        print('WARNING! USING OLD VERSION')
+        dep_var = xr.open_zarr(GRF_TMAX_PATH)['tmax']
+
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
     dep_var.name = dep_var_name
@@ -94,8 +96,11 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
 
     elif ind_var_name == 'cc_era5':
         ind_var, cc_loss = _load_canopy_cover_and_loss(era=True)
+
     ind_var = ind_var.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
     cc_loss = cc_loss.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
+    _check_coords_match([ind_var, cc_loss, dep_var])
+
     
 
     if include_cc_loss:
@@ -228,7 +233,7 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname, overwrite=False):
     encoding = {
         'selection': {
             'dtype': 'float32',
-            'compressor': Blosc(cname='zstd', clevel=3)
+            'compressors': [Blosc(cname='zstd', clevel=3)]
         }
     }
 
@@ -793,21 +798,23 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
     return dss
 
 
+
+
 def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
                        client=None, dep_var_agg=None,
                        coarsen_factor=None, window_radius=1, sname=None,
                        neighbour_map_sname=None, overwrite=False):
 
+    elev = xr.open_dataset(ELEV_PATH)['elevation']
+    ref_ind_var = ind_var
+    # check coords match elev
 
-    if len(dep_var.lat) == 5000 and len(dep_var.lon) == 4750:    
-        elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
-        ref_ind_var = ind_var
-        elev = elev.assign_coords(lat=ref_ind_var.lat, lon=ref_ind_var.lon)
-        ind_var = ind_var.where(elev < 1000)
-        cc_loss = cc_loss.where(elev < 1000)
-        dep_var = dep_var.where(elev < 1000)
-    else:
-        elev = None
+    _check_coords_match([dep_var, elev])
+    elev = elev.assign_coords({'lat': dep_var['lat'], 'lon': dep_var['lon']})
+    ind_var = ind_var.where(elev < 1000)
+    cc_loss = cc_loss.where(elev < 1000)
+    dep_var = dep_var.where(elev < 1000)
+
 
     # Generate list of variable triplets (with offsets if applicable)
     if coarsen_factor:
@@ -959,11 +966,18 @@ if __name__ == "__main__":
                         dashboard_address=':8787',
                        suppress_dask_warnings=False, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
 
-        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
-                             dep_var_name='tmax', client=client, overwrite=True)
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+        #                      dep_var_name='tmax', client=client, overwrite=False)
 
-        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
-                            dep_var_name='heatwaves_gapfilled', client=client, overwrite=True)
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+        #                              dep_var_name='lst', client=client, overwrite=False)
+
+        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+                             dep_var_name='tmax_grf', client=client, overwrite=False)
+
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
+        #                     dep_var_name='heatwaves_gapfilled', client=client, overwrite=False)
 
         # run_mwa_coarsen_loop(ind_var_name='cc', 
         #                      dep_var_name='absthresh_heatwaves',

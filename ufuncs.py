@@ -5,7 +5,7 @@ import json
 import shutil
 import xarray as xr
 import numpy as np
-from constants import STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR, BORDERS_DIR, TMAX_RECHUNKED_PATH, LAT_CHUNK_SIZE, LON_CHUNK_SIZE, COORD_DUMP_PATH
+from constants import LST_DIR, STORAGE_DIR, PERCENTILE_KEYS, HANSEN_DIR, BORDERS_DIR, TMAX_RECHUNKED_PATH, LAT_CHUNK_SIZE, LON_CHUNK_SIZE, COORD_DUMP_PATH
 from dask.distributed import Client, LocalCluster
 import warnings
 from contextlib import contextmanager
@@ -13,6 +13,7 @@ import regionmask
 import geopandas as gpd
 import os
 import pickle
+import itertools
 
 def lon_to_180(ds):
     ds = ds.copy()
@@ -127,12 +128,12 @@ def local_cluster(n_workers=16, threads_per_worker=1, memory_limit='20GB', proce
 
         
 def get_amazon_basin_mask(buffer_km=None):
-    hansen = xr.open_zarr(HANSEN_DIR+'hansen_tc_2000_2024_rechunked.zarr')
+    lst = xr.open_zarr(LST_DIR+'regridded_rechunked.zarr')['LST'][0]
     amazon_basin = gpd.read_file(BORDERS_DIR+'mrb_basins.shp')
     if buffer_km is not None:
         amazon_basin = amazon_basin.to_crs(epsg=3857).buffer(buffer_km * 1000).to_crs(epsg=4326)
     # create a mask for the Amazon basin using the hansen grid
-    amazon_mask = regionmask.Regions([amazon_basin.geometry.iloc[0]]).mask(hansen.lon, hansen.lat)
+    amazon_mask = regionmask.Regions([amazon_basin.geometry.iloc[0]]).mask(lst.lon, lst.lat)
     return {'raster': amazon_mask, 'vector': amazon_basin}
 
 def get_target_lat_lons():
@@ -178,3 +179,14 @@ def get_tmax_template_coords(coord_dump_path=COORD_DUMP_PATH):
                       dims=('lat', 'lon'))
     return da
 
+def _check_coords_match(das=[], warn_if_not_exact=True):
+    """for a list of dataarrays, check that lat/lon coords match. Raises ValueError if not."""
+    if len(das) < 2:
+        return ValueError("At least two dataarrays are required to check coordinates.")
+    combinations = itertools.combinations(das, 2)
+    for da1, da2 in combinations:
+        for dim in ['lat', 'lon']:
+            if not np.allclose(da1[dim].values, da2[dim].values, atol=1e-6):
+                raise ValueError(f"{dim} coordinates of {da1.name} and {da2.name} do not match.")
+            if not np.array_equal(da1[dim].values, da2[dim].values) and warn_if_not_exact:
+                warnings.warn(f"{dim} coordinates of {da1.name} and {da2.name} match but are not exactly equal")

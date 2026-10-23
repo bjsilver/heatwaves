@@ -1,20 +1,19 @@
 #%%
 import os
-from constants import DOY_POOL_WINDOW, GRF_RESULTS_DIR, CLIMATOLOGY_SCORE_THRESHOLD, LST_CORRELATION_THRESHOLD, ELEVATION_THRESHOLD
+from constants import  GRF_RESULTS_DIR, CLIMATOLOGY_SCORE_THRESHOLD, LST_CORRELATION_THRESHOLD, ELEVATION_THRESHOLD
 from pygrf_modified import PyGRFBuilder
 import pandas as pd
 import pickle as pkl
-from joblib import delayed
 from sklearn.utils.parallel import Parallel
-from grf_data import doy_gaussian_mean, get_climatologically_valid_data, get_interpolated_data, get_harmonised_data
+from grf_data import get_climatologically_valid_data
 from sklearn.model_selection import LeaveOneOut, KFold
 from obs_data import define_local_azimuthal_projection
 from ufuncs import get_amazon_basin_mask
 import geopandas as gpd
 import numpy as np
 
-CRS = define_local_azimuthal_projection(recalculate=False)
-AMAZON_BASIN = get_amazon_basin_mask(buffer_km=0)['vector'].to_crs(CRS)
+az_crs = define_local_azimuthal_projection(recalculate=False)
+AMAZON_BASIN = get_amazon_basin_mask(buffer_km=0)['vector'].to_crs(az_crs)
 N_JOBS_MODELS = 70
 FEATURES = ['LST', 'elevation', 'doy_sin', 'doy_cos', 'day']
 
@@ -85,7 +84,6 @@ def pickle_fold_results(fold, predictions, model, model_type, sdir):
     with open(spath, 'wb') as f:
         pkl.dump(results, f)
 
-#%% test feature partial dependencies
 def test_feature_partial_dependencies(train_stations, model, parallel=None):
 
     station_ids = model.station_ids
@@ -184,7 +182,6 @@ def test_feature_partial_dependencies(train_stations, model, parallel=None):
 
     return feature_responses
 
-#%%
 
 def kfold_cross_validation(rfd, sdir, model_type="rf", parallel=None):
     coord_df = rfd.groupby('station_id')['geometry'].first()
@@ -222,22 +219,26 @@ def kfold_cross_validation(rfd, sdir, model_type="rf", parallel=None):
 
         pickle_fold_results(fold, predictions, model, model_type=model_type, sdir=sdir)
 
+def add_aux_time_features(rfd):
+    datetimes = rfd.index.get_level_values('datetime')
+    rfd['doy_sin'] = np.sin(2 * np.pi * datetimes.dayofyear / 365)
+    rfd['doy_cos'] = np.cos(2 * np.pi * datetimes.dayofyear / 365)
+    rfd['day'] = (datetimes - datetimes.min()).days
+    return rfd
 
 def fit_evaluate_grf(df, sdir, model_type="rf"):
 
     rfd = df.copy()
     
     rfd = rfd.dropna(subset=['tmax', 'LST', 'elevation', 'easting', 'northing'])
-    datetimes = rfd.index
+    
     rfd = gpd.GeoDataFrame(rfd, 
                           geometry=gpd.points_from_xy(rfd['easting'], 
                                                       rfd['northing']), 
-                                                      crs=CRS)
+                                                      crs=az_crs)
     rfd = rfd.reset_index().set_index(['station_id', 'datetime'])
+    rfd = add_aux_time_features(rfd)
 
-    rfd['doy_sin'] = np.sin(2 * np.pi * datetimes.dayofyear / 365)
-    rfd['doy_cos'] = np.cos(2 * np.pi * datetimes.dayofyear / 365)
-    rfd['day'] = (datetimes - datetimes.min()).days
     
     # One persistent thread pool is reused for every fold and the final fit.
     with Parallel(n_jobs=N_JOBS_MODELS, backend="threading") as parallel:
@@ -258,10 +259,15 @@ def fit_evaluate_grf(df, sdir, model_type="rf"):
     
 #%%
 if __name__ == '__main__':
+    # df = get_climatologically_valid_data(
+    #     climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD,
+    #     lst_correlation_threshold=-np.inf,
+    #     elevation_threshold=np.inf
+    # )
+    # fit_evaluate_grf(df, sdir='all_elev', model_type="rf")
     df = get_climatologically_valid_data(
         climatology_score_threshold=CLIMATOLOGY_SCORE_THRESHOLD,
         lst_correlation_threshold=-np.inf,
-        elevation_threshold=ELEVATION_THRESHOLD
+        elevation_threshold=np.inf
     )
-    fit_evaluate_grf(df, sdir='low_corr', model_type="rf")
-    fit_evaluate_grf(df, sdir='low_corr', model_type="xgb")
+    fit_evaluate_grf(df, sdir='all_elev', model_type="rf")

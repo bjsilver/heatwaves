@@ -251,10 +251,13 @@ def plot_eval_metrics_map(df, meta, metric, suptitle,
                 legend_kwds={'label': metric.upper(), 'shrink': 0.7,
                             'orientation': 'horizontal', 'pad': 0.01})
         
-        ctx.add_basemap(ax, crs=CRS, source=ctx.providers.Esri.WorldImagery,
-                        attribution='')
+        
         AMAZON_BASIN.to_crs(crs=CRS).boundary.plot(ax=ax, color='red', linewidth=1,
                                 zorder=10)
+        ax.set_extent([AMAZON_BASIN.total_bounds[0]-2, AMAZON_BASIN.total_bounds[2]+2,
+                          AMAZON_BASIN.total_bounds[1]-2, AMAZON_BASIN.total_bounds[3]+2], crs=ccrs.PlateCarree())
+        ctx.add_basemap(ax, crs=CRS, source=ctx.providers.Esri.WorldImagery,
+                                attribution='')
 
     fig.suptitle(suptitle, fontsize=18, y=.83)
     fig.savefig(figpath + f'{spath_prefix}_{metric}_evalmap.png', dpi=300, bbox_inches='tight')
@@ -476,7 +479,7 @@ def evaluate_grf(sdir, model_type="rf"):
     all_obs, meta, _ = get_harmonised_data()
     
     zz_interped = interpolate_zz_to_stations(meta, recompute=False)
-    df = merge_zz_into_df(df, zz_interped)
+    df = merge_zz_into_df(df, zz_interped).dropna()
     mean_df = get_annual_mean_df(df)
     evaluation_plot(x=mean_df['obs'], y=mean_df['pred'], title='annual mean',
                     sfname='grf_eval_annual_mean')
@@ -490,5 +493,7 @@ def evaluate_grf(sdir, model_type="rf"):
     final_model_results = retrieve_final_model_results(sdir='climvalid_obs', model_type=model_type)
     plot_feature_importance_maps(final_model_results)
 
-evaluate_grf(sdir='low_corr', model_type='xgb')
+#%% 
+if __name__ == "__main__":
+    evaluate_grf(sdir='all_elev', model_type='rf')
 

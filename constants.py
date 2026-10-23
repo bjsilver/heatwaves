@@ -1,7 +1,5 @@
 import numpy as np
 
-#%%
-
 ### GLOBAL PARAMETERS ###
 START_DATE = '2003-01-01'
 END_DATE = '2020-12-31'
@@ -10,6 +8,7 @@ DATE_SLICE = slice(START_DATE, END_DATE)
 ### RAW DATA PATHS ###
 MODIS_PATH = '/uolstore/Research/b/b0122/earjba/MODIS_LST/modis_v6.1/processed_from_callum/'
 ERA5_PATH = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/era5/'
+
 STORAGE_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/'
 HANSEN_DIR = '/uolstore/Research/b/b0256/Users/earbsi/hansen/zz_original_grid/'
 PERCENTILES_DIR = '/uolstore/Research/b/b0256/Users/earbsi/heatwaves/percentiles/'
@@ -34,7 +33,8 @@ COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 ### PROCESSED DATA ###
 TMAX_RECHUNKED_PATH = STORAGE_DIR + 'tmax/rechunked/'
 TMAX_RECHUNKED_FILE = TMAX_RECHUNKED_PATH + 'tmax_rechunked.zarr'
-
+ELEV_PATH = '/uolstore/Research/b/b0256/Users/earbsi/elevation/orig_resolution_regridded/elevation_regridded.nc'
+GRF_TMAX_PATH = STORAGE_DIR + 'grf_results/predictions/old/grf_tmax_2003_2020.zarr'
 
 AREA_BBOX = {'westlimit':-82, 'eastlimit':-34.5, 'southlimit':-30, 'northlimit':20}
 

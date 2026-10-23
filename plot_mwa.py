@@ -35,7 +35,8 @@ pretty = {
     'tmax': 'daily maximum temperature',
     'tmax_era5': 'daily maximum temperature (ERA5)',
     'absthresh_heatwaves': 'absolute threshold heatwaves',
-    'warmest_days': 'temperature of warmest days'
+    'warmest_days': 'temperature of warmest days',
+    'lst': 'LST',
 }
 
 units = {
@@ -46,6 +47,7 @@ units = {
     'tmax_era5': '°C',
     'absthresh_heatwaves': 'days/year',
     'warmest_days': '°C',
+    'lst': '°C',
 }
 
 
@@ -165,7 +167,6 @@ def load_mwa_results_file_paired(sname, ind_var_name, aggregation):
 
     meta = pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in meta_dict.items()})
     ddf = dd.from_delayed(delayed_parts, meta=meta)
-    breakpoint()
     with ProgressBar():
         df = ddf.compute(num_workers=64, memory_limit='2GB')
     df = df.dropna(how='any')
@@ -213,7 +214,9 @@ def load_and_cache_all_coarsens(dep_var_name, ind_var_name, aggregation,
                                                aggregation=aggregation)
             os.makedirs(cache_dir, exist_ok=True)
             df.reset_index().to_parquet(cache_file, engine='pyarrow', index=False)
-
+        
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index()
         coarsen_dfs[coarsen_factor] = df
 
     return coarsen_dfs
@@ -600,6 +603,11 @@ def plot_hexbin_results(
     plt.colorbar(hb, ax=ax, label=f'{pretty[dep_var_name]} difference per 1% {pretty[ind_var_name]}', orientation='vertical')
     ax.set_xlabel(f'{pretty[ind_var_name]} in centre bin [%]', fontsize=12)
     ax.set_ylabel(f'{pretty[ind_var_name]} in neighbor bin [%]', fontsize=12)
+
+    ## add a grid
+    ax.grid(axis='both', linestyle='--', alpha=0.7)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
 
     norm_label = 'normalized' if normalize_by_ind_diff else 'raw'
     ax.set_title(
@@ -1032,78 +1040,76 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
             reset_caches=reset_caches,
         )
 
-    # plot_mwa_results_all(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     years=years,
-    #     sname=sname,
-    #     dfs=dfs,
-    #     stat='mean',
-    #     area_slice=area_slice,
-    #     plot_resolution_corr=False,
-    #     print_summary=True,
-    #     min_count_per_bin=20,
-    #     relative=False,
-    #     print_stats=True,
-    #     reset_caches=reset_caches,
-    # )
+
+    plot_mwa_results_all(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        sname=sname,
+        dfs=dfs,
+        stat='mean',
+        area_slice=area_slice,
+        plot_resolution_corr=False,
+        print_summary=True,
+        min_count_per_bin=20,
+        relative=False,
+        print_stats=True,
+        reset_caches=reset_caches,
+    )
 
 
 
 
-    # plot_binned_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     years=years,
-    #     stat='mean',
-    #     dfs=dfs,
-    #     sname=sname,
-    #     area_slice=area_slice,
-    #     relative=False,
-    #     print_stats=True,
-    #     coarsen_factor=None
-    # )
+    plot_binned_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        stat='mean',
+        dfs=dfs,
+        sname=sname,
+        area_slice=area_slice,
+        relative=False,
+        print_stats=True,
+        coarsen_factor=None
+    )
 
 
-    # plot_dep_response_vs_ind_diff(
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     coarsen_factor=None,
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     aggregation=aggregation,
-    #     years=years,
-    #     area_slice=area_slice,
-    #     normalize_by_ind_diff=True,
-    #     round_digits=0,
+    plot_dep_response_vs_ind_diff(
+        paired_dfs=paired_dfs,
+        sname=sname,
+        coarsen_factor=None,
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        aggregation=aggregation,
+        years=years,
+        area_slice=area_slice,
+        normalize_by_ind_diff=True,
+        round_digits=0,
+    )
 
-    # )
+    plot_map_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        ind_bin=top_bins[ind_var_name],
+        show_box=False,
+        area_slice=area_slice,
+    )
 
-    # plot_map_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     aggregation=aggregation,
-    #     ind_bin=top_bins[ind_var_name],
-    #     show_box=False,
-    #     area_slice=area_slice,
-        
-    # )
-
-    # plot_trend_results(
-    #     ind_var_name=ind_var_name,
-    #     dep_var_name=dep_var_name,
-    #     paired_dfs=paired_dfs,
-    #     sname=sname,
-    #     aggregation=aggregation,
-    #     area_slice=area_slice,
-    #     years=years,
-    #     coarsen_factor=None
-    # )
-
+    plot_trend_results(
+        ind_var_name=ind_var_name,
+        dep_var_name=dep_var_name,
+        paired_dfs=paired_dfs,
+        sname=sname,
+        aggregation=aggregation,
+        area_slice=area_slice,
+        years=years,
+        coarsen_factor=None
+    )
 
     plot_hexbin_results(
         ind_var_name=ind_var_name,
@@ -1111,28 +1117,28 @@ def make_all_plots(ind_var_name, dep_var_name, aggregation, years=None,
         aggregation=aggregation,
         sname=sname,
         paired_dfs=paired_dfs,
-        coarsen_factor=4,
+        coarsen_factor=2,
         years=years,
         area_slice=area_slice,
         normalize_by_ind_diff=True,
-        gridsize=30,
+        gridsize=25,
         cmap='viridis',
-        reduce_C_function=np.mean,
-        mincnt=10,
-        vmin=0,
-        vmax=0.015
-
+        reduce_C_function=np.median,
+        mincnt=75,
+        vmin=0.002,
+        vmax=.05
     )   
+
 
 
 
 make_all_plots(
     ind_var_name='cc',
-    dep_var_name='tmax',
+    dep_var_name='lst',
     aggregation='annual_mean',
     years=None,
     reset_caches=False,
-    area_slice=RESULTS_BBOX
+    area_slice=None
 )
 
 # make_all_plots(
@@ -1168,15 +1174,25 @@ make_all_plots(
 
 ind_var_name = 'cc'
 dep_var_name = 'heatwaves_gapfilled'
+
 years = None
 aggregation = 'annual_sum'
-reset_caches = True
+reset_caches = False
 area_slice = RESULTS_BBOX
 
 paired_dfs = load_and_cache_all_coarsens(
     dep_var_name=dep_var_name,
     ind_var_name=ind_var_name,
     aggregation=aggregation,
+    reset_caches=reset_caches,
+)
+
+sname, dfs = load_binned_results(
+    dep_var_name=dep_var_name,
+    ind_var_name=ind_var_name,
+    aggregation=aggregation,
+    years=years,
+    area_slice=area_slice,
     reset_caches=reset_caches,
 )
 #%%
