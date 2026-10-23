@@ -18,7 +18,17 @@ def open_hansen():
     da2 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000004864-0000000000.tif',
                             chunks='auto').squeeze()
 
-    da = xr.concat([da1, da2], dim='y')
+    da_1 = xr.concat([da1, da2], dim='y')
+
+    da1 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000000000-0000004864.tif',
+                            chunks='auto').squeeze()
+    da2 = rxr.open_rasterio(HANSEN_DIR + 'hansen_tc_2000_2024-0000004864-0000004864.tif',
+                            chunks='auto').squeeze()
+
+    da_2 = xr.concat([da1, da2], dim='y')
+
+    da = xr.concat([da_1, da_2], dim='x')
+
 
     da.name = 'tree_cover'
     da.attrs['units'] = '%'
@@ -27,7 +37,6 @@ def open_hansen():
     da = da.rename({'band': 'time'})
     da = da.assign_coords(time=list(range(2000, 2025)))
     da = da.sortby('lat', ascending=True)
-    da = da[:, :-1, :-1]
     return da
 
 
@@ -86,17 +95,11 @@ if __name__ == '__main__':
     with LocalCluster(processes=False, n_workers=4, threads_per_worker=8, memory_limit='128GB') as cluster:
             with Client(cluster) as client:
                 print(f"Dask Dashboard available at: {client.dashboard_link}")
-                rechunked.to_zarr(TARGET_STORE, mode='w')
+                rechunked = rechunk_hansen(hansen)
+                rechunked = xr.Dataset({'tree_cover': rechunked})
+                rechunked.to_zarr(TARGET_STORE, mode='w', consolidated=True)
 
-        
-    add_metadata_to_zarr(
-        TARGET_STORE,
-        var_name="tree_cover",
-        dims=("time", "lat", "lon"),
-        consolidate=True,
-        orig_ds=hansen,
-    )
 
-    ds = xr.open_zarr(TARGET_STORE, consolidated=False)
+    ds = xr.open_zarr(TARGET_STORE, consolidated=True)
     print(ds)
 

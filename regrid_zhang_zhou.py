@@ -4,7 +4,6 @@ from glob import glob
 import json
 import numpy as np
 import pandas as pd
-from sklearn import cluster
 import xarray as xr
 import xesmf as xe
 from dask.distributed import Client, LocalCluster
@@ -107,44 +106,44 @@ def save_progress(progress):
 
 
 #%%
-# if __name__ == "__main__":
+if __name__ == "__main__":
 
-#     if RESET_OUTPUT and os.path.exists(ZARR_DESTINATION):
-#         print(f"Removing existing output at {ZARR_DESTINATION}...")
-#         os.system(f"rm -rf {ZARR_DESTINATION}")
+    if RESET_OUTPUT and os.path.exists(ZARR_DESTINATION):
+        print(f"Removing existing output at {ZARR_DESTINATION}...")
+        os.system(f"rm -rf {ZARR_DESTINATION}")
 
-#     if RESET_OUTPUT and os.path.exists(PROGRESS_JSON):
-#         print(f"Removing existing progress file at {PROGRESS_JSON}...")
-#         os.remove(PROGRESS_JSON)
+    if RESET_OUTPUT and os.path.exists(PROGRESS_JSON):
+        print(f"Removing existing progress file at {PROGRESS_JSON}...")
+        os.remove(PROGRESS_JSON)
 
 
-#     progress = load_or_create_progress(list(YEAR_RANGE))
-#     completed_years = set(progress['completed_years'])
+    progress = load_or_create_progress(list(YEAR_RANGE))
+    completed_years = set(progress['completed_years'])
 
-#     with local_cluster(n_workers=24, memory_limit='15GB',
-#                       threads_per_worker=16):
-#         for year in YEAR_RANGE:
+    with local_cluster(n_workers=24, memory_limit='15GB',
+                      threads_per_worker=16):
+        for year in YEAR_RANGE:
 
-#             if year in completed_years:
-#                 print(f'{year}: already completed, skipping')
-#                 continue
-#             print(f'  [{year}] Starting regridding...')
+            if year in completed_years:
+                print(f'{year}: already completed, skipping')
+                continue
+            print(f'  [{year}] Starting regridding...')
 
-#             regridded_ds, regridder = get_regridder_and_data(year)
+            regridded_ds, regridder = get_regridder_and_data(year)
 
             
 
-#             print('saving to zarr...')
-#             if not os.path.exists(ZARR_DESTINATION):
-#                 print("Creating new Zarr store...")
-#                 regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='w', consolidated=False)
-#             else:
-#                 print("Appending to existing Zarr store...")
-#                 regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='time', consolidated=False)
+            print('saving to zarr...')
+            if not os.path.exists(ZARR_DESTINATION):
+                print("Creating new Zarr store...")
+                regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='w', consolidated=False)
+            else:
+                print("Appending to existing Zarr store...")
+                regridded_ds.astype('float32').to_zarr(ZARR_DESTINATION, mode='a', append_dim='time', consolidated=False)
 
-#             completed_years.add(year)
-#             progress['completed_years'] = sorted(completed_years)
-#             save_progress(progress)
+            completed_years.add(year)
+            progress['completed_years'] = sorted(completed_years)
+            save_progress(progress)
 
 #%% also regrid the mask
 def regrid_mask():

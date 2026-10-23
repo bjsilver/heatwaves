@@ -1,15 +1,12 @@
 #%%
 
 import ee
-import geemap
 import xarray as xr
 from constants import ZZ_SOURCE_DIR
 
 # 1. Initialize and Authenticate Earth Engine
 ee.Authenticate(auth_mode='notebook')
 ee.Initialize()
-geemap.ee_initialize()
-
 #%%
 
 target = xr.open_dataset(ZZ_SOURCE_DIR + 'SouthAmerica_Ta_SVCMsp_2003TMAX_daily_tropics30N30S.nc')['Ta_TMAX']
@@ -54,14 +51,14 @@ gain = dataset.select('gain').clip(roi)
 
 #%%
 
-# 3. Build the Annual Time Series (2000-2024)
 annual_list = [tc00.rename('year_2000')]
 
-for year_val in range(1, 25): 
+for year_val in range(1, 25):
     actual_year = 2000 + year_val
-    # Logic: Keep forest if loss hasn't happened yet (loss_year == 0 or > current year)
-    mask = loss_year.eq(0).where(loss_year.gt(year_val), 1)
-    year_img = tc00.where(mask.Not(), 0).rename(f'year_{actual_year}')
+
+    forest_mask = loss_year.eq(0).Or(loss_year.gt(year_val))
+    year_img = tc00.where(forest_mask.Not(), 0).rename(f'year_{actual_year}')
+
     annual_list.append(year_img)
 
 annual_stack = ee.Image.cat(annual_list)
@@ -78,6 +75,18 @@ regridded_tc = (
     )
 )
 
+regridded_gain = (
+    gain
+    .reduceResolution(
+        reducer=ee.Reducer.mean(),
+        maxPixels=2048
+    )
+    .reproject(
+        crs=target_crs,
+        crsTransform=target_transform
+    )
+    .rename('forest_gain_fraction')
+)
 # 5. Export Tasks
 # Use 'fileFormatConfig' for GeoTIFF compression options
 format_options = {

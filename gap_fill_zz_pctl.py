@@ -10,7 +10,7 @@ import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 # import lru_cache
 from functools import lru_cache
-from ufuncs import _add_gridlines
+from ufuncs_plot import _add_gridlines
 
 PCT_PATH = os.path.join(STORAGE_DIR, 'percentiles', 'zz_tmax_95pc.zarr')
 OUT_PATH = os.path.join(STORAGE_DIR, 'percentiles', 'zz_tmax_95pc_gapfilled.zarr')
@@ -286,8 +286,7 @@ if __name__ == '__main__':
         main()
 
 
-#%%
-# plot the process
+#%% plot the process
 
 
     

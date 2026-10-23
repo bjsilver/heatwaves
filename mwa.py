@@ -3,20 +3,17 @@ import xarray as xr
 import numpy as np
 import os
 import dask.array as da
-from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR, TMAX_RECHUNKED_FILE
+from constants import HANSEN_DIR, MWA_DIR, STORAGE_DIR, TMAX_RECHUNKED_FILE, COARSEN_FACTORS, ELEV_PATH, LST_DIR, GRF_TMAX_PATH
 import gc
 import json
 import shutil
 from glob import glob
-from ufuncs import local_cluster
+from ufuncs import local_cluster, _check_coords_match
 from calc_era5_percentiles import load_era5_t2m
 from numba import njit
 import pandas as pd
 from dask import delayed
 from numcodecs import Blosc
-
-# COARSEN_FACTORS = [None, 2, 5, 10, 25]
-COARSEN_FACTORS = [None, 2, 4, 8, 16, 32]
 
 SPATH_SUFFIX = None
 USE_DASK_DASHBOARD = True
@@ -28,6 +25,7 @@ MWA_ALGORITHM_TAG = f'cc-loss-explained-{int(CC_LOSS_EXPLAINED_FRACTION * 100):0
 MWA_SCHEMA_VERSION = 2
 # minimum fraction of non-NaN pixels a coarsen block must have to produce a valid coarsened value
 COARSEN_MIN_VALID_FRACTION = 0.90
+
 
 
 def _coarsen_mean_min_valid(data_array, coarsen_factor, min_valid_fraction=COARSEN_MIN_VALID_FRACTION):
@@ -50,7 +48,7 @@ def _coarsen_mean_min_valid(data_array, coarsen_factor, min_valid_fraction=COARS
 
 def _load_canopy_cover_and_loss(era=False):
     if era:
-        ds = xr.open_zarr(HANSEN_DIR+'hansen_regridded.zarr')
+        ds = xr.open_zarr(HANSEN_DIR+'regular_regridded_grid/hansen_regridded.zarr')
     else:
         ds = xr.open_zarr(os.path.join(HANSEN_DIR, 'hansen_tc_2000_2024_rechunked.zarr'), 
                         consolidated=False)
@@ -62,7 +60,6 @@ def _load_canopy_cover_and_loss(era=False):
     cc.name = 'cc'
     cc_loss.name = 'cc_loss'
     return cc, cc_loss
-
 
 def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
 
@@ -84,6 +81,12 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
         dep_var = xr.open_zarr(os.path.join(STORAGE_DIR, 'heat_metrics', 'heat_metrics.zarr'))['warmest_days']
     elif dep_var_name == 'tmax_era5':
         dep_var = load_era5_t2m()
+    elif dep_var_name == 'lst':
+        dep_var = xr.open_zarr(LST_DIR+'regridded_rechunked.zarr')['LST'] / 10
+    elif dep_var_name == 'tmax_grf':
+        print('WARNING! USING OLD VERSION')
+        dep_var = xr.open_zarr(GRF_TMAX_PATH)['tmax']
+
     else:
         raise ValueError(f"Unsupported dependent variable name: {dep_var_name}")
     dep_var.name = dep_var_name
@@ -93,8 +96,11 @@ def load_ind_dep_data(ind_var_name, dep_var_name, include_cc_loss=False):
 
     elif ind_var_name == 'cc_era5':
         ind_var, cc_loss = _load_canopy_cover_and_loss(era=True)
+
     ind_var = ind_var.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
     cc_loss = cc_loss.assign_coords(lat=dep_var.lat, lon=dep_var.lon)
+    _check_coords_match([ind_var, cc_loss, dep_var])
+
     
 
     if include_cc_loss:
@@ -227,7 +233,7 @@ def _get_mwa_neighbour_map(cc, cc_loss, window_radius, sname, overwrite=False):
     encoding = {
         'selection': {
             'dtype': 'float32',
-            'compressor': Blosc(cname='zstd', clevel=3)
+            'compressors': [Blosc(cname='zstd', clevel=3)]
         }
     }
 
@@ -734,10 +740,10 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
     dss.append((ind_coarse, cc_loss_coarse, dep_coarse, elev_coarse))
 
     # Add offset versions if coarsen_factor >= 10
-    if coarsen_factor >= 10:
-        num_offsets = (coarsen_factor - 10) // 5 + 1
+    if coarsen_factor >= 8:
+        num_offsets = (coarsen_factor - 10) // 4 + 1
         for offset_idx in range(num_offsets):
-            offset = (offset_idx + 1) * 5
+            offset = (offset_idx + 1) * 4
 
             # Create shifted versions with offset slicing
             ind_shifted = ind_var.loc[
@@ -792,21 +798,23 @@ def _generate_coarsened_versions(ind_var, cc_loss, dep_var, coarsen_factor, elev
     return dss
 
 
+
+
 def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
                        client=None, dep_var_agg=None,
                        coarsen_factor=None, window_radius=1, sname=None,
-                       overwrite=False):
+                       neighbour_map_sname=None, overwrite=False):
 
+    elev = xr.open_dataset(ELEV_PATH)['elevation']
+    ref_ind_var = ind_var
+    # check coords match elev
 
-    if len(dep_var.lat) == 5000 and len(dep_var.lon) == 4750:    
-        elev = xr.open_dataset(os.path.join(STORAGE_DIR, '..', 'elevation', 'elevation_regridded.nc'))['elevation']
-        ref_ind_var = ind_var
-        elev = elev.assign_coords(lat=ref_ind_var.lat, lon=ref_ind_var.lon)
-        ind_var = ind_var.where(elev < 1000)
-        cc_loss = cc_loss.where(elev < 1000)
-        dep_var = dep_var.where(elev < 1000)
-    else:
-        elev = None
+    _check_coords_match([dep_var, elev])
+    elev = elev.assign_coords({'lat': dep_var['lat'], 'lon': dep_var['lon']})
+    ind_var = ind_var.where(elev < 1000)
+    cc_loss = cc_loss.where(elev < 1000)
+    dep_var = dep_var.where(elev < 1000)
+
 
     # Generate list of variable triplets (with offsets if applicable)
     if coarsen_factor:
@@ -831,8 +839,10 @@ def calc_moving_window(ind_var, cc_loss, dep_var, dep_var_name,
             # Clear any partial output for this version only.
             shutil.rmtree(version_root)
 
-        suffix = f'_{version_idx}' if expected_versions > 1 else ''
-        map_sname = f'{sname}{suffix}'
+        shift_pixels = 0 if (not coarsen_factor or version_idx == 0) else 4 * version_idx
+        map_sname = f'{neighbour_map_sname or sname}'
+        if expected_versions > 1:
+            map_sname = f'{map_sname}_shift{shift_pixels}'
 
         if dep_var_agg is not None:
             dep_var_version = aggregate_dependent_variable(dep_var_version, dep_var_agg)
@@ -912,8 +922,13 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     if coarsen_factor:
         sname += f'_coarsened{coarsen_factor}'
 
+    neighbour_map_sname = f'{ind_var_name}_vs_cc'
+    if coarsen_factor:
+        neighbour_map_sname += f'_coarsened{coarsen_factor}'
+
     if SPATH_SUFFIX:
         sname += f'_{SPATH_SUFFIX}'
+        neighbour_map_sname += f'_{SPATH_SUFFIX}'
 
     if overwrite:
         print(f"Overwrite flag is set. Proceeding with moving window analysis for {sname}.")
@@ -925,7 +940,9 @@ def run_mwa(coarsen_factor=None, window_radius=1, dep_var_agg=None, client=None,
     calc_moving_window(ind_var=ind_var, cc_loss=cc_loss, dep_var=dep_var,
                         dep_var_name=dep_var_name,
                         client=client, window_radius=window_radius,
-                        coarsen_factor=coarsen_factor, sname=sname, dep_var_agg=dep_var_agg,
+                        coarsen_factor=coarsen_factor, sname=sname,
+                        neighbour_map_sname=neighbour_map_sname,
+                        dep_var_agg=dep_var_agg,
                         overwrite=overwrite)
     print(
         f"Moving window analysis completed for {dep_var.name} vs {ind_var_name} "
@@ -945,15 +962,22 @@ def run_mwa_coarsen_loop(ind_var_name, dep_var_agg,
 #%%
 if __name__ == "__main__":
     
-    with local_cluster(n_workers=1, threads_per_worker=32, memory_limit='400GB',
-                       processes=False,
-                       suppress_dask_warnings=True, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
+    with local_cluster(n_workers=12, threads_per_worker=6, memory_limit='32GB',
+                        dashboard_address=':8787',
+                       suppress_dask_warnings=False, use_dask_dashboard=USE_DASK_DASHBOARD) as client:
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+        #                      dep_var_name='tmax', client=client, overwrite=False)
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
+        #                              dep_var_name='lst', client=client, overwrite=False)
 
         run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_mean',
-                             dep_var_name='tmax', client=client, overwrite=True)
+                             dep_var_name='tmax_grf', client=client, overwrite=False)
 
-        run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
-                            dep_var_name='heatwaves_gapfilled', client=client, overwrite=True)
+
+        # run_mwa_coarsen_loop(ind_var_name='cc', dep_var_agg='annual_sum',
+        #                     dep_var_name='heatwaves_gapfilled', client=client, overwrite=False)
 
         # run_mwa_coarsen_loop(ind_var_name='cc', 
         #                      dep_var_name='absthresh_heatwaves',
